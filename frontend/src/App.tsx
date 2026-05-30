@@ -72,7 +72,6 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [uploadStatus, setUploadStatus] = useState<'idle' | 'uploading' | 'done' | 'error'>('idle');
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const dragRef = useRef<boolean>(false);
   const [isDragging, setIsDragging] = useState(false);
 
   const updateAgentStatus = useCallback((name: AgentName, status: AgentState['status']) => {
