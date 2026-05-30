@@ -6,7 +6,7 @@ import { RepoTab } from './tabs/RepoTab';
 import { TestsTab } from './tabs/TestsTab';
 import { SecurityTab } from './tabs/SecurityTab';
 import { ReleaseTab } from './tabs/ReleaseTab';
-import { Download, FileText } from 'lucide-react';
+import { Download } from 'lucide-react';
 
 const TABS = [
   { id: 'plan', label: '📋 Plan', icon: '📋' },

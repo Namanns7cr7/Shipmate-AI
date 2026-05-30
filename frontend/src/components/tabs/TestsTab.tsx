@@ -1,7 +1,7 @@
 import { motion } from 'framer-motion';
 import { useState } from 'react';
 import type { TestGeneratorOutput, TestCase } from '../../types';
-import { CheckSquare, FlaskConical, Zap, RotateCcw } from 'lucide-react';
+import { FlaskConical, Zap, RotateCcw } from 'lucide-react';
 
 function TestCaseCard({ test, index }: { test: TestCase; index: number }) {
   const [open, setOpen] = useState(false);

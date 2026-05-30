@@ -1,6 +1,6 @@
 import { motion } from 'framer-motion';
 import type { PlannerOutput, Task } from '../../types';
-import { AlertTriangle, Layers, Server, Database, TestTube, Rocket } from 'lucide-react';
+import { AlertTriangle, Layers, Server, Database, TestTube } from 'lucide-react';
 
 function priorityColor(p: string) {
   if (p === 'high') return '#f87171';
