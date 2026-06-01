@@ -1,30 +1,23 @@
 import { useState, useCallback, useEffect } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
-  Github,
-  LogOut,
   Menu,
   X,
   ChevronRight,
   Loader,
   AlertCircle,
-  CheckCircle,
-  Star,
-  GitFork,
   Code,
-  GitPullRequest,
-  AlertTriangle,
-  Settings,
-  FileText,
   Zap,
 } from 'lucide-react';
 import { Sidebar } from './components/Sidebar';
 import { AgentSwarm } from './components/AgentSwarm';
 import { ReadinessScore } from './components/ReadinessScore';
 import { ReportTabs } from './components/ReportTabs';
+import { GitHubConnectButton } from './components/GitHubConnectButton';
+import { GitHubUserProfile } from './components/GitHubUserProfile';
+import { useGithubAuth } from './hooks/useGithubAuth';
 import { api } from './lib/api';
 import type {
-  AppState,
   GitHubRepository,
   GitHubBranch,
   AnalyzeResponse,
@@ -78,11 +71,14 @@ Requirements:
 - Allow one-click analysis of selected repos
 - Secure token storage in backend`;
 
+type AppState = 'notConnected' | 'connected' | 'repoSelected' | 'analyzing' | 'analysisComplete' | 'error';
+
 export default function App() {
-  // ========== State Management ==========
+  // ========== Authentication ==========
+  const githubAuth = useGithubAuth();
+
+  // ========== App State ==========
   const [appState, setAppState] = useState<AppState>('notConnected');
-  const [githubUser, setGithubUser] = useState<any>(null);
-  const [accessToken, setAccessToken] = useState<string | null>(null);
   
   // Repository & branch selection
   const [repos, setRepos] = useState<GitHubRepository[]>([]);
@@ -105,90 +101,81 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
-  const [currentView, setCurrentView] = useState<'dashboard' | 'repos' | 'prs' | 'issues'>('dashboard');
 
-  // ========== GitHub Connection Handler ==========
-  const handleConnectGitHub = useCallback(async () => {
-    setAppState('connecting');
-    setError(null);
-    
-    try {
-      // Get the OAuth URL from backend
-      const { auth_url } = await api.getGitHubAuthUrl();
-      
-      // Create popup window for OAuth
-      const width = 500;
-      const height = 600;
-      const left = window.screenX + (window.outerWidth - width) / 2;
-      const top = window.screenY + (window.outerHeight - height) / 2;
-      
-      const popup = window.open(
-        auth_url,
-        'GitHub Login',
-        `width=${width},height=${height},left=${left},top=${top}`
-      );
-      
-      // Listen for postMessage from callback
-      const handleMessage = async (event: MessageEvent) => {
-        if (event.data.type === 'GITHUB_AUTH_SUCCESS') {
-          window.removeEventListener('message', handleMessage);
-          popup?.close();
-          
-          const { access_token, user } = event.data;
-          setAccessToken(access_token);
-          setGithubUser(user);
-          setAppState('connected');
-          
-          // Load user's repositories
-          try {
-            const userRepos = await api.getUserRepositories(access_token);
-            setRepos(userRepos);
-          } catch (err) {
-            setError('Failed to load repositories');
-          }
-        }
-      };
-      
-      window.addEventListener('message', handleMessage);
-    } catch (err) {
-      setError('Failed to initiate GitHub connection');
+  // ========== Load auth state on mount ==========
+  useEffect(() => {
+    if (githubAuth.isAuthenticated && !githubAuth.loading) {
+      setAppState('connected');
+      loadUserRepositories();
+    } else if (!githubAuth.loading) {
       setAppState('notConnected');
     }
-  }, []);
+  }, [githubAuth.isAuthenticated, githubAuth.loading]);
 
-  // ========== Repository Selection Handler ==========
-  const handleSelectRepository = useCallback(async (repo: GitHubRepository) => {
-    setSelectedRepo(repo);
-    setSelectedBranch('main');
-    setSelectedPull(null);
-    setSelectedIssue(null);
-    setAppState('repoSelected');
-    
-    if (!accessToken) return;
+  // ========== Load user repositories ==========
+  const loadUserRepositories = useCallback(async () => {
+    if (!githubAuth.accessToken) return;
     
     try {
-      // Extract owner and repo name from full_name
-      const [owner, repoName] = repo.full_name.split('/');
-      
-      // Fetch branches
-      const repoBranches = await api.getRepositoryBranches(owner, repoName, accessToken);
-      setBranches(repoBranches);
-      
-      // Fetch PRs
-      const repoPulls = await api.getRepositoryPulls(owner, repoName, accessToken);
-      setPulls(repoPulls);
-      
-      // Fetch issues
-      const repoIssues = await api.getRepositoryIssues(owner, repoName, accessToken);
-      setIssues(repoIssues);
+      const userRepos = await api.getUserRepositories(githubAuth.accessToken);
+      setRepos(userRepos);
+      setError(null);
     } catch (err) {
-      setError('Failed to load repository data');
+      setError('Failed to load repositories. Please try again.');
+      console.error('Repository loading error:', err);
     }
-  }, [accessToken]);
+  }, [githubAuth.accessToken]);
+
+  // ========== Repository Selection Handler ==========
+  const handleSelectRepository = useCallback(
+    async (repo: GitHubRepository) => {
+      setSelectedRepo(repo);
+      setSelectedBranch('main');
+      setSelectedPull(null);
+      setSelectedIssue(null);
+      setAppState('repoSelected');
+      setError(null);
+      
+      if (!githubAuth.accessToken) return;
+      
+      try {
+        // Extract owner and repo name from full_name
+        const [owner, repoName] = repo.full_name.split('/');
+        
+        // Fetch branches
+        const repoBranches = await api.getRepositoryBranches(
+          owner,
+          repoName,
+          githubAuth.accessToken
+        );
+        setBranches(repoBranches);
+        
+        // Fetch PRs
+        const repoPulls = await api.getRepositoryPulls(
+          owner,
+          repoName,
+          githubAuth.accessToken
+        );
+        setPulls(repoPulls);
+        
+        // Fetch issues
+        const repoIssues = await api.getRepositoryIssues(
+          owner,
+          repoName,
+          githubAuth.accessToken
+        );
+        setIssues(repoIssues);
+      } catch (err) {
+        setError('Failed to load repository data');
+        console.error('Repository data error:', err);
+      }
+    },
+    [githubAuth.accessToken]
+  );
 
   // ========== Analysis Handler ==========
   const handleAnalyze = useCallback(async () => {
-    if (!selectedRepo || !featureRequest || !accessToken) {
+    if (!selectedRepo || !featureRequest || !githubAuth.accessToken) {
       setError('Please select a repository and enter a feature request');
       return;
     }
@@ -222,7 +209,7 @@ export default function App() {
         featureRequest,
         selectedPull?.number,
         selectedIssue?.number,
-        accessToken
+        githubAuth.accessToken
       );
       
       setAnalysis(result);
@@ -234,27 +221,53 @@ export default function App() {
     } catch (err) {
       setError('Analysis failed. Please try again.');
       setAppState('error');
+      console.error('Analysis error:', err);
     } finally {
       setLoading(false);
     }
-  }, [selectedRepo, featureRequest, selectedBranch, selectedPull, selectedIssue, accessToken]);
+  }, [selectedRepo, featureRequest, selectedBranch, selectedPull, selectedIssue, githubAuth.accessToken]);
 
   // ========== Logout Handler ==========
-  const handleLogout = useCallback(() => {
+  const handleLogout = useCallback(async () => {
     setAppState('notConnected');
-    setGithubUser(null);
-    setAccessToken(null);
     setRepos([]);
     setSelectedRepo(null);
     setBranches([]);
     setAnalysis(null);
     setError(null);
-  }, []);
+    await githubAuth.logout();
+  }, [githubAuth]);
+
+  // ========== Refresh auth after callback ==========
+  useEffect(() => {
+    const checkAuth = () => {
+      const token = localStorage.getItem('github_access_token');
+      if (token && !githubAuth.isAuthenticated) {
+        githubAuth.refreshAuth();
+      }
+    };
+
+    // Check on window focus (for when callback page redirects)
+    window.addEventListener('focus', checkAuth);
+    return () => window.removeEventListener('focus', checkAuth);
+  }, [githubAuth]);
+
+  // Show loading state
+  if (githubAuth.loading) {
+    return (
+      <div className="flex h-screen items-center justify-center bg-slate-950">
+        <div className="text-center">
+          <Loader size={48} className="animate-spin text-blue-400 mx-auto mb-4" />
+          <p className="text-slate-400">Loading...</p>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="flex h-screen bg-slate-950 text-slate-100 overflow-hidden">
       {/* ========== Sidebar Navigation ========== */}
-      {appState !== 'notConnected' && (
+      {githubAuth.isAuthenticated && (
         <motion.div
           initial={{ x: -280 }}
           animate={{ x: sidebarOpen ? 0 : -280 }}
@@ -271,7 +284,7 @@ export default function App() {
         <header className="sticky top-0 z-40 border-b border-slate-800 bg-slate-900/80 backdrop-blur-sm px-8 py-4">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-4">
-              {appState !== 'notConnected' && (
+              {githubAuth.isAuthenticated && (
                 <button
                   onClick={() => setSidebarOpen(!sidebarOpen)}
                   className="p-2 hover:bg-slate-800 rounded-lg transition text-slate-400 hover:text-white"
@@ -285,34 +298,19 @@ export default function App() {
                   ShipMate AI
                 </h1>
                 <p className="text-xs text-slate-400 mt-0.5">
-                  Powered by Azure AI Foundry + Azure OpenAI
+                  Production Readiness Analysis Platform
                 </p>
               </div>
             </div>
 
-            {/* User Profile & Logout */}
-            {githubUser && (
-              <div className="flex items-center gap-4">
-                <div className="flex items-center gap-3 px-3 py-2 bg-slate-800/50 rounded-lg">
-                  <img
-                    src={githubUser.avatar_url}
-                    alt={githubUser.login}
-                    className="w-8 h-8 rounded-full"
-                  />
-                  <div>
-                    <p className="text-sm font-medium">{githubUser.login}</p>
-                    <p className="text-xs text-slate-400">{githubUser.company || 'Developer'}</p>
-                  </div>
-                </div>
-                <button
-                  onClick={handleLogout}
-                  className="p-2 hover:bg-slate-800 rounded-lg transition text-slate-400 hover:text-red-400"
-                  title="Logout"
-                >
-                  <LogOut size={20} />
-                </button>
-              </div>
-            )}
+            {/* User Profile or Connect Button */}
+            {githubAuth.isAuthenticated && githubAuth.user ? (
+              <GitHubUserProfile
+                user={githubAuth.user}
+                onLogout={handleLogout}
+                loading={githubAuth.loading}
+              />
+            ) : null}
           </div>
         </header>
 
@@ -321,7 +319,7 @@ export default function App() {
           <div className="p-8">
             <AnimatePresence mode="wait">
               {/* ========== NOT CONNECTED STATE ========== */}
-              {appState === 'notConnected' && (
+              {appState === 'notConnected' && !githubAuth.isAuthenticated && (
                 <motion.div
                   key="not-connected"
                   initial={{ opacity: 0, y: 20 }}
@@ -329,71 +327,60 @@ export default function App() {
                   exit={{ opacity: 0, y: -20 }}
                   className="max-w-2xl mx-auto"
                 >
-                  <div className="rounded-xl bg-gradient-to-br from-slate-800 to-slate-900 border border-slate-700 p-12 text-center">
-                    <Github className="w-16 h-16 text-blue-400 mx-auto mb-6" />
-                    
-                    <h2 className="text-3xl font-bold text-white mb-4">
-                      Connect Your GitHub Account
-                    </h2>
-                    
-                    <p className="text-slate-300 mb-8 text-lg">
-                      ShipMate AI analyzes your repositories using AI agents to assess delivery readiness.
-                      We use read-only access and never modify your code.
-                    </p>
-                    
-                    <button
-                      onClick={handleConnectGitHub}
-                      disabled={appState === 'connecting'}
-                      className="bg-gradient-to-r from-blue-600 to-blue-700 hover:from-blue-700 hover:to-blue-800 disabled:opacity-50 text-white font-semibold py-3 px-8 rounded-lg inline-flex items-center gap-3 transition transform hover:scale-105"
-                    >
-                      {appState === 'connecting' ? (
-                        <>
-                          <Loader size={20} className="animate-spin" />
-                          Connecting...
-                        </>
-                      ) : (
-                        <>
-                          <Github size={20} />
-                          Connect GitHub Account
-                        </>
-                      )}
-                    </button>
-                    
-                    {error && (
-                      <div className="mt-6 p-4 bg-red-900/30 border border-red-700 rounded-lg text-red-200 text-sm">
-                        {error}
-                      </div>
-                    )}
-                    
-                    <div className="mt-12 pt-8 border-t border-slate-700">
-                      <p className="text-sm text-slate-400 mb-6 font-semibold">
-                        Required Permissions (Read-Only)
-                      </p>
-                      <div className="grid grid-cols-2 gap-3 text-sm text-slate-400">
-                        <div className="flex items-center gap-2">
-                          <CheckCircle size={16} className="text-green-400" />
-                          <span>Repository contents</span>
-                        </div>
-                        <div className="flex items-center gap-2">
-                          <CheckCircle size={16} className="text-green-400" />
-                          <span>Metadata</span>
-                        </div>
-                        <div className="flex items-center gap-2">
-                          <CheckCircle size={16} className="text-green-400" />
-                          <span>Pull requests</span>
-                        </div>
-                        <div className="flex items-center gap-2">
-                          <CheckCircle size={16} className="text-green-400" />
-                          <span>Issues</span>
-                        </div>
-                      </div>
+                  <GitHubConnectButton
+                    onClick={githubAuth.initiateLogin}
+                    loading={githubAuth.loading}
+                    error={githubAuth.error}
+                  />
+                </motion.div>
+              )}
+
+              {/* ========== REPOSITORY SELECTION STATE ========== */}
+              {appState === 'connected' && !selectedRepo && githubAuth.isAuthenticated && (
+                <motion.div
+                  key="repo-list"
+                  initial={{ opacity: 0, y: 20 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={{ opacity: 0, y: -20 }}
+                >
+                  <h2 className="text-2xl font-bold text-white mb-6">Your Repositories</h2>
+                  
+                  {repos.length === 0 ? (
+                    <div className="text-center py-12">
+                      <p className="text-slate-400">No repositories found</p>
                     </div>
-                  </div>
+                  ) : (
+                    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                      {repos.map(repo => (
+                        <motion.button
+                          key={repo.id}
+                          onClick={() => handleSelectRepository(repo)}
+                          whileHover={{ scale: 1.02 }}
+                          className="p-4 rounded-lg border border-slate-700 bg-slate-800/50 hover:bg-slate-800 transition text-left"
+                        >
+                          <div className="flex items-start justify-between mb-2">
+                            <Code size={24} className="text-blue-400" />
+                            {repo.is_private && (
+                              <span className="text-xs bg-slate-700 px-2 py-1 rounded">Private</span>
+                            )}
+                          </div>
+                          <h3 className="font-semibold text-white mb-1">{repo.name}</h3>
+                          <p className="text-xs text-slate-400 mb-3 line-clamp-2">
+                            {repo.description || 'No description'}
+                          </p>
+                          <div className="flex items-center gap-4 text-xs text-slate-500">
+                            {repo.language && <span>{repo.language}</span>}
+                            <span>⭐ {repo.stars}</span>
+                          </div>
+                        </motion.button>
+                      ))}
+                    </div>
+                  )}
                 </motion.div>
               )}
 
               {/* ========== ANALYSIS INPUT STATE ========== */}
-              {selectedRepo && appState !== 'analyzing' && appState !== 'analysisComplete' && (
+              {selectedRepo && appState === 'repoSelected' && (
                 <motion.div
                   key="analysis-input"
                   initial={{ opacity: 0, y: 20 }}
@@ -401,7 +388,7 @@ export default function App() {
                   exit={{ opacity: 0, y: -20 }}
                 >
                   <button
-                    onClick={() => setSelectedRepo(null)}
+                    onClick={() => { setSelectedRepo(null); setAppState('connected'); }}
                     className="mb-6 flex items-center gap-2 text-blue-400 hover:text-blue-300 transition"
                   >
                     <ChevronRight size={18} className="rotate-180" />
@@ -535,15 +522,25 @@ export default function App() {
                   <div className="flex items-center justify-between">
                     <h2 className="text-2xl font-bold text-white">Analysis Results</h2>
                     <button
-                      onClick={() => setSelectedRepo(null)}
+                      onClick={() => { setSelectedRepo(null); setAnalysis(null); setAppState('connected'); }}
                       className="text-blue-400 hover:text-blue-300 transition"
                     >
                       Analyze Another Repository
                     </button>
                   </div>
                   
-                  <ReadinessScore analysis={analysis} />
-                  <ReportTabs analysis={analysis} />
+                  {analysis && (
+                    <>
+                      <ReadinessScore score={analysis.readiness_score} breakdown={analysis.score_breakdown} />
+                      <ReportTabs 
+                        planner={analysis.agents.planner}
+                        repoAnalyst={analysis.agents.repo_analyst}
+                        testGenerator={analysis.agents.test_generator}
+                        securityGuard={analysis.agents.security_guard}
+                        deliveryManager={analysis.agents.delivery_manager}
+                      />
+                    </>
+                  )}
                 </motion.div>
               )}
 
@@ -560,7 +557,7 @@ export default function App() {
                   <h3 className="text-xl font-semibold text-white text-center mb-2">Analysis Failed</h3>
                   <p className="text-red-200 text-center mb-6">{error}</p>
                   <button
-                    onClick={() => setSelectedRepo(null)}
+                    onClick={() => { setAppState('repoSelected'); setError(null); }}
                     className="w-full bg-red-600 hover:bg-red-700 text-white font-semibold py-2 px-4 rounded-lg transition"
                   >
                     Try Again
@@ -574,3 +571,4 @@ export default function App() {
     </div>
   );
 }
+

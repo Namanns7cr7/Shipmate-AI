@@ -1,3 +1,6 @@
+from dotenv import load_dotenv
+load_dotenv()  # Load .env file before anything else
+
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -11,9 +14,7 @@ from app.models.schemas import (
 )
 from app.services.analyzer import run_full_analysis
 from app.services.repo_service import process_repo_zip, get_sample_repo
-from app.services.github_service import GitHubService
-from app.services.auth_service import AuthService
-from app.services.github_api_service import GitHubAPIService
+from app.routes.auth_routes import router as auth_router
 
 app = FastAPI(
     title="ShipMate AI API",
@@ -38,6 +39,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ============================================================================
+# Include routers
+# ============================================================================
+app.include_router(auth_router, prefix="/api")
 
 
 
@@ -183,255 +189,6 @@ async def github_callback_html():
 
 
 # ============================================================================
-# Real GitHub OAuth Integration Endpoints
-# ============================================================================
-
-@app.get("/api/github/auth-url")
-async def get_github_auth_url():
-    """
-    Get GitHub OAuth authorization URL
-    
-    Frontend redirects user to this URL to authenticate with GitHub.
-    After authorization, GitHub redirects back to /github-callback.html.
-    """
-    try:
-        # Construct callback URL - GitHub will redirect here after user authorizes
-        redirect_uri = os.getenv(
-            "GITHUB_REDIRECT_URI",
-            "http://localhost:8000/github-callback.html"
-        )
-        
-        auth_url = AuthService.get_auth_url(redirect_uri)
-        
-        return {
-            "auth_url": auth_url,
-            "message": "Redirect user to this URL to authenticate"
-        }
-    except ValueError as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/api/github/callback")
-async def github_oauth_callback(code: str = Query(...), state: str = Query(...)):
-    """
-    GitHub OAuth callback endpoint
-    
-    GitHub redirects here after user authorizes.
-    Exchanges authorization code for access token.
-    Frontend can then use this token to fetch GitHub data.
-    """
-    try:
-        # Exchange code for access token
-        token_data = await AuthService.exchange_code_for_token(code, state)
-        
-        # Fetch user info
-        access_token = token_data.get("access_token")
-        user_info = await AuthService.get_user_info(access_token)
-        
-        # Return auth data to frontend
-        # In production: store in secure session, return session ID instead
-        return {
-            "success": True,
-            "access_token": access_token,
-            "token_type": token_data.get("token_type", "bearer"),
-            "user": user_info,
-            "message": "GitHub authentication successful"
-        }
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"GitHub callback failed: {str(e)}")
-
-
-@app.get("/api/github/me")
-async def get_current_user(access_token: str = Query(...)):
-    """
-    Get authenticated GitHub user profile
-    
-    Args:
-        access_token: GitHub OAuth access token from /api/github/callback
-    """
-    try:
-        user_info = await AuthService.get_user_info(access_token)
-        return user_info
-    except ValueError as e:
-        raise HTTPException(status_code=401, detail=str(e))
-
-
-@app.get("/api/github/user-repos")
-async def get_user_repositories(access_token: str = Query(...)):
-    """
-    Get authenticated user's repositories (real GitHub API)
-    
-    Args:
-        access_token: GitHub OAuth access token
-        
-    Returns:
-        List of user's repositories with metadata
-    """
-    try:
-        repos = await GitHubAPIService.get_user_repositories(access_token)
-        return repos
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/api/github/repos/{owner}/{repo_name}/branches")
-async def get_repo_branches(
-    owner: str,
-    repo_name: str,
-    access_token: str = Query(...)
-):
-    """
-    Get branches for a GitHub repository (real GitHub API)
-    """
-    try:
-        branches = await GitHubAPIService.get_repository_branches(
-            access_token, owner, repo_name
-        )
-        return branches
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/api/github/repos/{owner}/{repo_name}/pulls")
-async def get_repo_pulls(
-    owner: str,
-    repo_name: str,
-    access_token: str = Query(...),
-    state: str = Query("open")
-):
-    """
-    Get pull requests for a GitHub repository (real GitHub API)
-    """
-    try:
-        pulls = await GitHubAPIService.get_repository_pulls(
-            access_token, owner, repo_name, state
-        )
-        return pulls
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/api/github/repos/{owner}/{repo_name}/issues")
-async def get_repo_issues(
-    owner: str,
-    repo_name: str,
-    access_token: str = Query(...),
-    state: str = Query("open")
-):
-    """
-    Get issues for a GitHub repository (real GitHub API)
-    """
-    try:
-        issues = await GitHubAPIService.get_repository_issues(
-            access_token, owner, repo_name, state
-        )
-        return issues
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/api/github/repos/{owner}/{repo_name}/contents")
-async def get_repo_contents(
-    owner: str,
-    repo_name: str,
-    access_token: str = Query(...),
-    path: str = Query("")
-):
-    """
-    Get file tree for a GitHub repository (real GitHub API)
-    """
-    try:
-        contents = await GitHubAPIService.get_repository_contents(
-            access_token, owner, repo_name, path
-        )
-        return contents
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# Keep old endpoints for backward compatibility (mock data)
-@app.get("/api/github/app-install-url")
-async def get_github_app_install_url():
-    """
-    Get the GitHub App installation URL (deprecated).
-    
-    Use /api/github/auth-url instead for OAuth flow.
-    """
-    url = await GitHubService.get_github_app_install_url()
-    return {
-        "install_url": url,
-        "message": "Click to authorize ShipMate with your GitHub account",
-        "permissions": [
-            "Contents: read-only",
-            "Metadata: read-only",
-            "Pull requests: read-only",
-            "Issues: read-only",
-            "Actions: read-only"
-        ]
-    }
-
-
-@app.post("/api/github/callback-legacy")
-async def github_oauth_callback_legacy(code: str = Query(...), state: str = Query(...)):
-    """
-    GitHub OAuth callback endpoint (legacy mock version)
-    """
-    try:
-        result = await GitHubService.exchange_github_code(code, state)
-        return result
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"GitHub authentication failed: {str(e)}")
-
-
-@app.get("/api/github/repos", response_model=list[GitHubRepository])
-async def list_repositories(github_token: str = Query(None)):
-    """
-    Get list of repositories (mock data for demo fallback)
-    """
-    try:
-        repos = await GitHubService.get_repositories(github_token)
-        return repos
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to fetch repositories: {str(e)}")
-
-
-@app.get("/api/github/repos/{repo_id}/branches", response_model=list[GitHubBranch])
-async def list_branches(repo_id: str, github_token: str = Query(None)):
-    """
-    Get list of branches (mock data for demo fallback)
-    """
-    try:
-        branches = await GitHubService.get_branches(repo_id, github_token)
-        return branches
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to fetch branches: {str(e)}")
-
-
-@app.get("/api/github/repos/{repo_id}")
-async def get_repository(repo_id: str, github_token: str = Query(None)):
-    """
-    Get detailed information about a specific repository (mock data)
-    """
-    try:
-        repo = await GitHubService.get_repository_details(repo_id, github_token)
-        return repo
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to fetch repository: {str(e)}")
-
-
-# ============================================================================
 # Analysis Endpoints
 # ============================================================================
 
@@ -456,11 +213,8 @@ async def analyze(request: AnalyzeRequest):
         )
 
     try:
-        # Fetch repository details
-        repo_details = await GitHubService.get_repository_details(request.repo_id, request.github_token)
-        
-        # Run the analysis
-        result = run_full_analysis(request, repo_details)
+        # Run the analysis (repo_details optional - agents use feature_request context)
+        result = run_full_analysis(request)
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")

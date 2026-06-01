@@ -4,61 +4,52 @@ import type {
   RepoSummary,
   GitHubRepository,
   GitHubBranch,
-  GitHubConnection,
 } from '../types';
 
 const API_BASE = '/api';
 
 export const api = {
   // ============================================================================
-  // Real GitHub OAuth Integration
+  // Real GitHub OAuth Integration - New Endpoints
   // ============================================================================
 
-  async getGitHubAuthUrl(): Promise<{ auth_url: string }> {
-    const { data } = await axios.get(`${API_BASE}/github/auth-url`);
+  async getGitHubAuthUrl(): Promise<{ auth_url: string; message: string }> {
+    const { data } = await axios.get(`${API_BASE}/auth/github/login`);
     return data;
   },
 
   async handleGitHubCallback(code: string, state: string): Promise<any> {
-    const { data } = await axios.get(`${API_BASE}/github/callback`, {
+    const { data } = await axios.get(`${API_BASE}/auth/github/callback`, {
       params: { code, state },
     });
     return data;
   },
 
   async getCurrentUser(accessToken: string): Promise<any> {
-    const { data } = await axios.get(`${API_BASE}/github/me`, {
+    const { data } = await axios.get(`${API_BASE}/auth/github/me`, {
       params: { access_token: accessToken },
     });
     return data;
   },
 
-  // ============================================================================
-  // Real GitHub API - User Repositories
-  // ============================================================================
-
   async getUserRepositories(accessToken: string): Promise<GitHubRepository[]> {
-    const { data } = await axios.get<GitHubRepository[]>(
-      `${API_BASE}/github/user-repos`,
+    const { data } = await axios.get<{ repos: GitHubRepository[] }>(
+      `${API_BASE}/auth/github/repos`,
       { params: { access_token: accessToken } }
     );
-    return data;
+    return data.repos;
   },
-
-  // ============================================================================
-  // Real GitHub API - Repository Data
-  // ============================================================================
 
   async getRepositoryBranches(
     owner: string,
     repoName: string,
     accessToken: string
   ): Promise<GitHubBranch[]> {
-    const { data } = await axios.get<GitHubBranch[]>(
-      `${API_BASE}/github/repos/${owner}/${repoName}/branches`,
+    const { data } = await axios.get<{ branches: GitHubBranch[] }>(
+      `${API_BASE}/auth/github/repos/${owner}/${repoName}/branches`,
       { params: { access_token: accessToken } }
     );
-    return data;
+    return data.branches;
   },
 
   async getRepositoryPulls(
@@ -67,11 +58,11 @@ export const api = {
     accessToken: string,
     state: string = 'open'
   ): Promise<any[]> {
-    const { data } = await axios.get<any[]>(
-      `${API_BASE}/github/repos/${owner}/${repoName}/pulls`,
+    const { data } = await axios.get<{ pulls: any[] }>(
+      `${API_BASE}/auth/github/repos/${owner}/${repoName}/pulls`,
       { params: { access_token: accessToken, state } }
     );
-    return data;
+    return data.pulls;
   },
 
   async getRepositoryIssues(
@@ -80,23 +71,17 @@ export const api = {
     accessToken: string,
     state: string = 'open'
   ): Promise<any[]> {
-    const { data } = await axios.get<any[]>(
-      `${API_BASE}/github/repos/${owner}/${repoName}/issues`,
+    const { data } = await axios.get<{ issues: any[] }>(
+      `${API_BASE}/auth/github/repos/${owner}/${repoName}/issues`,
       { params: { access_token: accessToken, state } }
     );
-    return data;
+    return data.issues;
   },
 
-  async getRepositoryContents(
-    owner: string,
-    repoName: string,
-    accessToken: string,
-    path: string = ''
-  ): Promise<any[]> {
-    const { data } = await axios.get<any[]>(
-      `${API_BASE}/github/repos/${owner}/${repoName}/contents`,
-      { params: { access_token: accessToken, path } }
-    );
+  async logoutGitHub(accessToken: string): Promise<{ success: boolean }> {
+    const { data } = await axios.post(`${API_BASE}/auth/github/logout`, null, {
+      params: { access_token: accessToken },
+    });
     return data;
   },
 
@@ -140,7 +125,7 @@ export const api = {
   },
 
   // ============================================================================
-  // Mock/Demo Endpoints (Legacy - for fallback)
+  // Legacy/Demo Endpoints (kept for backward compatibility)
   // ============================================================================
 
   async getGitHubAppInstallUrl(): Promise<{ install_url: string; permissions: string[] }> {
