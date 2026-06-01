@@ -72,9 +72,12 @@ async def github_callback(code: str = Query(...), state: str = Query(...)):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
+        print(f"ERROR in github_callback:\n{tb}")
         raise HTTPException(
             status_code=500,
-            detail=f"GitHub callback failed: {str(e)}"
+            detail=f"GitHub callback failed: {str(e)}\n\nTraceback:\n{tb}"
         )
 
 
