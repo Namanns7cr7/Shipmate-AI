@@ -1,3 +1,109 @@
+// ============================================================================
+// GitHub Integration Types
+// ============================================================================
+
+export interface GitHubUser {
+  login: string;
+  id: number;
+  avatar_url: string;
+  name?: string;
+  bio?: string;
+  company?: string;
+  public_repos?: number;
+  followers?: number;
+}
+
+export interface GitHubRepository {
+  id: string;
+  name: string;
+  full_name: string;
+  description: string;
+  url: string;
+  language: string;
+  stars: number;
+  watchers: number;
+  forks: number;
+  is_private?: boolean;
+  default_branch?: string;
+  created_at?: string;
+  updated_at?: string;
+  tech_stack: string[];
+}
+
+export interface GitHubCommit {
+  sha: string;
+  message: string;
+  author?: string;
+  author_date?: string;
+}
+
+export interface GitHubBranch {
+  name: string;
+  commit: GitHubCommit;
+  protected?: boolean;
+}
+
+export interface GitHubPullRequest {
+  number: number;
+  title: string;
+  body?: string;
+  state: 'open' | 'closed' | 'merged';
+  author: string;
+  author_avatar?: string;
+  created_at: string;
+  updated_at?: string;
+  merged?: boolean;
+  merged_at?: string;
+  head_branch: string;
+  base_branch: string;
+  additions: number;
+  deletions: number;
+  changed_files: number;
+  url?: string;
+}
+
+export interface GitHubIssue {
+  number: number;
+  title: string;
+  body?: string;
+  state: 'open' | 'closed';
+  author: string;
+  author_avatar?: string;
+  created_at: string;
+  updated_at?: string;
+  closed_at?: string;
+  labels?: string[];
+  assignees?: string[];
+  comments?: number;
+  url?: string;
+}
+
+export interface GitHubConnection {
+  success: boolean;
+  access_token: string;
+  token_type: string;
+  scope: string;
+  user: GitHubUser;
+  installed_at: string;
+  message?: string;
+}
+
+export type AppState = 'notConnected' | 'connecting' | 'connected' | 'repoSelected' | 'analyzing' | 'analysisComplete' | 'error';
+
+// ============================================================================
+// Repo Analysis Types
+// ============================================================================
+
+export interface RepoSummary {
+  name: string;
+  branch: string;
+  tech_stack: string[];
+  file_count: number;
+  files_to_modify: string[];
+  language: string;
+  stars: number;
+}
+
 export interface Task {
   id: string;
   title: string;
@@ -95,22 +201,13 @@ export interface AgentResults {
 }
 
 export interface AnalyzeResponse {
-  readiness_score: number;
+  repo_summary: RepoSummary;
   agents: AgentResults;
+  readiness_score: number;
+  recommendation: 'Ready to ship' | 'Needs fixes before shipping' | 'Major issues to address';
   summary: string;
   markdown_report: string;
   score_breakdown: Record<string, number>;
-}
-
-export interface RepoSummary {
-  file_tree: string[];
-  file_count: number;
-  detected_stack: string[];
-  readme_content?: string;
-  package_json?: Record<string, unknown>;
-  requirements_txt?: string;
-  key_files: Record<string, string>;
-  repo_context: string;
 }
 
 export type AgentName = 'planner' | 'repo_analyst' | 'test_generator' | 'security_guard' | 'delivery_manager';

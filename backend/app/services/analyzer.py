@@ -263,11 +263,25 @@ def generate_markdown_report(
     return md
 
 
-def run_full_analysis(request: AnalyzeRequest) -> AnalyzeResponse:
-    """Run all 5 agents and compile the final production readiness report."""
+def run_full_analysis(request: AnalyzeRequest, repo_details: Dict = None) -> AnalyzeResponse:
+    """
+    Run all 5 agents and compile the final production readiness report.
+    
+    GitHub-first flow:
+    1. Fetch repository details from GitHub Service
+    2. Run all 5 agents with repo context
+    3. Calculate readiness score
+    4. Generate markdown report
+    5. Return comprehensive analysis
+    """
 
     feature_request = request.feature_request
-    repo_context = request.repo_context or ""
+    
+    # Build repo context from repo details
+    repo_context = ""
+    if repo_details:
+        tech_stack = ", ".join(repo_details.get("tech_stack", []))
+        repo_context = f"Repository: {repo_details.get('name', '')}. Tech Stack: {tech_stack}. Language: {repo_details.get('language', '')}."
 
     # Run agents in sequence (in production, could be parallel)
     planner = run_planner_agent(feature_request, repo_context)
@@ -296,9 +310,28 @@ def run_full_analysis(request: AnalyzeRequest) -> AnalyzeResponse:
         f"{len(delivery_manager.cicd_recommendations)} CI/CD recommendations, "
         f"and a {delivery_manager.estimated_release_date.split('(')[0].strip()} release plan."
     )
+    
+    # Determine recommendation
+    if readiness_score >= 80:
+        recommendation = "Ready to ship"
+    elif readiness_score >= 60:
+        recommendation = "Needs fixes before shipping"
+    else:
+        recommendation = "Major issues to address"
+    
+    # Build repo summary
+    repo_summary = {
+        "name": repo_details.get("name", "Unknown") if repo_details else "Unknown",
+        "branch": request.branch,
+        "tech_stack": repo_details.get("tech_stack", []) if repo_details else [],
+        "file_count": 42,  # Mock
+        "files_to_modify": [f.path for f in repo_analyst.files_to_change],
+        "language": repo_details.get("language", "Unknown") if repo_details else "Unknown",
+        "stars": repo_details.get("stars", 0) if repo_details else 0,
+    }
 
     return AnalyzeResponse(
-        readiness_score=readiness_score,
+        repo_summary=repo_summary,
         agents=AgentResults(
             planner=planner,
             repo_analyst=repo_analyst,
@@ -306,6 +339,8 @@ def run_full_analysis(request: AnalyzeRequest) -> AnalyzeResponse:
             security_guard=security_guard,
             delivery_manager=delivery_manager
         ),
+        readiness_score=readiness_score,
+        recommendation=recommendation,
         summary=summary,
         markdown_report=markdown_report,
         score_breakdown=score_breakdown
