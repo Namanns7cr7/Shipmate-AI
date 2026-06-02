@@ -1,4 +1,21 @@
 import { useState, useCallback, useEffect } from 'react';
+import { motion, AnimatePresence } from 'framer-motion';
+import {
+  Menu,
+  X,
+  ChevronRight,
+  Loader,
+  AlertCircle,
+  Code,
+  Zap,
+} from 'lucide-react';
+import { Sidebar } from './components/Sidebar';
+import { AgentSwarm } from './components/AgentSwarm';
+import { ReadinessScore } from './components/ReadinessScore';
+import { ReportTabs } from './components/ReportTabs';
+import { GitHubConnectButton } from './components/GitHubConnectButton';
+import { LandingPage } from './components/LandingPage';
+import { GitHubUserProfile } from './components/GitHubUserProfile';
 import { useGithubAuth } from './hooks/useGithubAuth';
 import { api } from './lib/api';
 import { LandingPage } from './components/landing/LandingPage';
@@ -13,10 +30,10 @@ import type {
 } from './types';
 
 const INITIAL_AGENTS: AgentProgress[] = [
-  { id: 'repo_lens',  label: 'RepoLens',  icon: '🔍', status: 'idle', description: 'Repo structure, tech stack & architecture risks' },
+  { id: 'repo_lens', label: 'RepoLens', icon: '🔍', status: 'idle', description: 'Repo structure, tech stack & architecture risks' },
   { id: 'plan_forge', label: 'PlanForge', icon: '📋', status: 'idle', description: 'Delivery milestones, blockers & next actions' },
-  { id: 'guardrail',  label: 'GuardRail', icon: '🔒', status: 'idle', description: 'Security findings, secrets & CORS analysis' },
-  { id: 'testpilot',  label: 'TestPilot', icon: '🧪', status: 'idle', description: 'Test coverage, gaps & QA readiness' },
+  { id: 'guardrail', label: 'GuardRail', icon: '🔒', status: 'idle', description: 'Security findings, secrets & CORS analysis' },
+  { id: 'testpilot', label: 'TestPilot', icon: '🧪', status: 'idle', description: 'Test coverage, gaps & QA readiness' },
 ];
 
 function useAgentSimulation(analyzing: boolean) {
@@ -25,10 +42,10 @@ function useAgentSimulation(analyzing: boolean) {
   useEffect(() => {
     if (!analyzing) { setAgents(INITIAL_AGENTS); return; }
     const steps: { id: AgentProgress['id']; delay: number }[] = [
-      { id: 'repo_lens',  delay: 200  },
+      { id: 'repo_lens', delay: 200 },
       { id: 'plan_forge', delay: 2800 },
-      { id: 'guardrail',  delay: 3200 },
-      { id: 'testpilot',  delay: 3600 },
+      { id: 'guardrail', delay: 3200 },
+      { id: 'testpilot', delay: 3600 },
     ];
     const timers = steps.map(({ id, delay }) =>
       setTimeout(() => setAgents(prev => prev.map(a => a.id === id ? { ...a, status: 'running' } : a)), delay)
@@ -37,7 +54,7 @@ function useAgentSimulation(analyzing: boolean) {
   }, [analyzing]);
 
   function markAllComplete() { setAgents(prev => prev.map(a => ({ ...a, status: 'complete' }))); }
-  function markAllError()    { setAgents(prev => prev.map(a => ({ ...a, status: a.status === 'running' ? 'error' : a.status }))); }
+  function markAllError() { setAgents(prev => prev.map(a => ({ ...a, status: a.status === 'running' ? 'error' : a.status }))); }
 
   return { agents, markAllComplete, markAllError };
 }
@@ -45,21 +62,35 @@ function useAgentSimulation(analyzing: boolean) {
 export default function App() {
   const auth = useGithubAuth();
 
-  // Navigation
-  const [page, setPage] = useState<Page>('dashboard');
+  // ========== App State ==========
+  const [appState, setAppState] = useState<AppState>('notConnected');
 
-  // Data state
-  const [repos, setRepos]                   = useState<GitHubRepo[]>([]);
-  const [loadingRepos, setLoadingRepos]     = useState(false);
-  const [selectedRepo, setSelectedRepo]     = useState<GitHubRepo | null>(null);
-  const [_branches, setBranches]            = useState<GitHubBranch[]>([]);
-  const [selectedBranch, setSelectedBranch] = useState('main');
-  const [_pulls, setPulls]                  = useState<GitHubPR[]>([]);
-  const [selectedPull]                      = useState<GitHubPR | null>(null);
-  const [report, setReport]                 = useState<ShipMateReport | null>(null);
-  const [analyzing, setAnalyzing]           = useState(false);
+  // Repository & branch selection
+  const [repos, setRepos] = useState<GitHubRepository[]>([]);
+  const [selectedRepo, setSelectedRepo] = useState<GitHubRepository | null>(null);
+  const [branches, setBranches] = useState<GitHubBranch[]>([]);
+  const [selectedBranch, setSelectedBranch] = useState<string>('main');
 
-  const { agents, markAllComplete, markAllError } = useAgentSimulation(analyzing);
+  // PR & Issue selection
+  const [pulls, setPulls] = useState<any[]>([]);
+  const [selectedPull, setSelectedPull] = useState<any | null>(null);
+  const [issues, setIssues] = useState<any[]>([]);
+  const [selectedIssue, setSelectedIssue] = useState<any | null>(null);
+
+  // Feature & analysis
+  const [featureRequest, setFeatureRequest] = useState<string>(SAMPLE_FEATURE_REQUEST);
+  const [agents, setAgents] = useState<AgentState[]>(INITIAL_AGENTS);
+  const [analysis, setAnalysis] = useState<AnalyzeResponse | null>(null);
+
+  // UI state
+  const [error, setError] = useState<string | null>(null);
+  const [uploadStatus, setUploadStatus] = useState<'idle' | 'uploading' | 'done' | 'error'>('idle');
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [isDragging, setIsDragging] = useState(false);
+
+  const updateAgentStatus = useCallback((name: AgentName, status: AgentState['status']) => {
+    setAgents(prev => prev.map(a => a.name === name ? { ...a, status } : a));
+  }, []);
 
   // Load repos on auth
   useEffect(() => {
@@ -127,12 +158,43 @@ export default function App() {
     setPage('repos');
   }, []);
 
-  // ── Not authenticated ──────────────────────────────────────────────────────
-  if (!auth.isAuthenticated) {
-    return <LandingPage onLogin={auth.login} loading={auth.loading} error={auth.error} />;
+  // ========== Refresh auth after callback ==========
+  useEffect(() => {
+    const checkAuth = () => {
+      const token = localStorage.getItem('github_access_token');
+      if (token && !githubAuth.isAuthenticated) {
+        githubAuth.refreshAuth();
+      }
+    };
+
+    // Check on window focus (for when callback page redirects)
+    window.addEventListener('focus', checkAuth);
+    return () => window.removeEventListener('focus', checkAuth);
+  }, [githubAuth]);
+
+  // Show loading state
+  if (githubAuth.loading) {
+    return (
+      <div className="flex h-screen items-center justify-center bg-slate-950">
+        <div className="text-center">
+          <Loader size={48} className="animate-spin text-blue-400 mx-auto mb-4" />
+          <p className="text-slate-400">Loading...</p>
+        </div>
+      </div>
+    );
   }
 
-  // ── Authenticated: sidebar app ─────────────────────────────────────────────
+  // Landing page (not connected) — full screen, no app shell
+  if (appState === 'notConnected' && !githubAuth.isAuthenticated) {
+    return (
+      <LandingPage
+        onLogin={githubAuth.initiateLogin}
+        loginLoading={githubAuth.loading}
+        loginError={githubAuth.error}
+      />
+    );
+  }
+
   return (
     <div className="flex min-h-screen bg-[#080e1d] text-slate-100 font-sans" style={{ overflow: 'hidden' }}>
       {/* Left sidebar */}
@@ -152,72 +214,263 @@ export default function App() {
         <div className="sticky top-0 z-40 bg-[#080e1d]/90 backdrop-blur-xl border-b border-slate-800/40 px-6 h-14 flex items-center justify-between">
           <p className="text-sm text-slate-400">
             {analyzing ? 'Analysis in Progress' :
-             page === 'dashboard'  ? 'Dashboard' :
-             page === 'repos'      ? 'Repositories' :
-             page === 'reports'    ? 'Analysis Report' : 'ShipMate AI'}
+              page === 'dashboard' ? 'Dashboard' :
+                page === 'repos' ? 'Repositories' :
+                  page === 'reports' ? 'Analysis Report' : 'ShipMate AI'}
           </p>
           {auth.user && (
             <div className="flex items-center gap-2">
               <img src={auth.user.avatar_url} alt="" className="w-6 h-6 rounded-full ring-1 ring-slate-700" />
               <span className="text-xs text-slate-400 hidden sm:block">{auth.user.login}</span>
             </div>
-          )}
+
+            {/* User Profile or Connect Button */}
+          {githubAuth.isAuthenticated && githubAuth.user ? (
+            <GitHubUserProfile
+              user={githubAuth.user}
+              onLogout={handleLogout}
+              loading={githubAuth.loading}
+            />
+          ) : null}
         </div>
+      </header>
 
-        {/* Pages */}
-        {analyzing && (
-          <AnalysisPage
-            selectedRepo={selectedRepo}
-            selectedBranch={selectedBranch}
-            selectedPull={selectedPull}
-            agents={agents}
-            onCancel={handleCancelAnalysis}
-          />
-        )}
+      {/* ========== Content Area ========== */}
+      <div className="flex-1 overflow-auto">
+        <div className="p-8">
+          <AnimatePresence mode="wait">
 
-        {!analyzing && page === 'dashboard' && (
-          <DashboardPage
-            user={auth.user}
-            repos={repos}
-            report={report}
-            onNavigate={setPage}
-          />
-        )}
+            {/* ========== REPOSITORY SELECTION STATE ========== */}
+            {appState === 'connected' && !selectedRepo && githubAuth.isAuthenticated && (
+              <motion.div
+                key="repo-list"
+                initial={{ opacity: 0, y: 20 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: -20 }}
+              >
+                <h2 className="text-2xl font-bold text-white mb-6">Your Repositories</h2>
 
-        {!analyzing && page === 'repos' && (
-          <RepositoriesPage
-            repos={repos}
-            loadingRepos={loadingRepos}
-            selectedRepo={selectedRepo}
-            analyzing={analyzing}
-            report={report}
-            onAnalyze={handleAnalyze}
-            onViewReport={() => setPage('reports')}
-          />
-        )}
+                {repos.length === 0 ? (
+                  <div className="text-center py-12">
+                    <p className="text-slate-400">No repositories found</p>
+                  </div>
+                ) : (
+                  <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                    {repos.map(repo => (
+                      <motion.button
+                        key={repo.id}
+                        onClick={() => handleSelectRepository(repo)}
+                        whileHover={{ scale: 1.02 }}
+                        className="p-4 rounded-lg border border-slate-700 bg-slate-800/50 hover:bg-slate-800 transition text-left"
+                      >
+                        <div className="flex items-start justify-between mb-2">
+                          <Code size={24} className="text-blue-400" />
+                          {repo.is_private && (
+                            <span className="text-xs bg-slate-700 px-2 py-1 rounded">Private</span>
+                          )}
+                        </div>
+                        <h3 className="font-semibold text-white mb-1">{repo.name}</h3>
+                        <p className="text-xs text-slate-400 mb-3 line-clamp-2">
+                          {repo.description || 'No description'}
+                        </p>
+                        <div className="flex items-center gap-4 text-xs text-slate-500">
+                          {repo.language && <span>{repo.language}</span>}
+                          <span>⭐ {repo.stars}</span>
+                        </div>
+                      </motion.button>
+                    ))}
+                  </div>
+                )}
+              </motion.div>
+            )}
 
-        {!analyzing && page === 'reports' && report && (
-          <ReportsPage
-            report={report}
-            onReRun={() => {
-              if (selectedRepo) handleAnalyze(selectedRepo);
-              else setPage('repos');
-            }}
-          />
-        )}
+            {/* ========== ANALYSIS INPUT STATE ========== */}
+            {selectedRepo && appState === 'repoSelected' && (
+              <motion.div
+                key="analysis-input"
+                initial={{ opacity: 0, y: 20 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: -20 }}
+              >
+                <button
+                  onClick={() => { setSelectedRepo(null); setAppState('connected'); }}
+                  className="mb-6 flex items-center gap-2 text-blue-400 hover:text-blue-300 transition"
+                >
+                  <ChevronRight size={18} className="rotate-180" />
+                  Back to repositories
+                </button>
 
-        {!analyzing && page === 'reports' && !report && (
-          <div className="flex flex-col items-center justify-center min-h-[60vh] text-center p-6">
-            <div className="text-5xl mb-4">📊</div>
-            <h2 className="text-xl font-black text-white mb-2">No report yet</h2>
-            <p className="text-sm text-slate-500 mb-6">Run an analysis on one of your repositories to generate a report.</p>
-            <button
-              onClick={() => setPage('repos')}
-              className="px-5 py-2.5 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-sm font-bold transition-all"
-            >
-              Go to Repositories
-            </button>
-          </div>
+                <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                  {/* Main Analysis Panel */}
+                  <div className="lg:col-span-2 space-y-6">
+                    {/* Repository Info */}
+                    <div className="p-6 rounded-lg bg-slate-800 border border-slate-700">
+                      <div className="flex items-center gap-4">
+                        <Code size={32} className="text-blue-400" />
+                        <div>
+                          <h3 className="text-xl font-semibold text-white">{selectedRepo.name}</h3>
+                          <p className="text-slate-400 text-sm">{selectedRepo.full_name}</p>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Branch Selector */}
+                    {branches.length > 0 && (
+                      <div>
+                        <label className="block text-sm font-semibold text-white mb-2">
+                          Branch
+                        </label>
+                        <select
+                          value={selectedBranch}
+                          onChange={(e) => setSelectedBranch(e.target.value)}
+                          className="w-full px-4 py-2 rounded-lg bg-slate-800 border border-slate-700 text-white focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition"
+                        >
+                          {branches.map((branch) => (
+                            <option key={branch.name} value={branch.name}>
+                              {branch.name}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                    )}
+
+                    {/* Pull Requests Selector */}
+                    {pulls.length > 0 && (
+                      <div>
+                        <label className="block text-sm font-semibold text-white mb-2">
+                          Pull Request (Optional)
+                        </label>
+                        <select
+                          value={selectedPull?.number || ''}
+                          onChange={(e) => {
+                            const prNum = e.target.value ? parseInt(e.target.value) : null;
+                            setSelectedPull(pulls.find(p => p.number === prNum) || null);
+                          }}
+                          className="w-full px-4 py-2 rounded-lg bg-slate-800 border border-slate-700 text-white focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition"
+                        >
+                          <option value="">None</option>
+                          {pulls.map((pr) => (
+                            <option key={pr.number} value={pr.number}>
+                              #{pr.number} - {pr.title}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                    )}
+
+                    {/* Feature Request */}
+                    <div>
+                      <label className="block text-sm font-semibold text-white mb-2">
+                        Feature Request / Issue Description
+                      </label>
+                      <textarea
+                        value={featureRequest}
+                        onChange={(e) => setFeatureRequest(e.target.value)}
+                        placeholder="Describe the feature you want to implement..."
+                        rows={6}
+                        className="w-full px-4 py-3 rounded-lg bg-slate-800 border border-slate-700 text-white placeholder-slate-500 focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition resize-none"
+                      />
+                    </div>
+                  </div>
+
+                  {/* Side Panel - Actions */}
+                  <div className="space-y-4">
+                    <div className="p-6 rounded-lg bg-blue-900/30 border border-blue-700/50">
+                      <Zap size={24} className="text-blue-400 mb-2" />
+                      <h4 className="font-semibold text-white mb-2">Ready to Analyze?</h4>
+                      <p className="text-sm text-slate-300 mb-4">
+                        ShipMate will run 5 AI agents to assess your delivery readiness.
+                      </p>
+                      <button
+                        onClick={handleAnalyze}
+                        disabled={loading || !featureRequest.trim()}
+                        className="w-full bg-gradient-to-r from-blue-600 to-blue-700 hover:from-blue-700 hover:to-blue-800 disabled:opacity-50 text-white font-semibold py-2 px-4 rounded-lg transition"
+                      >
+                        {loading ? 'Analyzing...' : 'Analyze Delivery Readiness'}
+                      </button>
+                    </div>
+
+                    {error && (
+                      <div className="p-4 rounded-lg bg-red-900/30 border border-red-700/50 text-red-200 text-sm flex items-start gap-2">
+                        <AlertCircle size={18} className="mt-0.5 flex-shrink-0" />
+                        <span>{error}</span>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </motion.div>
+            )}
+
+            {/* ========== ANALYZING STATE ========== */}
+            {appState === 'analyzing' && (
+              <motion.div
+                key="analyzing"
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                exit={{ opacity: 0 }}
+                className="space-y-6"
+              >
+                <h2 className="text-2xl font-bold text-white">Analyzing Delivery Readiness</h2>
+                <AgentSwarm agents={agents} />
+              </motion.div>
+            )}
+
+            {/* ========== ANALYSIS COMPLETE STATE ========== */}
+            {appState === 'analysisComplete' && analysis && (
+              <motion.div
+                key="results"
+                initial={{ opacity: 0, y: 20 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: -20 }}
+                className="space-y-6"
+              >
+                <div className="flex items-center justify-between">
+                  <h2 className="text-2xl font-bold text-white">Analysis Results</h2>
+                  <button
+                    onClick={() => { setSelectedRepo(null); setAnalysis(null); setAppState('connected'); }}
+                    className="text-blue-400 hover:text-blue-300 transition"
+                  >
+                    Analyze Another Repository
+                  </button>
+                </div>
+
+                {analysis && (
+                  <>
+                    <ReadinessScore score={analysis.readiness_score} breakdown={analysis.score_breakdown} />
+                    <ReportTabs
+                      planner={analysis.agents.planner}
+                      repoAnalyst={analysis.agents.repo_analyst}
+                      testGenerator={analysis.agents.test_generator}
+                      securityGuard={analysis.agents.security_guard}
+                      deliveryManager={analysis.agents.delivery_manager}
+                    />
+                  </>
+                )}
+              </motion.div>
+            )}
+
+            {/* ========== ERROR STATE ========== */}
+            {appState === 'error' && (
+              <motion.div
+                key="error"
+                initial={{ opacity: 0, y: 20 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: -20 }}
+                className="max-w-lg mx-auto p-6 rounded-lg bg-red-900/30 border border-red-700"
+              >
+                <AlertCircle className="w-12 h-12 text-red-400 mx-auto mb-4" />
+                <h3 className="text-xl font-semibold text-white text-center mb-2">Analysis Failed</h3>
+                <p className="text-red-200 text-center mb-6">{error}</p>
+                <button
+                  onClick={() => { setAppState('repoSelected'); setError(null); }}
+                  className="w-full bg-red-600 hover:bg-red-700 text-white font-semibold py-2 px-4 rounded-lg transition"
+                >
+                  Try Again
+                </button>
+              </motion.div>
+            )}
+          </AnimatePresence>
+        </div>
         )}
       </main>
     </div>
