@@ -2,9 +2,55 @@ from pydantic import BaseModel
 from typing import Optional, List, Dict, Any, Tuple
 
 
+# ============================================================================
+# GitHub Integration Models
+# ============================================================================
+
+class GitHubRepository(BaseModel):
+    id: str
+    name: str
+    full_name: str
+    description: str
+    url: str
+    language: str
+    stars: int
+    watchers: int
+    forks: int
+    tech_stack: List[str]
+
+
+class GitHubBranch(BaseModel):
+    name: str
+    commit: Dict[str, str]  # {"sha": "...", "message": "..."}
+
+
+class GitHubUser(BaseModel):
+    login: str
+    id: int
+    avatar_url: str
+
+
+class GitHubConnectionResponse(BaseModel):
+    access_token: str
+    token_type: str
+    scope: str
+    user: GitHubUser
+    installed_at: str
+
+
+# ============================================================================
+# Analysis Request/Response Models (GitHub-First)
+# ============================================================================
+
 class AnalyzeRequest(BaseModel):
+    """
+    GitHub-first analysis request.
+    Instead of ZIP uploads, we specify repo_id and branch.
+    """
+    repo_id: str
+    branch: str = "main"
     feature_request: str
-    repo_context: Optional[str] = None
+    github_token: Optional[str] = None
 
 
 class Task(BaseModel):
@@ -104,19 +150,20 @@ class AgentResults(BaseModel):
 
 
 class AnalyzeResponse(BaseModel):
-    readiness_score: int
+    repo_summary: Dict[str, Any]  # Repository info
     agents: AgentResults
+    readiness_score: int
+    recommendation: str  # "Ready to ship" | "Needs fixes before shipping" | "Major issues to address"
     summary: str
     markdown_report: str
     score_breakdown: Dict[str, int]
 
 
 class RepoSummary(BaseModel):
-    file_tree: List[str]
+    name: str
+    branch: str
+    tech_stack: List[str]
     file_count: int
-    detected_stack: List[str]
-    readme_content: Optional[str] = None
-    package_json: Optional[Dict[str, Any]] = None
-    requirements_txt: Optional[str] = None
-    key_files: Dict[str, str]
-    repo_context: str
+    files_to_modify: List[str]
+    language: str
+    stars: int
