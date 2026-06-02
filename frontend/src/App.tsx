@@ -14,6 +14,7 @@ import { AgentSwarm } from './components/AgentSwarm';
 import { ReadinessScore } from './components/ReadinessScore';
 import { ReportTabs } from './components/ReportTabs';
 import { GitHubConnectButton } from './components/GitHubConnectButton';
+import { LandingPage } from './components/LandingPage';
 import { GitHubUserProfile } from './components/GitHubUserProfile';
 import { useGithubAuth } from './hooks/useGithubAuth';
 import { api } from './lib/api';
@@ -264,6 +265,17 @@ export default function App() {
     );
   }
 
+  // Landing page (not connected) — full screen, no app shell
+  if (appState === 'notConnected' && !githubAuth.isAuthenticated) {
+    return (
+      <LandingPage
+        onLogin={githubAuth.initiateLogin}
+        loginLoading={githubAuth.loading}
+        loginError={githubAuth.error}
+      />
+    );
+  }
+
   return (
     <div className="flex h-screen bg-slate-950 text-slate-100 overflow-hidden">
       {/* ========== Sidebar Navigation ========== */}
@@ -318,22 +330,6 @@ export default function App() {
         <div className="flex-1 overflow-auto">
           <div className="p-8">
             <AnimatePresence mode="wait">
-              {/* ========== NOT CONNECTED STATE ========== */}
-              {appState === 'notConnected' && !githubAuth.isAuthenticated && (
-                <motion.div
-                  key="not-connected"
-                  initial={{ opacity: 0, y: 20 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  exit={{ opacity: 0, y: -20 }}
-                  className="max-w-2xl mx-auto"
-                >
-                  <GitHubConnectButton
-                    onClick={githubAuth.initiateLogin}
-                    loading={githubAuth.loading}
-                    error={githubAuth.error}
-                  />
-                </motion.div>
-              )}
 
               {/* ========== REPOSITORY SELECTION STATE ========== */}
               {appState === 'connected' && !selectedRepo && githubAuth.isAuthenticated && (
