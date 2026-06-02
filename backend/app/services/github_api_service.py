@@ -1,257 +1,119 @@
 """
-GitHub Service — Real GitHub API Integration
-
-Uses PyGithub library to fetch real data from GitHub API.
-Handles repositories, branches, pull requests, and issues.
+GitHub REST API service — uses httpx for async calls.
+Access tokens are never logged or stored beyond the request lifetime.
 """
 
-import os
-from typing import List, Dict, Any, Optional
-from github import Github
-from github.GithubException import GithubException
+import base64
+import asyncio
+from typing import Any, Dict, List, Optional
+
+import httpx
+
+_BASE = "https://api.github.com"
+_TIMEOUT = httpx.Timeout(20.0)
+
+
+def _headers(token: str) -> Dict[str, str]:
+    return {
+        "Authorization": f"token {token}",
+        "Accept": "application/vnd.github.v3+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
 
 
 class GitHubAPIService:
-    """
-    GitHub API service using PyGithub library.
-    Requires GitHub Personal Access Token for authentication.
-    """
-    
+
+    # ── User / repos ──────────────────────────────────────────────────────
+
     @staticmethod
-    def _get_github_client(access_token: str) -> Github:
-        """Get authenticated GitHub client"""
-        return Github(access_token)
-    
+    async def get_user_repos(token: str) -> List[Dict[str, Any]]:
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+            resp = await client.get(
+                f"{_BASE}/user/repos",
+                headers=_headers(token),
+                params={"sort": "updated", "direction": "desc", "per_page": 100, "type": "owner"},
+            )
+            resp.raise_for_status()
+            return resp.json()
+
     @staticmethod
-    async def get_user_repositories(access_token: str) -> List[Dict[str, Any]]:
-        """
-        Fetch authenticated user's repositories
-        
-        Args:
-            access_token: GitHub OAuth access token
-            
-        Returns:
-            List of repository objects with metadata
-        """
-        try:
-            g = GitHubAPIService._get_github_client(access_token)
-            user = g.get_user()
-            
-            repos = []
-            for repo in user.get_repos(type="owner"):
-                repos.append({
-                    "id": str(repo.id),
-                    "name": repo.name,
-                    "full_name": repo.full_name,
-                    "description": repo.description or "",
-                    "url": repo.html_url,
-                    "language": repo.language or "Unknown",
-                    "stars": repo.stargazers_count,
-                    "watchers": repo.watchers_count,
-                    "forks": repo.forks_count,
-                    "is_private": repo.private,
-                    "default_branch": repo.default_branch,
-                    "created_at": repo.created_at.isoformat(),
-                    "updated_at": repo.updated_at.isoformat(),
-                    "tech_stack": [repo.language] if repo.language else []
-                })
-            
-            return repos
-        except GithubException as e:
-            raise ValueError(f"GitHub API error: {str(e)}")
-        except Exception as e:
-            raise ValueError(f"Failed to fetch repositories: {str(e)}")
-    
+    async def get_repo_info(token: str, owner: str, repo: str) -> Dict[str, Any]:
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+            resp = await client.get(f"{_BASE}/repos/{owner}/{repo}", headers=_headers(token))
+            resp.raise_for_status()
+            return resp.json()
+
     @staticmethod
-    async def get_repository_branches(
-        access_token: str,
-        owner: str,
-        repo_name: str
-    ) -> List[Dict[str, Any]]:
-        """
-        Fetch all branches for a repository
-        
-        Args:
-            access_token: GitHub OAuth access token
-            owner: Repository owner username
-            repo_name: Repository name
-            
-        Returns:
-            List of branch objects with commit info
-        """
-        try:
-            g = GitHubAPIService._get_github_client(access_token)
-            repo = g.get_user(owner).get_repo(repo_name)
-            
-            branches = []
-            for branch in repo.get_branches():
-                branches.append({
-                    "name": branch.name,
-                    "commit": {
-                        "sha": branch.commit.sha[:7],  # Short SHA
-                        "message": branch.commit.commit.message.split("\n")[0],  # First line
-                        "author": branch.commit.commit.author.name if branch.commit.commit.author else "Unknown",
-                        "date": branch.commit.commit.author.date.isoformat() if branch.commit.commit.author else ""
-                    },
-                    "protected": branch.protected
-                })
-            
-            return branches
-        except GithubException as e:
-            raise ValueError(f"GitHub API error: {str(e)}")
-        except Exception as e:
-            raise ValueError(f"Failed to fetch branches: {str(e)}")
-    
+    async def get_branches(token: str, owner: str, repo: str) -> List[Dict[str, Any]]:
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+            resp = await client.get(
+                f"{_BASE}/repos/{owner}/{repo}/branches",
+                headers=_headers(token),
+                params={"per_page": 50},
+            )
+            resp.raise_for_status()
+            return resp.json()
+
+    # ── File tree ─────────────────────────────────────────────────────────
+
     @staticmethod
-    async def get_repository_pulls(
-        access_token: str,
-        owner: str,
-        repo_name: str,
-        state: str = "open"
-    ) -> List[Dict[str, Any]]:
-        """
-        Fetch pull requests for a repository
-        
-        Args:
-            access_token: GitHub OAuth access token
-            owner: Repository owner username
-            repo_name: Repository name
-            state: "open", "closed", or "all"
-            
-        Returns:
-            List of pull request objects
-        """
-        try:
-            g = GitHubAPIService._get_github_client(access_token)
-            repo = g.get_user(owner).get_repo(repo_name)
-            
-            pulls = []
-            for pr in repo.get_pulls(state=state):
-                pulls.append({
-                    "number": pr.number,
-                    "title": pr.title,
-                    "body": pr.body or "",
-                    "state": pr.state,
-                    "author": pr.user.login if pr.user else "Unknown",
-                    "author_avatar": pr.user.avatar_url if pr.user else "",
-                    "created_at": pr.created_at.isoformat(),
-                    "updated_at": pr.updated_at.isoformat(),
-                    "merged": pr.merged,
-                    "merged_at": pr.merged_at.isoformat() if pr.merged_at else None,
-                    "head_branch": pr.head.ref,
-                    "base_branch": pr.base.ref,
-                    "additions": pr.additions,
-                    "deletions": pr.deletions,
-                    "changed_files": pr.changed_files,
-                    "url": pr.html_url
-                })
-            
-            return pulls
-        except GithubException as e:
-            raise ValueError(f"GitHub API error: {str(e)}")
-        except Exception as e:
-            raise ValueError(f"Failed to fetch pull requests: {str(e)}")
-    
+    async def get_file_tree(token: str, owner: str, repo: str, branch: str = "main") -> List[str]:
+        """Returns a flat list of all file paths in the repo (recursive tree walk)."""
+        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
+            resp = await client.get(
+                f"{_BASE}/repos/{owner}/{repo}/git/trees/{branch}",
+                headers=_headers(token),
+                params={"recursive": "1"},
+            )
+            if resp.status_code == 404:
+                # Branch might be "master"
+                resp = await client.get(
+                    f"{_BASE}/repos/{owner}/{repo}/git/trees/master",
+                    headers=_headers(token),
+                    params={"recursive": "1"},
+                )
+            resp.raise_for_status()
+            data = resp.json()
+            return [item["path"] for item in data.get("tree", []) if item.get("type") == "blob"]
+
     @staticmethod
-    async def get_repository_issues(
-        access_token: str,
-        owner: str,
-        repo_name: str,
-        state: str = "open"
-    ) -> List[Dict[str, Any]]:
-        """
-        Fetch issues for a repository
-        
-        Args:
-            access_token: GitHub OAuth access token
-            owner: Repository owner username
-            repo_name: Repository name
-            state: "open", "closed", or "all"
-            
-        Returns:
-            List of issue objects
-        """
-        try:
-            g = GitHubAPIService._get_github_client(access_token)
-            repo = g.get_user(owner).get_repo(repo_name)
-            
-            issues = []
-            for issue in repo.get_issues(state=state):
-                # Skip pull requests (they're also returned as issues)
-                if issue.pull_request:
-                    continue
-                
-                issues.append({
-                    "number": issue.number,
-                    "title": issue.title,
-                    "body": issue.body or "",
-                    "state": issue.state,
-                    "author": issue.user.login if issue.user else "Unknown",
-                    "author_avatar": issue.user.avatar_url if issue.user else "",
-                    "created_at": issue.created_at.isoformat(),
-                    "updated_at": issue.updated_at.isoformat(),
-                    "closed_at": issue.closed_at.isoformat() if issue.closed_at else None,
-                    "labels": [label.name for label in issue.labels],
-                    "assignees": [assignee.login for assignee in issue.assignees],
-                    "comments": issue.comments,
-                    "url": issue.html_url
-                })
-            
-            return issues
-        except GithubException as e:
-            raise ValueError(f"GitHub API error: {str(e)}")
-        except Exception as e:
-            raise ValueError(f"Failed to fetch issues: {str(e)}")
-    
+    async def get_file_content(token: str, owner: str, repo: str, path: str) -> Optional[str]:
+        """Fetch and decode a single file's content. Returns None on 404 / binary files."""
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+            resp = await client.get(
+                f"{_BASE}/repos/{owner}/{repo}/contents/{path}",
+                headers=_headers(token),
+            )
+            if resp.status_code == 404:
+                return None
+            resp.raise_for_status()
+            data = resp.json()
+            if data.get("encoding") == "base64" and data.get("content"):
+                try:
+                    return base64.b64decode(data["content"]).decode("utf-8", errors="replace")
+                except Exception:
+                    return None
+            return None
+
+    # ── PRs ───────────────────────────────────────────────────────────────
+
     @staticmethod
-    async def get_repository_contents(
-        access_token: str,
-        owner: str,
-        repo_name: str,
-        path: str = ""
-    ) -> List[Dict[str, Any]]:
-        """
-        Fetch file tree for a repository
-        
-        Args:
-            access_token: GitHub OAuth access token
-            owner: Repository owner username
-            repo_name: Repository name
-            path: Directory path (empty for root)
-            
-        Returns:
-            List of file objects with metadata
-        """
-        try:
-            g = GitHubAPIService._get_github_client(access_token)
-            repo = g.get_user(owner).get_repo(repo_name)
-            
-            contents = []
-            try:
-                items = repo.get_contents(path if path else "")
-                if isinstance(items, list):
-                    for item in items:
-                        contents.append({
-                            "name": item.name,
-                            "path": item.path,
-                            "type": item.type,  # "file" or "dir"
-                            "size": item.size if item.type == "file" else 0,
-                            "url": item.html_url
-                        })
-                else:
-                    contents.append({
-                        "name": items.name,
-                        "path": items.path,
-                        "type": items.type,
-                        "size": items.size if items.type == "file" else 0,
-                        "url": items.html_url
-                    })
-            except GithubException:
-                # Path doesn't exist or empty
-                pass
-            
-            return contents
-        except GithubException as e:
-            raise ValueError(f"GitHub API error: {str(e)}")
-        except Exception as e:
-            raise ValueError(f"Failed to fetch repository contents: {str(e)}")
+    async def get_pr_info(token: str, owner: str, repo: str, pr_number: int) -> Dict[str, Any]:
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+            resp = await client.get(
+                f"{_BASE}/repos/{owner}/{repo}/pulls/{pr_number}",
+                headers=_headers(token),
+            )
+            resp.raise_for_status()
+            return resp.json()
+
+    @staticmethod
+    async def get_open_pulls(token: str, owner: str, repo: str) -> List[Dict[str, Any]]:
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+            resp = await client.get(
+                f"{_BASE}/repos/{owner}/{repo}/pulls",
+                headers=_headers(token),
+                params={"state": "open", "per_page": 30},
+            )
+            resp.raise_for_status()
+            return resp.json()

@@ -1,150 +1,106 @@
 import { motion } from 'framer-motion';
-import { TrendingUp, TrendingDown } from 'lucide-react';
+import type { ScoreBreakdown, ShipRecommendation } from '../types';
 
-interface ReadinessScoreProps {
+const REC_CONFIG: Record<ShipRecommendation, { label: string; color: string; bg: string; border: string }> = {
+  ready_to_ship:  { label: '✅ Ready to Ship',  color: 'text-emerald-400', bg: 'bg-emerald-500/10', border: 'border-emerald-500/30' },
+  mostly_ready:   { label: '🟢 Mostly Ready',   color: 'text-green-400',   bg: 'bg-green-500/10',   border: 'border-green-500/30' },
+  needs_review:   { label: '🟡 Needs Review',   color: 'text-yellow-400',  bg: 'bg-yellow-500/10',  border: 'border-yellow-500/30' },
+  risky_release:  { label: '🟠 Risky Release',  color: 'text-orange-400',  bg: 'bg-orange-500/10',  border: 'border-orange-500/30' },
+  not_ready:      { label: '🔴 Not Ready',       color: 'text-red-400',     bg: 'bg-red-500/10',     border: 'border-red-500/30' },
+};
+
+const DIM_LABELS: [keyof ScoreBreakdown, string, number][] = [
+  ['repo_score',     'Repo Structure', 20],
+  ['delivery_score', 'Delivery Plan',  25],
+  ['security_score', 'Security',       30],
+  ['test_score',     'Test Coverage',  25],
+];
+
+function scoreColor(n: number) {
+  if (n >= 80) return 'text-emerald-400';
+  if (n >= 60) return 'text-yellow-400';
+  if (n >= 40) return 'text-orange-400';
+  return 'text-red-400';
+}
+function barColor(n: number) {
+  if (n >= 80) return 'bg-emerald-500';
+  if (n >= 60) return 'bg-yellow-500';
+  if (n >= 40) return 'bg-orange-500';
+  return 'bg-red-500';
+}
+function strokeColor(n: number) {
+  if (n >= 80) return '#10b981';
+  if (n >= 60) return '#eab308';
+  if (n >= 40) return '#f97316';
+  return '#ef4444';
+}
+
+export function ReadinessScore({
+  score,
+  recommendation,
+  breakdown,
+}: {
   score: number;
-  breakdown: Record<string, number>;
-}
-
-function ScoreRing({ score }: { score: number }) {
-  const radius = 60;
-  const circumference = 2 * Math.PI * radius;
-  const strokeDashoffset = circumference - (score / 100) * circumference;
-
-  const getColor = (s: number) => {
-    if (s >= 80) return '#10b981';
-    if (s >= 60) return '#f59e0b';
-    return '#ef4444';
-  };
-
-  const color = getColor(score);
+  recommendation: ShipRecommendation;
+  breakdown: ScoreBreakdown;
+}) {
+  const rec = REC_CONFIG[recommendation] ?? REC_CONFIG.not_ready;
+  const r = 54, circ = 2 * Math.PI * r;
+  const dashOffset = circ - (score / 100) * circ;
 
   return (
-    <div style={{ position: 'relative', width: 160, height: 160, flexShrink: 0 }}>
-      <svg width="160" height="160" style={{ transform: 'rotate(-90deg)' }}>
-        {/* Track */}
-        <circle
-          cx="80" cy="80" r={radius}
-          fill="none"
-          stroke="rgba(255,255,255,0.05)"
-          strokeWidth="10"
-        />
-        {/* Progress */}
-        <motion.circle
-          cx="80" cy="80" r={radius}
-          fill="none"
-          stroke={color}
-          strokeWidth="10"
-          strokeLinecap="round"
-          strokeDasharray={circumference}
-          initial={{ strokeDashoffset: circumference }}
-          animate={{ strokeDashoffset }}
-          transition={{ duration: 1.5, ease: 'easeOut', delay: 0.3 }}
-          style={{ filter: `drop-shadow(0 0 8px ${color})` }}
-        />
-      </svg>
-      <div style={{
-        position: 'absolute', inset: 0,
-        display: 'flex', flexDirection: 'column',
-        alignItems: 'center', justifyContent: 'center',
-        gap: 2,
-      }}>
-        <motion.div
-          initial={{ opacity: 0, scale: 0.5 }}
-          animate={{ opacity: 1, scale: 1 }}
-          transition={{ delay: 0.8, type: 'spring' }}
-          style={{
-            fontSize: 36, fontWeight: 900, lineHeight: 1,
-            color,
-            textShadow: `0 0 20px ${color}`,
-          }}
-        >
-          {score}
-        </motion.div>
-        <div style={{ fontSize: 12, color: '#4a6180', fontWeight: 500 }}>/ 100</div>
-      </div>
-    </div>
-  );
-}
-
-const DIMENSION_LABELS: Record<string, string> = {
-  task_clarity: 'Task Clarity',
-  test_coverage: 'Test Coverage',
-  security_score: 'Security Score',
-  deployment_confidence: 'Deploy Confidence',
-  repo_confidence: 'Repo Confidence',
-  cicd_readiness: 'CI/CD Readiness',
-};
-
-const DIMENSION_COLORS: Record<string, string> = {
-  task_clarity: '#60a5fa',
-  test_coverage: '#34d399',
-  security_score: '#f87171',
-  deployment_confidence: '#fbbf24',
-  repo_confidence: '#a78bfa',
-  cicd_readiness: '#06b6d4',
-};
-
-export function ReadinessScore({ score, breakdown }: ReadinessScoreProps) {
-  const label = score >= 80 ? 'Production Ready' : score >= 60 ? 'Needs Work' : 'Not Ready';
-  const trendUp = score >= 70;
-
-  return (
-    <motion.div
-      initial={{ opacity: 0, scale: 0.95 }}
-      animate={{ opacity: 1, scale: 1 }}
-      transition={{ duration: 0.5 }}
-      style={{
-        padding: '28px',
-        background: 'rgba(17, 24, 39, 0.85)',
-        border: '1px solid rgba(99, 179, 237, 0.12)',
-        borderRadius: 20,
-        backdropFilter: 'blur(12px)',
-      }}
-    >
-      <div style={{ display: 'flex', alignItems: 'flex-start', gap: 28, flexWrap: 'wrap' }}>
-        {/* Score Ring */}
-        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 12 }}>
-          <ScoreRing score={score} />
-          <div style={{ textAlign: 'center' }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 6, justifyContent: 'center' }}>
-              {trendUp ? <TrendingUp size={14} color="#10b981" /> : <TrendingDown size={14} color="#ef4444" />}
-              <span style={{
-                fontSize: 13,
-                fontWeight: 700,
-                color: score >= 80 ? '#10b981' : score >= 60 ? '#f59e0b' : '#ef4444',
-              }}>
-                {label}
-              </span>
-            </div>
-            <div style={{ fontSize: 11, color: '#4a6180', marginTop: 2 }}>Production Readiness</div>
+    <div className="rounded-2xl border bg-slate-800/60 border-slate-700/40 p-6">
+      <div className="flex flex-col sm:flex-row items-center gap-8">
+        {/* Ring */}
+        <div className="relative flex-shrink-0">
+          <svg width={136} height={136}>
+            <circle cx={68} cy={68} r={r} fill="none" stroke="#1e293b" strokeWidth={10} />
+            <motion.circle
+              cx={68} cy={68} r={r}
+              fill="none"
+              stroke={strokeColor(score)}
+              strokeWidth={10}
+              strokeLinecap="round"
+              strokeDasharray={circ}
+              initial={{ strokeDashoffset: circ }}
+              animate={{ strokeDashoffset: dashOffset }}
+              transition={{ duration: 1.2, ease: 'easeOut' }}
+              style={{ transform: 'rotate(-90deg)', transformOrigin: '50% 50%' }}
+            />
+          </svg>
+          <div className="absolute inset-0 flex flex-col items-center justify-center">
+            <motion.span
+              className={`text-4xl font-black ${scoreColor(score)}`}
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              transition={{ delay: 0.6 }}
+            >
+              {score}
+            </motion.span>
+            <span className="text-xs text-slate-500 font-medium">/ 100</span>
           </div>
         </div>
 
-        {/* Breakdown */}
-        <div style={{ flex: 1, minWidth: 200 }}>
-          <div style={{ marginBottom: 16, fontWeight: 700, fontSize: 15, color: '#f0f6ff' }}>Score Breakdown</div>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-            {Object.entries(breakdown).map(([key, value]) => {
-              const color = DIMENSION_COLORS[key] || '#60a5fa';
-              const label = DIMENSION_LABELS[key] || key;
+        {/* Recommendation + breakdown */}
+        <div className="flex-1 w-full">
+          <div className={`inline-flex items-center gap-2 px-3 py-1.5 rounded-lg border text-sm font-semibold mb-4 ${rec.bg} ${rec.border} ${rec.color}`}>
+            {rec.label}
+          </div>
+          <div className="space-y-2">
+            {DIM_LABELS.map(([key, label, weight]) => {
+              const val = breakdown[key];
               return (
                 <div key={key}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
-                    <span style={{ fontSize: 12, color: '#8ba3c1' }}>{label}</span>
-                    <span style={{ fontSize: 12, fontWeight: 700, color }}>{value}</span>
+                  <div className="flex justify-between text-xs mb-1">
+                    <span className="text-slate-400">{label} <span className="text-slate-600">({weight}%)</span></span>
+                    <span className={`font-bold ${scoreColor(val)}`}>{val}</span>
                   </div>
-                  <div style={{ height: 4, background: 'rgba(255,255,255,0.05)', borderRadius: 2 }}>
+                  <div className="h-1.5 rounded-full bg-slate-700/60">
                     <motion.div
+                      className={`h-full rounded-full ${barColor(val)}`}
                       initial={{ width: 0 }}
-                      animate={{ width: `${value}%` }}
-                      transition={{ duration: 1, ease: 'easeOut', delay: 0.5 }}
-                      style={{
-                        height: '100%',
-                        background: color,
-                        borderRadius: 2,
-                        boxShadow: `0 0 6px ${color}50`,
-                      }}
+                      animate={{ width: `${val}%` }}
+                      transition={{ duration: 0.8, delay: 0.2 }}
                     />
                   </div>
                 </div>
@@ -153,6 +109,6 @@ export function ReadinessScore({ score, breakdown }: ReadinessScoreProps) {
           </div>
         </div>
       </div>
-    </motion.div>
+    </div>
   );
 }

@@ -1,222 +1,210 @@
-// ============================================================================
-// GitHub Integration Types
-// ============================================================================
+// ── GitHub auth ───────────────────────────────────────────────────────────────
 
 export interface GitHubUser {
-  login: string;
   id: number;
+  login: string;
+  name: string;
   avatar_url: string;
-  name?: string;
+  html_url: string;
+  email?: string;
   bio?: string;
   company?: string;
-  public_repos?: number;
-  followers?: number;
+  location?: string;
+  public_repos: number;
+  followers: number;
+  following: number;
 }
 
-export interface GitHubRepository {
-  id: string;
+export interface GitHubRepo {
+  id: number;
   name: string;
   full_name: string;
-  description: string;
-  url: string;
-  language: string;
-  stars: number;
-  watchers: number;
-  forks: number;
-  is_private?: boolean;
-  default_branch?: string;
-  created_at?: string;
-  updated_at?: string;
-  tech_stack: string[];
-}
-
-export interface GitHubCommit {
-  sha: string;
-  message: string;
-  author?: string;
-  author_date?: string;
+  description: string | null;
+  html_url: string;
+  private: boolean;
+  default_branch: string;
+  language: string | null;
+  stargazers_count: number;
+  forks_count: number;
+  updated_at: string | null;
+  owner: { login: string; avatar_url: string };
 }
 
 export interface GitHubBranch {
   name: string;
-  commit: GitHubCommit;
-  protected?: boolean;
+  commit: { sha: string };
+  protected: boolean;
 }
 
-export interface GitHubPullRequest {
+export interface GitHubPR {
   number: number;
   title: string;
-  body?: string;
-  state: 'open' | 'closed' | 'merged';
-  author: string;
-  author_avatar?: string;
+  state: string;
+  html_url: string;
+  user: { login: string };
   created_at: string;
-  updated_at?: string;
-  merged?: boolean;
-  merged_at?: string;
-  head_branch: string;
-  base_branch: string;
-  additions: number;
-  deletions: number;
-  changed_files: number;
-  url?: string;
 }
 
-export interface GitHubIssue {
-  number: number;
-  title: string;
-  body?: string;
-  state: 'open' | 'closed';
-  author: string;
-  author_avatar?: string;
-  created_at: string;
-  updated_at?: string;
-  closed_at?: string;
-  labels?: string[];
-  assignees?: string[];
-  comments?: number;
-  url?: string;
+// ── Agent outputs ─────────────────────────────────────────────────────────────
+
+export type Severity = 'critical' | 'high' | 'medium' | 'low' | 'info';
+export type ShipRecommendation =
+  | 'ready_to_ship'
+  | 'mostly_ready'
+  | 'needs_review'
+  | 'risky_release'
+  | 'not_ready';
+
+export interface ArchitectureRisk {
+  risk: string;
+  impact: string;
+  category: string;
 }
 
-export interface GitHubConnection {
-  success: boolean;
-  access_token: string;
-  token_type: string;
-  scope: string;
-  user: GitHubUser;
-  installed_at: string;
-  message?: string;
-}
-
-export type AppState = 'notConnected' | 'connecting' | 'connected' | 'repoSelected' | 'analyzing' | 'analysisComplete' | 'error';
-
-// ============================================================================
-// Repo Analysis Types
-// ============================================================================
-
-export interface RepoSummary {
-  name: string;
-  branch: string;
+export interface RepoLensOutput {
   tech_stack: string[];
+  primary_language: string;
+  architecture_pattern: string;
+  key_modules: string[];
+  entry_points: string[];
+  config_files: string[];
+  has_ci_cd: boolean;
+  has_dockerfile: boolean;
+  has_tests: boolean;
+  architecture_risks: ArchitectureRisk[];
+  dependency_summary: Record<string, string[]>;
   file_count: number;
-  files_to_modify: string[];
-  language: string;
-  stars: number;
+  repo_score: number;
 }
 
-export interface Task {
+export interface Milestone {
+  title: string;
+  description: string;
+  estimated_days: number;
+  priority: string;
+  category: string;
+}
+
+export interface Blocker {
   id: string;
   title: string;
-  type: 'frontend' | 'backend' | 'database' | 'test' | 'devops';
-  priority: 'high' | 'medium' | 'low';
-  effort: 'S' | 'M' | 'L' | 'XL';
   description: string;
+  severity: string;
+  resolution: string;
+  category: string;
 }
 
-export interface PlannerOutput {
-  frontend_tasks: Task[];
-  backend_tasks: Task[];
-  database_changes: Task[];
-  test_requirements: Task[];
-  deployment_risks: string[];
-  total_story_points: number;
-  recommended_sprint_count: number;
+export interface PlanForgeOutput {
+  milestones: Milestone[];
+  blockers: Blocker[];
+  dependencies: string[];
+  next_best_action: string;
+  estimated_effort: string;
+  delivery_score: number;
 }
 
-export interface RepoFile {
-  path: string;
-  risk_level: 'high' | 'medium' | 'low';
-  change_type: 'modify' | 'create' | 'delete';
-  reason: string;
-}
-
-export interface RepoAnalystOutput {
-  files_to_change: RepoFile[];
-  affected_apis: string[];
-  risky_dependencies: string[];
-  patterns_to_follow: string[];
-  impact_score: number;
-  architecture_notes: string;
-}
-
-export interface TestCase {
-  id: string;
-  name: string;
-  type: 'unit' | 'integration' | 'e2e' | 'security';
-  priority: 'high' | 'medium' | 'low';
-  description: string;
-  assertions: string[];
-}
-
-export interface TestGeneratorOutput {
-  unit_tests: TestCase[];
-  api_tests: TestCase[];
-  edge_cases: TestCase[];
-  regression_checklist: string[];
-  total_coverage_estimate: number;
-}
-
-export interface SecurityRisk {
+export interface SecurityFinding {
   id: string;
   title: string;
-  severity: 'critical' | 'high' | 'medium' | 'low';
+  severity: Severity;
   category: string;
   description: string;
   recommendation: string;
-  cve_reference?: string;
+  file?: string;
+  cve?: string;
 }
 
-export interface SecurityGuardOutput {
-  risks: SecurityRisk[];
-  prompt_injection_risks: string[];
+export interface GuardRailOutput {
+  findings: SecurityFinding[];
   exposed_secrets: string[];
-  unsafe_tool_calls: string[];
-  auth_bypass_risks: string[];
-  dependency_warnings: string[];
-  overall_security_score: number;
+  cors_issues: string[];
+  auth_risks: string[];
+  dependency_vulnerabilities: string[];
+  security_score: number;
 }
 
-export interface SprintTask {
-  day: string;
-  tasks: string[];
+export interface ExistingTests {
+  count: number;
+  coverage_estimate: number;
+  frameworks: string[];
+  test_files: string[];
+}
+
+export interface SuggestedTest {
+  name: string;
+  type: string;
+  priority: string;
+  description: string;
+  target_file?: string;
+}
+
+export interface TestPilotOutput {
+  existing_tests: ExistingTests;
+  missing_coverage_areas: string[];
+  suggested_tests: SuggestedTest[];
+  qa_readiness: string;
+  test_score: number;
+}
+
+// ── Report ────────────────────────────────────────────────────────────────────
+
+export interface ScoreBreakdown {
+  repo_score: number;
+  delivery_score: number;
+  security_score: number;
+  test_score: number;
+}
+
+export interface RepoInfo {
   owner: string;
+  name: string;
+  full_name: string;
+  branch: string;
+  description?: string;
+  language?: string;
+  stars: number;
+  file_count: number;
+  html_url: string;
 }
 
-export interface DeliveryManagerOutput {
-  sprint_plan: SprintTask[];
-  standup_summary: string;
-  pr_review_summary: string;
-  cicd_recommendations: string[];
-  release_readiness_score: number;
+export interface AgentOutputs {
+  repo_lens: RepoLensOutput;
+  plan_forge: PlanForgeOutput;
+  guardrail: GuardRailOutput;
+  testpilot: TestPilotOutput;
+}
+
+export interface ShipMateReport {
+  repo: RepoInfo;
+  readiness_score: number;
+  ship_recommendation: ShipRecommendation;
+  score_breakdown: ScoreBreakdown;
+  agents: AgentOutputs;
+  key_blockers: string[];
   next_actions: string[];
-  estimated_release_date: string;
-}
-
-export interface AgentResults {
-  planner: PlannerOutput;
-  repo_analyst: RepoAnalystOutput;
-  test_generator: TestGeneratorOutput;
-  security_guard: SecurityGuardOutput;
-  delivery_manager: DeliveryManagerOutput;
+  generated_at: string;
 }
 
 export interface AnalyzeResponse {
-  repo_summary: RepoSummary;
-  agents: AgentResults;
-  readiness_score: number;
-  recommendation: 'Ready to ship' | 'Needs fixes before shipping' | 'Major issues to address';
-  summary: string;
-  markdown_report: string;
-  score_breakdown: Record<string, number>;
+  status: string;
+  report: ShipMateReport;
 }
 
-export type AgentName = 'planner' | 'repo_analyst' | 'test_generator' | 'security_guard' | 'delivery_manager';
+// ── App state ─────────────────────────────────────────────────────────────────
+
+export type AppState =
+  | 'not_connected'
+  | 'connected'
+  | 'analyzing'
+  | 'complete'
+  | 'error';
+
 export type AgentStatus = 'idle' | 'running' | 'complete' | 'error';
 
-export interface AgentState {
-  name: AgentName;
+export interface AgentProgress {
+  id: 'repo_lens' | 'plan_forge' | 'guardrail' | 'testpilot';
   label: string;
   icon: string;
-  status: AgentStatus;
   description: string;
+  status: AgentStatus;
 }

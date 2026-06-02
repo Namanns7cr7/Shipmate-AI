@@ -1,6 +1,6 @@
 import { LogOut } from 'lucide-react';
 import { motion } from 'framer-motion';
-import type { GitHubUser } from '../hooks/useGithubAuth';
+import type { GitHubUser } from '../types';
 
 // Inline GitHub icon (not available in lucide-react)
 function GithubIcon({ size = 24, className = '' }: { size?: number; className?: string }) {

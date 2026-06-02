@@ -1,574 +1,225 @@
 import { useState, useCallback, useEffect } from 'react';
-import { motion, AnimatePresence } from 'framer-motion';
-import {
-  Menu,
-  X,
-  ChevronRight,
-  Loader,
-  AlertCircle,
-  Code,
-  Zap,
-} from 'lucide-react';
-import { Sidebar } from './components/Sidebar';
-import { AgentSwarm } from './components/AgentSwarm';
-import { ReadinessScore } from './components/ReadinessScore';
-import { ReportTabs } from './components/ReportTabs';
-import { GitHubConnectButton } from './components/GitHubConnectButton';
-import { GitHubUserProfile } from './components/GitHubUserProfile';
 import { useGithubAuth } from './hooks/useGithubAuth';
 import { api } from './lib/api';
+import { LandingPage } from './components/landing/LandingPage';
+import { AppSidebar } from './components/app/AppSidebar';
+import { DashboardPage } from './pages/DashboardPage';
+import { RepositoriesPage } from './pages/RepositoriesPage';
+import { AnalysisPage } from './pages/AnalysisPage';
+import { ReportsPage } from './pages/ReportsPage';
+import type { Page } from './components/app/AppSidebar';
 import type {
-  GitHubRepository,
-  GitHubBranch,
-  AnalyzeResponse,
-  AgentState,
+  AgentProgress, GitHubRepo, GitHubBranch, GitHubPR, ShipMateReport,
 } from './types';
 
-const INITIAL_AGENTS: AgentState[] = [
-  {
-    name: 'planner',
-    label: 'Planner Agent',
-    icon: '🧠',
-    status: 'idle',
-    description: 'Converts feature request into structured engineering tasks with story points.',
-  },
-  {
-    name: 'repo_analyst',
-    label: 'Repo Analyst Agent',
-    icon: '🔍',
-    status: 'idle',
-    description: 'Maps feature impact across the codebase and identifies affected files.',
-  },
-  {
-    name: 'test_generator',
-    label: 'Test Architect Agent',
-    icon: '🧪',
-    status: 'idle',
-    description: 'Creates comprehensive unit, API, and edge case tests.',
-  },
-  {
-    name: 'security_guard',
-    label: 'Security Guard Agent',
-    icon: '🛡️',
-    status: 'idle',
-    description: 'Identifies security vulnerabilities, CVEs, and compliance risks.',
-  },
-  {
-    name: 'delivery_manager',
-    label: 'Delivery Manager Agent',
-    icon: '🚢',
-    status: 'idle',
-    description: 'Produces sprint plan, CI/CD recommendations, and release readiness.',
-  },
+const INITIAL_AGENTS: AgentProgress[] = [
+  { id: 'repo_lens',  label: 'RepoLens',  icon: '🔍', status: 'idle', description: 'Repo structure, tech stack & architecture risks' },
+  { id: 'plan_forge', label: 'PlanForge', icon: '📋', status: 'idle', description: 'Delivery milestones, blockers & next actions' },
+  { id: 'guardrail',  label: 'GuardRail', icon: '🔒', status: 'idle', description: 'Security findings, secrets & CORS analysis' },
+  { id: 'testpilot',  label: 'TestPilot', icon: '🧪', status: 'idle', description: 'Test coverage, gaps & QA readiness' },
 ];
 
-const SAMPLE_FEATURE_REQUEST = `Add social login with GitHub OAuth.
+function useAgentSimulation(analyzing: boolean) {
+  const [agents, setAgents] = useState<AgentProgress[]>(INITIAL_AGENTS);
 
-Requirements:
-- Support GitHub login via OAuth2 flow
-- Link GitHub account to user profile
-- Show linked repositories in dashboard
-- Allow one-click analysis of selected repos
-- Secure token storage in backend`;
+  useEffect(() => {
+    if (!analyzing) { setAgents(INITIAL_AGENTS); return; }
+    const steps: { id: AgentProgress['id']; delay: number }[] = [
+      { id: 'repo_lens',  delay: 200  },
+      { id: 'plan_forge', delay: 2800 },
+      { id: 'guardrail',  delay: 3200 },
+      { id: 'testpilot',  delay: 3600 },
+    ];
+    const timers = steps.map(({ id, delay }) =>
+      setTimeout(() => setAgents(prev => prev.map(a => a.id === id ? { ...a, status: 'running' } : a)), delay)
+    );
+    return () => timers.forEach(clearTimeout);
+  }, [analyzing]);
 
-type AppState = 'notConnected' | 'connected' | 'repoSelected' | 'analyzing' | 'analysisComplete' | 'error';
+  function markAllComplete() { setAgents(prev => prev.map(a => ({ ...a, status: 'complete' }))); }
+  function markAllError()    { setAgents(prev => prev.map(a => ({ ...a, status: a.status === 'running' ? 'error' : a.status }))); }
+
+  return { agents, markAllComplete, markAllError };
+}
 
 export default function App() {
-  // ========== Authentication ==========
-  const githubAuth = useGithubAuth();
+  const auth = useGithubAuth();
 
-  // ========== App State ==========
-  const [appState, setAppState] = useState<AppState>('notConnected');
-  
-  // Repository & branch selection
-  const [repos, setRepos] = useState<GitHubRepository[]>([]);
-  const [selectedRepo, setSelectedRepo] = useState<GitHubRepository | null>(null);
-  const [branches, setBranches] = useState<GitHubBranch[]>([]);
-  const [selectedBranch, setSelectedBranch] = useState<string>('main');
-  
-  // PR & Issue selection
-  const [pulls, setPulls] = useState<any[]>([]);
-  const [selectedPull, setSelectedPull] = useState<any | null>(null);
-  const [issues, setIssues] = useState<any[]>([]);
-  const [selectedIssue, setSelectedIssue] = useState<any | null>(null);
-  
-  // Feature & analysis
-  const [featureRequest, setFeatureRequest] = useState<string>(SAMPLE_FEATURE_REQUEST);
-  const [agents, setAgents] = useState<AgentState[]>(INITIAL_AGENTS);
-  const [analysis, setAnalysis] = useState<AnalyzeResponse | null>(null);
-  
-  // UI state
-  const [error, setError] = useState<string | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [sidebarOpen, setSidebarOpen] = useState(false);
+  // Navigation
+  const [page, setPage] = useState<Page>('dashboard');
 
-  // ========== Load auth state on mount ==========
+  // Data state
+  const [repos, setRepos]                   = useState<GitHubRepo[]>([]);
+  const [loadingRepos, setLoadingRepos]     = useState(false);
+  const [selectedRepo, setSelectedRepo]     = useState<GitHubRepo | null>(null);
+  const [_branches, setBranches]            = useState<GitHubBranch[]>([]);
+  const [selectedBranch, setSelectedBranch] = useState('main');
+  const [_pulls, setPulls]                  = useState<GitHubPR[]>([]);
+  const [selectedPull]                      = useState<GitHubPR | null>(null);
+  const [report, setReport]                 = useState<ShipMateReport | null>(null);
+  const [analyzing, setAnalyzing]           = useState(false);
+
+  const { agents, markAllComplete, markAllError } = useAgentSimulation(analyzing);
+
+  // Load repos on auth
   useEffect(() => {
-    if (githubAuth.isAuthenticated && !githubAuth.loading) {
-      setAppState('connected');
-      loadUserRepositories();
-    } else if (!githubAuth.loading) {
-      setAppState('notConnected');
-    }
-  }, [githubAuth.isAuthenticated, githubAuth.loading]);
+    if (!auth.isAuthenticated || !auth.accessToken) return;
+    setLoadingRepos(true);
+    api.getRepos(auth.accessToken)
+      .then(setRepos)
+      .catch(e => console.error('Failed to load repos', e))
+      .finally(() => setLoadingRepos(false));
+  }, [auth.isAuthenticated, auth.accessToken]);
 
-  // ========== Load user repositories ==========
-  const loadUserRepositories = useCallback(async () => {
-    if (!githubAuth.accessToken) return;
-    
-    try {
-      const userRepos = await api.getUserRepositories(githubAuth.accessToken);
-      setRepos(userRepos);
-      setError(null);
-    } catch (err) {
-      setError('Failed to load repositories. Please try again.');
-      console.error('Repository loading error:', err);
-    }
-  }, [githubAuth.accessToken]);
-
-  // ========== Repository Selection Handler ==========
-  const handleSelectRepository = useCallback(
-    async (repo: GitHubRepository) => {
-      setSelectedRepo(repo);
-      setSelectedBranch('main');
-      setSelectedPull(null);
-      setSelectedIssue(null);
-      setAppState('repoSelected');
-      setError(null);
-      
-      if (!githubAuth.accessToken) return;
-      
-      try {
-        // Extract owner and repo name from full_name
-        const [owner, repoName] = repo.full_name.split('/');
-        
-        // Fetch branches
-        const repoBranches = await api.getRepositoryBranches(
-          owner,
-          repoName,
-          githubAuth.accessToken
-        );
-        setBranches(repoBranches);
-        
-        // Fetch PRs
-        const repoPulls = await api.getRepositoryPulls(
-          owner,
-          repoName,
-          githubAuth.accessToken
-        );
-        setPulls(repoPulls);
-        
-        // Fetch issues
-        const repoIssues = await api.getRepositoryIssues(
-          owner,
-          repoName,
-          githubAuth.accessToken
-        );
-        setIssues(repoIssues);
-      } catch (err) {
-        setError('Failed to load repository data');
-        console.error('Repository data error:', err);
-      }
-    },
-    [githubAuth.accessToken]
-  );
-
-  // ========== Analysis Handler ==========
-  const handleAnalyze = useCallback(async () => {
-    if (!selectedRepo || !featureRequest || !githubAuth.accessToken) {
-      setError('Please select a repository and enter a feature request');
-      return;
-    }
-    
-    setLoading(true);
-    setError(null);
-    setAppState('analyzing');
-    
-    // Animate agents
-    const animateAgents = async () => {
-      for (let i = 0; i < INITIAL_AGENTS.length; i++) {
-        setAgents(prev => prev.map((a, idx) => 
-          idx === i ? { ...a, status: 'running' } : a
-        ));
-        await new Promise(resolve => setTimeout(resolve, 1500));
-        setAgents(prev => prev.map((a, idx) => 
-          idx === i ? { ...a, status: 'complete' } : a
-        ));
-      }
-    };
-    
-    try {
-      // Extract owner and repo name
-      const [owner, repoName] = selectedRepo.full_name.split('/');
-      
-      // Call analysis endpoint
-      const result = await api.analyzeDeliveryReadiness(
-        owner,
-        repoName,
-        selectedBranch,
-        featureRequest,
-        selectedPull?.number,
-        selectedIssue?.number,
-        githubAuth.accessToken
-      );
-      
-      setAnalysis(result);
-      setAgents(INITIAL_AGENTS);
-      setAppState('analysisComplete');
-      
-      // Animate agents while loading
-      animateAgents();
-    } catch (err) {
-      setError('Analysis failed. Please try again.');
-      setAppState('error');
-      console.error('Analysis error:', err);
-    } finally {
-      setLoading(false);
-    }
-  }, [selectedRepo, featureRequest, selectedBranch, selectedPull, selectedIssue, githubAuth.accessToken]);
-
-  // ========== Logout Handler ==========
-  const handleLogout = useCallback(async () => {
-    setAppState('notConnected');
-    setRepos([]);
-    setSelectedRepo(null);
+  // Select repo + load branches/PRs
+  const handleSelectRepo = useCallback(async (repo: GitHubRepo) => {
+    setSelectedRepo(repo);
+    setSelectedBranch(repo.default_branch || 'main');
     setBranches([]);
-    setAnalysis(null);
-    setError(null);
-    await githubAuth.logout();
-  }, [githubAuth]);
+    setPulls([]);
+    if (!auth.accessToken) return;
+    const [owner, repoName] = repo.full_name.split('/');
+    try {
+      const [b, p] = await Promise.all([
+        api.getBranches(owner, repoName, auth.accessToken),
+        api.getPulls(owner, repoName, auth.accessToken),
+      ]);
+      setBranches(b);
+      setPulls(p);
+      setSelectedBranch(repo.default_branch || b[0]?.name || 'main');
+    } catch (e) { console.error('Failed to load repo data', e); }
+  }, [auth.accessToken]);
 
-  // ========== Refresh auth after callback ==========
-  useEffect(() => {
-    const checkAuth = () => {
-      const token = localStorage.getItem('github_access_token');
-      if (token && !githubAuth.isAuthenticated) {
-        githubAuth.refreshAuth();
-      }
-    };
+  // Analyze
+  const handleAnalyze = useCallback(async (repo?: GitHubRepo) => {
+    const target = repo ?? selectedRepo;
+    if (!target || !auth.accessToken) return;
 
-    // Check on window focus (for when callback page redirects)
-    window.addEventListener('focus', checkAuth);
-    return () => window.removeEventListener('focus', checkAuth);
-  }, [githubAuth]);
+    if (repo && repo.id !== selectedRepo?.id) {
+      await handleSelectRepo(repo);
+    }
 
-  // Show loading state
-  if (githubAuth.loading) {
-    return (
-      <div className="flex h-screen items-center justify-center bg-slate-950">
-        <div className="text-center">
-          <Loader size={48} className="animate-spin text-blue-400 mx-auto mb-4" />
-          <p className="text-slate-400">Loading...</p>
-        </div>
-      </div>
-    );
+    setAnalyzing(true);
+    setReport(null);
+    setPage('analysis');
+
+    const [owner, repoName] = target.full_name.split('/');
+    try {
+      const res = await api.analyze({
+        owner, repo: repoName,
+        branch: selectedBranch,
+        access_token: auth.accessToken,
+        pr_number: selectedPull?.number,
+      });
+      markAllComplete();
+      setReport(res.report);
+      setAnalyzing(false);
+      setPage('reports');
+    } catch (e: any) {
+      markAllError();
+      setAnalyzing(false);
+      setPage('repos');
+    }
+  }, [selectedRepo, selectedBranch, selectedPull, auth.accessToken, markAllComplete, markAllError, handleSelectRepo]);
+
+  const handleCancelAnalysis = useCallback(() => {
+    setAnalyzing(false);
+    setPage('repos');
+  }, []);
+
+  // ── Not authenticated ──────────────────────────────────────────────────────
+  if (!auth.isAuthenticated) {
+    return <LandingPage onLogin={auth.login} loading={auth.loading} error={auth.error} />;
   }
 
+  // ── Authenticated: sidebar app ─────────────────────────────────────────────
   return (
-    <div className="flex h-screen bg-slate-950 text-slate-100 overflow-hidden">
-      {/* ========== Sidebar Navigation ========== */}
-      {githubAuth.isAuthenticated && (
-        <motion.div
-          initial={{ x: -280 }}
-          animate={{ x: sidebarOpen ? 0 : -280 }}
-          transition={{ type: 'spring', stiffness: 100 }}
-          className="fixed left-0 top-0 h-screen w-80 bg-slate-900 border-r border-slate-800 z-50 overflow-y-auto"
-        >
-          <Sidebar />
-        </motion.div>
-      )}
+    <div className="flex min-h-screen bg-[#080e1d] text-slate-100 font-sans" style={{ overflow: 'hidden' }}>
+      {/* Left sidebar */}
+      <AppSidebar
+        activePage={analyzing ? 'analysis' : page}
+        onNavigate={p => {
+          if (p === 'analysis' && !analyzing) return;
+          setPage(p);
+        }}
+        user={auth.user}
+        onLogout={auth.logout}
+      />
 
-      {/* ========== Main Content ========== */}
-      <main className="flex-1 flex flex-col overflow-hidden">
-        {/* ========== Header ========== */}
-        <header className="sticky top-0 z-40 border-b border-slate-800 bg-slate-900/80 backdrop-blur-sm px-8 py-4">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-4">
-              {githubAuth.isAuthenticated && (
-                <button
-                  onClick={() => setSidebarOpen(!sidebarOpen)}
-                  className="p-2 hover:bg-slate-800 rounded-lg transition text-slate-400 hover:text-white"
-                  title={sidebarOpen ? 'Hide sidebar' : 'Show sidebar'}
-                >
-                  {sidebarOpen ? <X size={20} /> : <Menu size={20} />}
-                </button>
-              )}
-              <div>
-                <h1 className="text-2xl font-bold bg-gradient-to-r from-blue-400 to-cyan-400 bg-clip-text text-transparent">
-                  ShipMate AI
-                </h1>
-                <p className="text-xs text-slate-400 mt-0.5">
-                  Production Readiness Analysis Platform
-                </p>
-              </div>
+      {/* Main content */}
+      <main className="flex-1 overflow-y-auto" style={{ height: '100vh' }}>
+        {/* Top bar */}
+        <div className="sticky top-0 z-40 bg-[#080e1d]/90 backdrop-blur-xl border-b border-slate-800/40 px-6 h-14 flex items-center justify-between">
+          <p className="text-sm text-slate-400">
+            {analyzing ? 'Analysis in Progress' :
+             page === 'dashboard'  ? 'Dashboard' :
+             page === 'repos'      ? 'Repositories' :
+             page === 'reports'    ? 'Analysis Report' : 'ShipMate AI'}
+          </p>
+          {auth.user && (
+            <div className="flex items-center gap-2">
+              <img src={auth.user.avatar_url} alt="" className="w-6 h-6 rounded-full ring-1 ring-slate-700" />
+              <span className="text-xs text-slate-400 hidden sm:block">{auth.user.login}</span>
             </div>
-
-            {/* User Profile or Connect Button */}
-            {githubAuth.isAuthenticated && githubAuth.user ? (
-              <GitHubUserProfile
-                user={githubAuth.user}
-                onLogout={handleLogout}
-                loading={githubAuth.loading}
-              />
-            ) : null}
-          </div>
-        </header>
-
-        {/* ========== Content Area ========== */}
-        <div className="flex-1 overflow-auto">
-          <div className="p-8">
-            <AnimatePresence mode="wait">
-              {/* ========== NOT CONNECTED STATE ========== */}
-              {appState === 'notConnected' && !githubAuth.isAuthenticated && (
-                <motion.div
-                  key="not-connected"
-                  initial={{ opacity: 0, y: 20 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  exit={{ opacity: 0, y: -20 }}
-                  className="max-w-2xl mx-auto"
-                >
-                  <GitHubConnectButton
-                    onClick={githubAuth.initiateLogin}
-                    loading={githubAuth.loading}
-                    error={githubAuth.error}
-                  />
-                </motion.div>
-              )}
-
-              {/* ========== REPOSITORY SELECTION STATE ========== */}
-              {appState === 'connected' && !selectedRepo && githubAuth.isAuthenticated && (
-                <motion.div
-                  key="repo-list"
-                  initial={{ opacity: 0, y: 20 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  exit={{ opacity: 0, y: -20 }}
-                >
-                  <h2 className="text-2xl font-bold text-white mb-6">Your Repositories</h2>
-                  
-                  {repos.length === 0 ? (
-                    <div className="text-center py-12">
-                      <p className="text-slate-400">No repositories found</p>
-                    </div>
-                  ) : (
-                    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-                      {repos.map(repo => (
-                        <motion.button
-                          key={repo.id}
-                          onClick={() => handleSelectRepository(repo)}
-                          whileHover={{ scale: 1.02 }}
-                          className="p-4 rounded-lg border border-slate-700 bg-slate-800/50 hover:bg-slate-800 transition text-left"
-                        >
-                          <div className="flex items-start justify-between mb-2">
-                            <Code size={24} className="text-blue-400" />
-                            {repo.is_private && (
-                              <span className="text-xs bg-slate-700 px-2 py-1 rounded">Private</span>
-                            )}
-                          </div>
-                          <h3 className="font-semibold text-white mb-1">{repo.name}</h3>
-                          <p className="text-xs text-slate-400 mb-3 line-clamp-2">
-                            {repo.description || 'No description'}
-                          </p>
-                          <div className="flex items-center gap-4 text-xs text-slate-500">
-                            {repo.language && <span>{repo.language}</span>}
-                            <span>⭐ {repo.stars}</span>
-                          </div>
-                        </motion.button>
-                      ))}
-                    </div>
-                  )}
-                </motion.div>
-              )}
-
-              {/* ========== ANALYSIS INPUT STATE ========== */}
-              {selectedRepo && appState === 'repoSelected' && (
-                <motion.div
-                  key="analysis-input"
-                  initial={{ opacity: 0, y: 20 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  exit={{ opacity: 0, y: -20 }}
-                >
-                  <button
-                    onClick={() => { setSelectedRepo(null); setAppState('connected'); }}
-                    className="mb-6 flex items-center gap-2 text-blue-400 hover:text-blue-300 transition"
-                  >
-                    <ChevronRight size={18} className="rotate-180" />
-                    Back to repositories
-                  </button>
-                  
-                  <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-                    {/* Main Analysis Panel */}
-                    <div className="lg:col-span-2 space-y-6">
-                      {/* Repository Info */}
-                      <div className="p-6 rounded-lg bg-slate-800 border border-slate-700">
-                        <div className="flex items-center gap-4">
-                          <Code size={32} className="text-blue-400" />
-                          <div>
-                            <h3 className="text-xl font-semibold text-white">{selectedRepo.name}</h3>
-                            <p className="text-slate-400 text-sm">{selectedRepo.full_name}</p>
-                          </div>
-                        </div>
-                      </div>
-
-                      {/* Branch Selector */}
-                      {branches.length > 0 && (
-                        <div>
-                          <label className="block text-sm font-semibold text-white mb-2">
-                            Branch
-                          </label>
-                          <select
-                            value={selectedBranch}
-                            onChange={(e) => setSelectedBranch(e.target.value)}
-                            className="w-full px-4 py-2 rounded-lg bg-slate-800 border border-slate-700 text-white focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition"
-                          >
-                            {branches.map((branch) => (
-                              <option key={branch.name} value={branch.name}>
-                                {branch.name}
-                              </option>
-                            ))}
-                          </select>
-                        </div>
-                      )}
-
-                      {/* Pull Requests Selector */}
-                      {pulls.length > 0 && (
-                        <div>
-                          <label className="block text-sm font-semibold text-white mb-2">
-                            Pull Request (Optional)
-                          </label>
-                          <select
-                            value={selectedPull?.number || ''}
-                            onChange={(e) => {
-                              const prNum = e.target.value ? parseInt(e.target.value) : null;
-                              setSelectedPull(pulls.find(p => p.number === prNum) || null);
-                            }}
-                            className="w-full px-4 py-2 rounded-lg bg-slate-800 border border-slate-700 text-white focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition"
-                          >
-                            <option value="">None</option>
-                            {pulls.map((pr) => (
-                              <option key={pr.number} value={pr.number}>
-                                #{pr.number} - {pr.title}
-                              </option>
-                            ))}
-                          </select>
-                        </div>
-                      )}
-
-                      {/* Feature Request */}
-                      <div>
-                        <label className="block text-sm font-semibold text-white mb-2">
-                          Feature Request / Issue Description
-                        </label>
-                        <textarea
-                          value={featureRequest}
-                          onChange={(e) => setFeatureRequest(e.target.value)}
-                          placeholder="Describe the feature you want to implement..."
-                          rows={6}
-                          className="w-full px-4 py-3 rounded-lg bg-slate-800 border border-slate-700 text-white placeholder-slate-500 focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition resize-none"
-                        />
-                      </div>
-                    </div>
-
-                    {/* Side Panel - Actions */}
-                    <div className="space-y-4">
-                      <div className="p-6 rounded-lg bg-blue-900/30 border border-blue-700/50">
-                        <Zap size={24} className="text-blue-400 mb-2" />
-                        <h4 className="font-semibold text-white mb-2">Ready to Analyze?</h4>
-                        <p className="text-sm text-slate-300 mb-4">
-                          ShipMate will run 5 AI agents to assess your delivery readiness.
-                        </p>
-                        <button
-                          onClick={handleAnalyze}
-                          disabled={loading || !featureRequest.trim()}
-                          className="w-full bg-gradient-to-r from-blue-600 to-blue-700 hover:from-blue-700 hover:to-blue-800 disabled:opacity-50 text-white font-semibold py-2 px-4 rounded-lg transition"
-                        >
-                          {loading ? 'Analyzing...' : 'Analyze Delivery Readiness'}
-                        </button>
-                      </div>
-
-                      {error && (
-                        <div className="p-4 rounded-lg bg-red-900/30 border border-red-700/50 text-red-200 text-sm flex items-start gap-2">
-                          <AlertCircle size={18} className="mt-0.5 flex-shrink-0" />
-                          <span>{error}</span>
-                        </div>
-                      )}
-                    </div>
-                  </div>
-                </motion.div>
-              )}
-
-              {/* ========== ANALYZING STATE ========== */}
-              {appState === 'analyzing' && (
-                <motion.div
-                  key="analyzing"
-                  initial={{ opacity: 0 }}
-                  animate={{ opacity: 1 }}
-                  exit={{ opacity: 0 }}
-                  className="space-y-6"
-                >
-                  <h2 className="text-2xl font-bold text-white">Analyzing Delivery Readiness</h2>
-                  <AgentSwarm agents={agents} />
-                </motion.div>
-              )}
-
-              {/* ========== ANALYSIS COMPLETE STATE ========== */}
-              {appState === 'analysisComplete' && analysis && (
-                <motion.div
-                  key="results"
-                  initial={{ opacity: 0, y: 20 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  exit={{ opacity: 0, y: -20 }}
-                  className="space-y-6"
-                >
-                  <div className="flex items-center justify-between">
-                    <h2 className="text-2xl font-bold text-white">Analysis Results</h2>
-                    <button
-                      onClick={() => { setSelectedRepo(null); setAnalysis(null); setAppState('connected'); }}
-                      className="text-blue-400 hover:text-blue-300 transition"
-                    >
-                      Analyze Another Repository
-                    </button>
-                  </div>
-                  
-                  {analysis && (
-                    <>
-                      <ReadinessScore score={analysis.readiness_score} breakdown={analysis.score_breakdown} />
-                      <ReportTabs 
-                        planner={analysis.agents.planner}
-                        repoAnalyst={analysis.agents.repo_analyst}
-                        testGenerator={analysis.agents.test_generator}
-                        securityGuard={analysis.agents.security_guard}
-                        deliveryManager={analysis.agents.delivery_manager}
-                      />
-                    </>
-                  )}
-                </motion.div>
-              )}
-
-              {/* ========== ERROR STATE ========== */}
-              {appState === 'error' && (
-                <motion.div
-                  key="error"
-                  initial={{ opacity: 0, y: 20 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  exit={{ opacity: 0, y: -20 }}
-                  className="max-w-lg mx-auto p-6 rounded-lg bg-red-900/30 border border-red-700"
-                >
-                  <AlertCircle className="w-12 h-12 text-red-400 mx-auto mb-4" />
-                  <h3 className="text-xl font-semibold text-white text-center mb-2">Analysis Failed</h3>
-                  <p className="text-red-200 text-center mb-6">{error}</p>
-                  <button
-                    onClick={() => { setAppState('repoSelected'); setError(null); }}
-                    className="w-full bg-red-600 hover:bg-red-700 text-white font-semibold py-2 px-4 rounded-lg transition"
-                  >
-                    Try Again
-                  </button>
-                </motion.div>
-              )}
-            </AnimatePresence>
-          </div>
+          )}
         </div>
+
+        {/* Pages */}
+        {analyzing && (
+          <AnalysisPage
+            selectedRepo={selectedRepo}
+            selectedBranch={selectedBranch}
+            selectedPull={selectedPull}
+            agents={agents}
+            onCancel={handleCancelAnalysis}
+          />
+        )}
+
+        {!analyzing && page === 'dashboard' && (
+          <DashboardPage
+            user={auth.user}
+            repos={repos}
+            report={report}
+            onNavigate={setPage}
+          />
+        )}
+
+        {!analyzing && page === 'repos' && (
+          <RepositoriesPage
+            repos={repos}
+            loadingRepos={loadingRepos}
+            selectedRepo={selectedRepo}
+            analyzing={analyzing}
+            report={report}
+            onAnalyze={handleAnalyze}
+            onViewReport={() => setPage('reports')}
+          />
+        )}
+
+        {!analyzing && page === 'reports' && report && (
+          <ReportsPage
+            report={report}
+            onReRun={() => {
+              if (selectedRepo) handleAnalyze(selectedRepo);
+              else setPage('repos');
+            }}
+          />
+        )}
+
+        {!analyzing && page === 'reports' && !report && (
+          <div className="flex flex-col items-center justify-center min-h-[60vh] text-center p-6">
+            <div className="text-5xl mb-4">📊</div>
+            <h2 className="text-xl font-black text-white mb-2">No report yet</h2>
+            <p className="text-sm text-slate-500 mb-6">Run an analysis on one of your repositories to generate a report.</p>
+            <button
+              onClick={() => setPage('repos')}
+              className="px-5 py-2.5 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-sm font-bold transition-all"
+            >
+              Go to Repositories
+            </button>
+          </div>
+        )}
       </main>
     </div>
   );
 }
-

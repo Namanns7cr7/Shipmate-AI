@@ -38,22 +38,27 @@ export default function GitHubCallback() {
         }
 
         // Exchange code for token
-        const response = await api.handleGitHubCallback(code, state);
+        const response = await api.handleCallback(code, state);
 
         if (!response.success) {
           throw new Error(response.detail || 'Authentication failed');
         }
 
-        // Store token and user info in localStorage
-        localStorage.setItem('github_access_token', response.access_token);
-        localStorage.setItem('github_user', JSON.stringify(response.user));
-
         setStatus('success');
 
-        // Redirect to dashboard after 1 second
-        setTimeout(() => {
-          window.location.href = '/';
-        }, 1000);
+        // If opened as a popup, postMessage to parent and close
+        if (window.opener && !window.opener.closed) {
+          window.opener.postMessage(
+            { type: 'GITHUB_AUTH_SUCCESS', access_token: response.access_token, user: response.user },
+            window.location.origin
+          );
+          setTimeout(() => window.close(), 800);
+        } else {
+          // Opened as a redirect (not popup) — store and navigate
+          localStorage.setItem('github_access_token', response.access_token);
+          localStorage.setItem('github_user', JSON.stringify(response.user));
+          setTimeout(() => { window.location.href = '/'; }, 1000);
+        }
       } catch (err) {
         setStatus('error');
         setError(
