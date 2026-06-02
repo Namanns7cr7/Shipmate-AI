@@ -100,8 +100,13 @@ export default function App() {
   
   // UI state
   const [error, setError] = useState<string | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [uploadStatus, setUploadStatus] = useState<'idle' | 'uploading' | 'done' | 'error'>('idle');
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [isDragging, setIsDragging] = useState(false);
+
+  const updateAgentStatus = useCallback((name: AgentName, status: AgentState['status']) => {
+    setAgents(prev => prev.map(a => a.name === name ? { ...a, status } : a));
+  }, []);
 
   // ========== Load auth state on mount ==========
   useEffect(() => {

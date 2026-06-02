@@ -1,6 +1,6 @@
 import { motion } from 'framer-motion';
 import type { RepoAnalystOutput } from '../../types';
-import { FileCode, AlertTriangle, Package, Lightbulb, Activity } from 'lucide-react';
+import { FileCode, Package, Lightbulb, Activity } from 'lucide-react';
 
 function riskColor(risk: string) {
   if (risk === 'high') return '#f87171';

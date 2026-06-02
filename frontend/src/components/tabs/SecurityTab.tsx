@@ -1,6 +1,6 @@
 import { motion } from 'framer-motion';
 import type { SecurityGuardOutput, SecurityRisk } from '../../types';
-import { Shield, AlertTriangle, Key, Terminal, Lock, Package, Siren } from 'lucide-react';
+import { AlertTriangle, Key, Terminal, Lock, Package, Siren } from 'lucide-react';
 
 function severityConfig(sev: string) {
   const map: Record<string, { color: string; bg: string; icon: string }> = {
