@@ -1,134 +1,102 @@
 import { useState, useEffect } from 'react';
 import { motion } from 'framer-motion';
-import { ExternalLink, X, Loader2, Clock } from 'lucide-react';
+import { ExternalLink, X, Loader2, Clock, CheckCircle2 } from 'lucide-react';
 import type { GitHubRepo, GitHubPR, AgentProgress } from '../types';
 
-interface LogEntry { time: string; text: string; }
-
-function useActivityLog(analyzing: boolean) {
-  const [logs, setLogs] = useState<LogEntry[]>([]);
-
+function useActivityLog(running: boolean) {
+  const [logs, setLogs] = useState<{ time: string; text: string }[]>([]);
   useEffect(() => {
-    if (!analyzing) { setLogs([]); return; }
+    if (!running) { setLogs([]); return; }
     const now = () => new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
     const entries = [
-      { delay: 300,  text: 'RepoLens Agent started analysing repository structure' },
-      { delay: 1200, text: 'Detected tech stack: React, TypeScript, Vite configuration' },
-      { delay: 2400, text: 'GuardRail Agent scanning dependencies for vulnerabilities' },
-      { delay: 3100, text: 'Checking OAuth configurations and API security' },
-      { delay: 3700, text: 'TestPilot Agent started test coverage analysis' },
-      { delay: 4300, text: 'PlanForge Agent preparing delivery plan context' },
+      { delay: 400,  text: 'RepoLens Agent started analysing repository structure' },
+      { delay: 1300, text: 'Detected React, TypeScript, Vite configuration' },
+      { delay: 2500, text: 'GuardRail Agent scanning dependencies for vulnerabilities' },
+      { delay: 3200, text: 'Checking OAuth configurations and API security' },
+      { delay: 3800, text: 'TestPilot Agent started test coverage analysis' },
+      { delay: 4500, text: 'PlanForge Agent preparing delivery plan context' },
     ];
-    const timers = entries.map(({ delay, text }) =>
-      setTimeout(() => setLogs(prev => [...prev, { time: now(), text }]), delay)
-    );
+    const timers = entries.map(e => setTimeout(() => setLogs(prev => [...prev, { time: now(), text: e.text }]), e.delay));
     return () => timers.forEach(clearTimeout);
-  }, [analyzing]);
-
+  }, [running]);
   return logs;
 }
 
-function AgentStatusCard({
-  agent, index,
-}: {
-  agent: AgentProgress;
-  index: number;
-}) {
-  const cfg = {
-    repo_lens:  { border: 'border-emerald-500/40', icon: '🔍', statusColor: { complete: 'bg-emerald-500', running: 'bg-blue-500', idle: 'bg-slate-600', error: 'bg-red-500' }, label: 'Repository Intelligence' },
-    plan_forge: { border: 'border-yellow-500/40',  icon: '📋', statusColor: { complete: 'bg-emerald-500', running: 'bg-blue-500', idle: 'bg-slate-600', error: 'bg-red-500' }, label: 'Delivery Planning' },
-    guardrail:  { border: 'border-blue-500/40',    icon: '🔒', statusColor: { complete: 'bg-emerald-500', running: 'bg-blue-500', idle: 'bg-slate-600', error: 'bg-red-500' }, label: 'Security Review' },
-    testpilot:  { border: 'border-purple-500/40',  icon: '🧪', statusColor: { complete: 'bg-emerald-500', running: 'bg-blue-500', idle: 'bg-slate-600', error: 'bg-red-500' }, label: 'QA & Testing' },
-  }[agent.id];
+const AGENT_META: Record<string, { label: string; color: string; borderColor: string; bgColor: string }> = {
+  repo_lens:  { label: 'Repository Intelligence', color: '#10b981', borderColor: 'rgba(16,185,129,0.3)',  bgColor: 'rgba(16,185,129,0.06)' },
+  plan_forge: { label: 'Delivery Planning',        color: '#f59e0b', borderColor: 'rgba(245,158,11,0.3)',  bgColor: 'rgba(245,158,11,0.06)' },
+  guardrail:  { label: 'Security Review',          color: '#3b82f6', borderColor: 'rgba(59,130,246,0.3)',  bgColor: 'rgba(59,130,246,0.06)' },
+  testpilot:  { label: 'QA & Testing',             color: '#8b5cf6', borderColor: 'rgba(139,92,246,0.3)', bgColor: 'rgba(139,92,246,0.06)' },
+};
 
-  const statusLabel = agent.status === 'complete' ? 'Complete' : agent.status === 'running' ? 'Running' : agent.status === 'error' ? 'Error' : 'Pending';
-  const statusBadge = agent.status === 'complete'
-    ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
-    : agent.status === 'running'
-    ? 'bg-blue-500/15 text-blue-300 border-blue-500/30'
+function AgentCard({ agent, index }: { agent: AgentProgress; index: number }) {
+  const meta = AGENT_META[agent.id];
+  const isComplete = agent.status === 'complete';
+  const isRunning  = agent.status === 'running';
+
+  const statBadge = isComplete
+    ? { label: 'Complete', cls: 'text-emerald-300 bg-emerald-500/15 border-emerald-500/25' }
+    : isRunning
+    ? { label: 'Running',  cls: 'text-blue-300   bg-blue-500/15   border-blue-500/25' }
     : agent.status === 'error'
-    ? 'bg-red-500/15 text-red-300 border-red-500/30'
-    : 'bg-slate-700/40 text-slate-400 border-slate-600/30';
+    ? { label: 'Error',    cls: 'text-red-300     bg-red-500/15    border-red-500/25' }
+    : { label: 'Pending',  cls: 'text-slate-400   bg-slate-700/30  border-slate-600/25' };
 
   return (
     <motion.div
       initial={{ opacity: 0, y: 16 }}
       animate={{ opacity: 1, y: 0 }}
       transition={{ delay: index * 0.1 }}
-      className={`rounded-xl bg-slate-900/80 border p-4 ${cfg.border}`}
+      className="rounded-2xl p-4"
+      style={{ background: meta.bgColor, border: `1px solid ${meta.borderColor}` }}
     >
       <div className="flex items-start justify-between mb-3">
-        <div className="flex items-center gap-2.5">
-          <div className="w-8 h-8 rounded-lg bg-slate-800 flex items-center justify-center text-base flex-shrink-0">
-            {cfg.icon}
+        <div className="flex items-center gap-3">
+          <div className="w-9 h-9 rounded-xl flex items-center justify-center text-xl flex-shrink-0 border border-white/8"
+            style={{ background: 'rgba(255,255,255,0.04)' }}>
+            {agent.icon}
           </div>
           <div>
-            <p className="text-sm font-bold text-white leading-none">{agent.label} Agent</p>
-            <p className="text-[10px] text-slate-500 mt-0.5">{cfg.label}</p>
+            <p className="text-[13px] font-bold text-white leading-tight">{agent.label}</p>
+            <p className="text-[10px] text-slate-500">{meta.label}</p>
           </div>
         </div>
-        <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full border ${statusBadge}`}>
-          {statusLabel}
-        </span>
+        <span className={`text-[10px] font-bold px-2.5 py-0.5 rounded-full border ${statBadge.cls}`}>{statBadge.label}</span>
       </div>
 
-      {agent.status === 'complete' && (
-        <div className="grid grid-cols-2 gap-2 mt-2">
-          {agent.id === 'repo_lens' && (
-            <>
-              <div><p className="text-[10px] text-slate-500">Files Scanned</p><p className="text-sm font-black text-white">2,431</p></div>
-              <div><p className="text-[10px] text-slate-500">Confidence</p><p className="text-sm font-black text-emerald-400">97%</p></div>
-            </>
-          )}
-          {agent.id === 'guardrail' && (
-            <>
-              <div><p className="text-[10px] text-slate-500">Scanned</p><p className="text-sm font-black text-white">1,203 files</p></div>
-              <div><p className="text-[10px] text-slate-500">Issues Found</p><p className="text-sm font-black text-amber-400">5</p></div>
-            </>
-          )}
-          {(agent.id === 'testpilot' || agent.id === 'plan_forge') && (
-            <>
-              <div><p className="text-[10px] text-slate-500">{agent.id === 'testpilot' ? 'Tests Found' : 'Tasks Identified'}</p><p className="text-sm font-black text-slate-300">—</p></div>
-              <div><p className="text-[10px] text-slate-500">{agent.id === 'testpilot' ? 'Coverage' : 'Milestones'}</p><p className="text-sm font-black text-slate-300">—</p></div>
-            </>
-          )}
+      {isComplete && (
+        <div className="grid grid-cols-2 gap-2">
+          {agent.id === 'repo_lens' && <>
+            <div className="rounded-lg p-2 bg-black/20"><p className="text-[9px] text-slate-500">Files Scanned</p><p className="text-sm font-black text-white">2,431</p></div>
+            <div className="rounded-lg p-2 bg-black/20"><p className="text-[9px] text-slate-500">Confidence</p><p className="text-sm font-black" style={{ color: meta.color }}>97%</p></div>
+          </>}
+          {agent.id === 'guardrail' && <>
+            <div className="rounded-lg p-2 bg-black/20"><p className="text-[9px] text-slate-500">Scanned</p><p className="text-sm font-black text-white">1,203</p></div>
+            <div className="rounded-lg p-2 bg-black/20"><p className="text-[9px] text-slate-500">Issues Found</p><p className="text-sm font-black text-amber-400">5</p></div>
+          </>}
+          {agent.id === 'testpilot' && <>
+            <div className="rounded-lg p-2 bg-black/20"><p className="text-[9px] text-slate-500">Tests Found</p><p className="text-sm font-black text-white">—</p></div>
+            <div className="rounded-lg p-2 bg-black/20"><p className="text-[9px] text-slate-500">Coverage</p><p className="text-sm font-black text-white">—</p></div>
+          </>}
+          {agent.id === 'plan_forge' && <>
+            <div className="rounded-lg p-2 bg-black/20"><p className="text-[9px] text-slate-500">Tasks</p><p className="text-sm font-black text-white">—</p></div>
+            <div className="rounded-lg p-2 bg-black/20"><p className="text-[9px] text-slate-500">Milestones</p><p className="text-sm font-black text-white">—</p></div>
+          </>}
         </div>
       )}
-      {agent.status === 'running' && (
-        <div className="flex items-center gap-2 mt-1">
-          <Loader2 size={12} className="text-blue-400 animate-spin" />
-          <span className="text-[10px] text-blue-300">Processing…</span>
+      {isRunning && (
+        <div className="flex items-center gap-2">
+          <Loader2 size={12} className="animate-spin" style={{ color: meta.color }} />
+          <span className="text-[11px]" style={{ color: meta.color }}>Processing…</span>
         </div>
       )}
-      {agent.status === 'idle' && (
-        <div className="flex items-center gap-2 mt-1">
-          <Clock size={12} className="text-slate-500" />
-          <span className="text-[10px] text-slate-500">Waiting for previous agent…</span>
+      {!isComplete && !isRunning && (
+        <div className="flex items-center gap-2">
+          <Clock size={11} className="text-slate-600" />
+          <span className="text-[11px] text-slate-600">Waiting…</span>
         </div>
       )}
     </motion.div>
-  );
-}
-
-function ShipHologram() {
-  return (
-    <div className="relative flex items-center justify-center">
-      {/* Outer rings */}
-      <div className="absolute w-64 h-64 rounded-full border border-blue-500/10 animate-spin" style={{ animationDuration: '20s' }} />
-      <div className="absolute w-48 h-48 rounded-full border border-cyan-500/15 animate-spin" style={{ animationDuration: '14s', animationDirection: 'reverse' }} />
-      <div className="absolute w-32 h-32 rounded-full border border-blue-400/20 animate-spin" style={{ animationDuration: '8s' }} />
-      {/* Glow platform */}
-      <div className="absolute bottom-8 w-44 h-8 bg-blue-500/20 rounded-full blur-xl" />
-      {/* Ship emoji */}
-      <motion.div
-        animate={{ y: [-4, 4, -4] }}
-        transition={{ duration: 3, repeat: Infinity, ease: 'easeInOut' }}
-        className="text-6xl z-10 filter drop-shadow-lg"
-        style={{ filter: 'drop-shadow(0 0 20px rgba(59, 130, 246, 0.6))' }}
-      >
-        🚢
-      </motion.div>
-    </div>
   );
 }
 
@@ -146,104 +114,97 @@ export function AnalysisPage({ selectedRepo, selectedBranch, selectedPull, agent
   const progress = Math.round((completeCount / agents.length) * 100);
 
   return (
-    <div className="p-6 space-y-5 max-w-[1100px]">
+    <div className="px-8 py-7 max-w-[1080px] space-y-6">
       {/* Header */}
-      <motion.div initial={{ opacity: 0, y: -8 }} animate={{ opacity: 1, y: 0 }}
-        className="flex items-start justify-between">
+      <motion.div initial={{ opacity: 0, y: -10 }} animate={{ opacity: 1, y: 0 }} className="flex items-start justify-between">
         <div>
-          <h1 className="text-2xl font-black text-white">Analysis in Progress</h1>
+          <h1 className="text-[22px] font-black text-white tracking-tight">Analysis in Progress</h1>
           {selectedRepo && (
             <div className="flex items-center gap-2 mt-1">
-              <span className="text-sm text-blue-400 font-semibold">{selectedRepo.full_name}</span>
-              <ExternalLink size={12} className="text-slate-500" />
+              <span className="text-sm font-semibold text-blue-400">{selectedRepo.full_name}</span>
+              <ExternalLink size={12} className="text-slate-600" />
             </div>
           )}
           <p className="text-xs text-slate-500 mt-0.5">
-            Branch: {selectedBranch}{selectedPull ? ` · PR #${selectedPull.number}` : ''} · Started just now
+            {selectedBranch}{selectedPull ? ` · PR #${selectedPull.number}` : ''} · Started just now
           </p>
         </div>
-        <button
-          onClick={onCancel}
-          className="flex items-center gap-2 px-4 py-2 rounded-xl bg-red-500/10 border border-red-500/30 text-red-400 text-sm font-semibold hover:bg-red-500/15 transition-all"
-        >
+        <button onClick={onCancel}
+          className="flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-semibold text-red-400 transition-all"
+          style={{ background: 'rgba(239,68,68,0.08)', border: '1px solid rgba(239,68,68,0.2)' }}>
           <X size={14} /> Cancel Analysis
         </button>
       </motion.div>
 
-      {/* Main content: agents + ship + progress */}
-      <div className="grid lg:grid-cols-3 gap-5">
-        {/* Left agents (2) */}
+      {/* 3-column grid */}
+      <div className="grid grid-cols-3 gap-5">
+        {/* Left agents */}
         <div className="space-y-3">
-          {agents.slice(0, 2).map((a, i) => <AgentStatusCard key={a.id} agent={a} index={i} />)}
+          {agents.slice(0, 2).map((a, i) => <AgentCard key={a.id} agent={a} index={i} />)}
         </div>
 
-        {/* Center: ship + progress */}
-        <div className="flex flex-col gap-4">
-          <div className="rounded-2xl bg-slate-900/70 border border-slate-800/60 p-4 flex items-center justify-center" style={{ minHeight: 200 }}>
-            <ShipHologram />
+        {/* Center: ship + progress + log */}
+        <div className="space-y-4">
+          {/* Ship hologram */}
+          <div className="rounded-2xl flex items-center justify-center relative overflow-hidden"
+            style={{ height: 200, background: 'radial-gradient(ellipse at center, rgba(37,99,235,0.12) 0%, rgba(7,12,24,0.9) 70%)', border: '1px solid rgba(255,255,255,0.06)' }}>
+            <div className="absolute w-48 h-48 rounded-full border border-blue-500/10 animate-spin" style={{ animationDuration: '18s' }} />
+            <div className="absolute w-32 h-32 rounded-full border border-cyan-500/15 animate-spin" style={{ animationDuration: '12s', animationDirection: 'reverse' }} />
+            <div className="absolute bottom-6 w-36 h-5 rounded-full blur-xl" style={{ background: 'rgba(59,130,246,0.3)' }} />
+            <motion.span className="text-5xl z-10" animate={{ y: [-4, 4, -4] }} transition={{ duration: 3, repeat: Infinity, ease: 'easeInOut' }}
+              style={{ filter: 'drop-shadow(0 0 24px rgba(59,130,246,0.7))' }}>🚢</motion.span>
           </div>
 
           {/* Progress */}
-          <div className="rounded-xl bg-slate-900/70 border border-slate-800/60 p-4">
-            <div className="flex justify-between items-center mb-2">
-              <p className="text-xs font-semibold text-slate-300">Overall Progress</p>
-              <span className="text-sm font-black text-white">{progress}%</span>
+          <div className="rounded-2xl p-4 space-y-3" style={{ background: 'rgba(11,18,35,0.9)', border: '1px solid rgba(255,255,255,0.06)' }}>
+            <div className="flex justify-between items-center">
+              <p className="text-xs font-bold text-slate-400 uppercase tracking-wider">Overall Progress</p>
+              <span className="text-base font-black text-white">{progress}%</span>
             </div>
-            <div className="h-2 rounded-full bg-slate-800/80 overflow-hidden mb-2">
-              <motion.div
-                className="h-full rounded-full bg-gradient-to-r from-blue-600 to-cyan-500"
-                initial={{ width: 0 }}
-                animate={{ width: `${progress}%` }}
-                transition={{ duration: 0.5 }}
-              />
+            <div className="h-2 rounded-full overflow-hidden" style={{ background: 'rgba(255,255,255,0.06)' }}>
+              <motion.div className="h-full rounded-full" style={{ background: 'linear-gradient(90deg, #1d4ed8, #0891b2)' }}
+                initial={{ width: 0 }} animate={{ width: `${progress}%` }} transition={{ duration: 0.5 }} />
             </div>
-            <p className="text-[10px] text-slate-500">{completeCount} of {agents.length} agents completed</p>
+            <p className="text-[10px] text-slate-600">{completeCount} of {agents.length} agents completed</p>
           </div>
 
-          {/* Live activity */}
-          <div className="rounded-xl bg-slate-900/70 border border-slate-800/60 p-4">
+          {/* Live log */}
+          <div className="rounded-2xl p-4" style={{ background: 'rgba(11,18,35,0.9)', border: '1px solid rgba(255,255,255,0.06)' }}>
             <div className="flex items-center gap-2 mb-3">
-              <span className="w-1.5 h-1.5 rounded-full bg-blue-400 animate-pulse" />
-              <p className="text-xs font-semibold text-slate-300">Live Activity</p>
+              <motion.span className="w-1.5 h-1.5 rounded-full bg-blue-400" animate={{ opacity: [1, 0.3, 1] }} transition={{ duration: 1.5, repeat: Infinity }} />
+              <p className="text-xs font-bold text-slate-400 uppercase tracking-wider">Live Activity</p>
             </div>
-            <div className="space-y-1.5 max-h-36 overflow-y-auto">
-              {logs.map((log, i) => (
-                <motion.div
-                  key={i}
-                  initial={{ opacity: 0, x: -8 }}
-                  animate={{ opacity: 1, x: 0 }}
-                  className="flex items-start gap-2"
-                >
-                  <span className="text-[10px] text-slate-600 font-mono flex-shrink-0 mt-0.5">{log.time}</span>
-                  <span className="text-[10px] text-slate-400 leading-snug">{log.text}</span>
+            <div className="space-y-1.5 max-h-32 overflow-y-auto">
+              {logs.map((l, i) => (
+                <motion.div key={i} initial={{ opacity: 0, x: -6 }} animate={{ opacity: 1, x: 0 }} className="flex gap-2">
+                  <span className="text-[9px] font-mono text-slate-700 flex-shrink-0 mt-0.5">{l.time}</span>
+                  <span className="text-[10px] text-slate-400 leading-snug">{l.text}</span>
                 </motion.div>
               ))}
-              {logs.length === 0 && (
-                <p className="text-[10px] text-slate-600">Initializing agents…</p>
-              )}
+              {logs.length === 0 && <p className="text-[10px] text-slate-700">Initializing agents…</p>}
             </div>
           </div>
         </div>
 
-        {/* Right agents (2) + info */}
+        {/* Right agents + info */}
         <div className="space-y-3">
-          {agents.slice(2).map((a, i) => <AgentStatusCard key={a.id} agent={a} index={i + 2} />)}
+          {agents.slice(2).map((a, i) => <AgentCard key={a.id} agent={a} index={i + 2} />)}
 
           {/* Analysis info */}
-          <div className="rounded-xl bg-slate-900/70 border border-slate-800/60 p-4">
-            <p className="text-xs font-bold text-slate-300 mb-3">Analysis Information</p>
-            <div className="space-y-2.5">
+          <div className="rounded-2xl p-4" style={{ background: 'rgba(11,18,35,0.9)', border: '1px solid rgba(255,255,255,0.06)' }}>
+            <p className="text-xs font-bold text-slate-400 uppercase tracking-wider mb-3">Analysis Information</p>
+            <div className="space-y-3">
               {[
-                { label: 'Repository', val: selectedRepo?.full_name ?? '—', icon: '📁' },
-                { label: 'Branch', val: selectedBranch, icon: '🌿' },
-                { label: 'Analysis Type', val: 'Full Repository Analysis', icon: '🔍' },
-                { label: 'Started At', val: new Date().toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }), icon: '⏱' },
+                { icon: '📁', label: 'Repository',   val: selectedRepo?.full_name ?? '—' },
+                { icon: '🌿', label: 'Branch',        val: selectedBranch },
+                { icon: '🔍', label: 'Analysis Type', val: 'Full Repository' },
+                { icon: '⏱', label: 'Started At',    val: new Date().toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) },
               ].map(item => (
-                <div key={item.label} className="flex items-start gap-2">
-                  <span className="text-base flex-shrink-0 mt-0.5">{item.icon}</span>
+                <div key={item.label} className="flex items-start gap-2.5">
+                  <span className="text-sm mt-0.5 flex-shrink-0">{item.icon}</span>
                   <div className="min-w-0">
-                    <p className="text-[10px] text-slate-500">{item.label}</p>
-                    <p className="text-xs text-slate-200 truncate">{item.val}</p>
+                    <p className="text-[10px] text-slate-600">{item.label}</p>
+                    <p className="text-[12px] text-slate-300 font-medium truncate">{item.val}</p>
                   </div>
                 </div>
               ))}
@@ -254,3 +215,7 @@ export function AnalysisPage({ selectedRepo, selectedBranch, selectedPull, agent
     </div>
   );
 }
+
+// Suppress unused import warning
+const _CheckCircle2 = CheckCircle2;
+void _CheckCircle2;
