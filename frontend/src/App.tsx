@@ -1,4 +1,5 @@
 import { useState, useCallback, useEffect } from 'react';
+import { Zap, Bell, GitBranch, BookOpen, Clock } from 'lucide-react';
 import { useGithubAuth } from './hooks/useGithubAuth';
 import { api } from './lib/api';
 import { LandingPage } from './components/landing/LandingPage';
@@ -7,10 +8,9 @@ import { DashboardPage } from './pages/DashboardPage';
 import { RepositoriesPage } from './pages/RepositoriesPage';
 import { AnalysisPage } from './pages/AnalysisPage';
 import { ReportsPage } from './pages/ReportsPage';
+import { Spinner } from './components/ui/GitHubConnectButton';
 import type { Page } from './components/app/AppSidebar';
-import type {
-  AgentProgress, GitHubRepo, GitHubBranch, GitHubPR, ShipMateReport,
-} from './types';
+import type { AgentProgress, GitHubRepo, GitHubBranch, GitHubPR, ShipMateReport } from './types';
 
 const INITIAL_AGENTS: AgentProgress[] = [
   { id: 'repo_lens',  label: 'RepoLens',  icon: '🔍', status: 'idle', description: 'Repo structure, tech stack & architecture risks' },
@@ -31,7 +31,7 @@ function useAgentSimulation(analyzing: boolean) {
       { id: 'testpilot',  delay: 3600 },
     ];
     const timers = steps.map(({ id, delay }) =>
-      setTimeout(() => setAgents(prev => prev.map(a => a.id === id ? { ...a, status: 'running' } : a)), delay)
+      setTimeout(() => setAgents(prev => prev.map(a => a.id === id ? { ...a, status: 'running' } : a)), delay),
     );
     return () => timers.forEach(clearTimeout);
   }, [analyzing]);
@@ -62,7 +62,7 @@ export default function App() {
     if (!auth.isAuthenticated || !auth.accessToken) return;
     setLoadingRepos(true);
     api.getRepos(auth.accessToken)
-      .then(setRepos)
+      .then(r => { setRepos(r); if (r.length > 0 && !selectedRepo) setSelectedRepo(r[0]); })
       .catch(e => console.error('Failed to load repos', e))
       .finally(() => setLoadingRepos(false));
   }, [auth.isAuthenticated, auth.accessToken]);
@@ -118,42 +118,93 @@ export default function App() {
   }
 
   const activePage: Page = analyzing ? 'analysis' : page;
+  const lastScan = report ? new Date(report.generated_at).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : null;
 
   return (
-    <div className="flex min-h-screen bg-[#070c18] text-slate-100 font-sans overflow-hidden">
+    <div style={{ display: 'flex', minHeight: '100vh', background: 'var(--bg)', color: 'var(--ink)' }}>
       <AppSidebar
         activePage={activePage}
         onNavigate={p => { if (p === 'analysis' && !analyzing) return; setPage(p); }}
         user={auth.user}
         onLogout={auth.logout}
+        repos={repos}
+        selectedRepo={selectedRepo}
+        onSelectRepo={r => { handleSelectRepo(r); }}
+        hasReport={!!report}
       />
 
-      <main className="flex-1 overflow-y-auto h-screen">
+      <main style={{ flex: 1, height: '100vh', overflowY: 'auto', display: 'flex', flexDirection: 'column' }}>
         {/* Topbar */}
-        <div className="sticky top-0 z-40 bg-[#070c18]/95 backdrop-blur-xl border-b border-slate-800/50 px-8 h-14 flex items-center justify-between">
-          <div className="flex items-center gap-2 text-sm">
-            <span className="text-slate-500">ShipMate AI</span>
-            <span className="text-slate-700">/</span>
-            <span className="text-slate-300 font-semibold capitalize">{activePage === 'repos' ? 'Repositories' : activePage === 'analysis' ? 'Analysis' : activePage}</span>
-          </div>
-          {auth.user && (
-            <div className="flex items-center gap-3">
-              <div className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
-              <span className="text-xs text-slate-400 hidden sm:block">@{auth.user.login}</span>
-              <img src={auth.user.avatar_url} alt="" className="w-7 h-7 rounded-full ring-2 ring-slate-700" />
+        <div style={{
+          position: 'sticky', top: 0, zIndex: 40, height: 60,
+          background: 'rgba(7,12,24,0.82)', backdropFilter: 'blur(16px)',
+          borderBottom: '1px solid var(--line)',
+          display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '0 28px',
+          flexShrink: 0,
+        }}>
+          {/* Left: breadcrumb + chips */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13 }}>
+              <span className="muted">ShipMate</span>
+              <span style={{ color: 'var(--ink-4)' }}>›</span>
+              <span style={{ color: '#fff', fontWeight: 600, textTransform: 'capitalize' }}>
+                {activePage === 'repos' ? 'Repositories' : activePage}
+              </span>
             </div>
-          )}
+            <span style={{ width: 1, height: 18, background: 'var(--line-2)' }} />
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              {selectedRepo && (
+                <>
+                  <span className="mono chip tone-slate"><BookOpen size={12} /> {selectedRepo.name}</span>
+                  <span className="mono chip tone-slate"><GitBranch size={12} /> {selectedBranch}</span>
+                </>
+              )}
+              <span className="chip tone-slate">
+                <Clock size={12} /> {lastScan ? `scanned ${lastScan}` : 'never scanned'}
+              </span>
+            </div>
+          </div>
+
+          {/* Right: run button + bell + user */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+            <button
+              className="btn btn-primary btn-sm"
+              onClick={() => handleAnalyze()}
+              disabled={analyzing || !selectedRepo}
+            >
+              {analyzing ? <><Spinner size={13} /> Running…</> : <><Zap size={14} /> Run Analysis</>}
+            </button>
+            <button style={{ padding: 8, borderRadius: 8, background: 'none', border: 'none', color: 'var(--ink-3)', cursor: 'pointer' }}>
+              <Bell size={16} />
+            </button>
+            {auth.user && (
+              <div className="pill" style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '5px 5px 5px 11px' }}>
+                <span className="dot dot-pulse" style={{ background: '#34d399' }} />
+                <span className="mono" style={{ fontSize: 11.5, color: 'var(--ink-2)' }}>@{auth.user.login}</span>
+                {auth.user.avatar_url
+                  ? <img src={auth.user.avatar_url} alt="" style={{ width: 24, height: 24, borderRadius: 7, objectFit: 'cover' }} />
+                  : <div style={{ width: 24, height: 24, borderRadius: 7, background: 'linear-gradient(135deg,#8b5cf6,#3b82f6)', display: 'grid', placeItems: 'center', fontSize: 10, fontWeight: 700, color: '#fff' }}>
+                      {auth.user.login.slice(0, 2).toUpperCase()}
+                    </div>
+                }
+              </div>
+            )}
+          </div>
         </div>
 
         {/* Page content */}
         {activePage === 'dashboard' && (
-          <DashboardPage user={auth.user} repos={repos} report={report} onNavigate={setPage} />
+          <DashboardPage
+            user={auth.user} repos={repos} report={report}
+            onNavigate={setPage} onAnalyze={handleAnalyze}
+          />
         )}
         {activePage === 'repos' && (
           <RepositoriesPage
             repos={repos} loadingRepos={loadingRepos} selectedRepo={selectedRepo}
             analyzing={analyzing} report={report}
             onAnalyze={handleAnalyze} onViewReport={() => setPage('reports')}
+            onConnect={auth.login}
           />
         )}
         {activePage === 'analysis' && (
@@ -164,14 +215,17 @@ export default function App() {
           />
         )}
         {activePage === 'reports' && report && (
-          <ReportsPage report={report} onReRun={() => selectedRepo ? handleAnalyze(selectedRepo) : setPage('repos')} />
+          <ReportsPage
+            report={report}
+            onReRun={() => selectedRepo ? handleAnalyze(selectedRepo) : setPage('repos')}
+          />
         )}
         {activePage === 'reports' && !report && (
-          <div className="flex flex-col items-center justify-center h-[80vh] text-center p-6">
-            <div className="text-5xl mb-4">📊</div>
-            <h2 className="text-xl font-black text-white mb-2">No report yet</h2>
-            <p className="text-sm text-slate-500 mb-6">Run an analysis on a repository to generate your first report.</p>
-            <button onClick={() => setPage('repos')} className="px-5 py-2.5 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-sm font-bold transition-all">
+          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: '80vh', textAlign: 'center', padding: 24 }}>
+            <div style={{ fontSize: 48, marginBottom: 16 }}>📊</div>
+            <h2 style={{ fontSize: 20, fontWeight: 800, color: '#fff', margin: '0 0 8px' }}>No report yet</h2>
+            <p style={{ fontSize: 14, color: 'var(--ink-3)', marginBottom: 24 }}>Run an analysis on a repository to generate your first report.</p>
+            <button className="btn btn-primary" onClick={() => setPage('repos')}>
               Go to Repositories
             </button>
           </div>

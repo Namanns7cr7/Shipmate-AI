@@ -1,141 +1,122 @@
 import { useState } from 'react';
 import { motion } from 'framer-motion';
-import { Download, Share2, RotateCcw, ExternalLink, ChevronRight } from 'lucide-react';
+import { Download, Share2, RotateCcw, AlertTriangle, Check, X, Clock, Compass, ShieldCheck, FlaskConical, Radar, LayoutGrid, ChevronRight, TrendingUp } from 'lucide-react';
+import { ScoreRing } from '../components/ui/ScoreRing';
+import { VerdictPill, toVerdict } from '../components/ui/VerdictPill';
+import { RadarBg } from '../components/ui/RadarBg';
+import { AGENTS, scoreColor } from '../lib/agents';
 import type { ShipMateReport, SecurityFinding } from '../types';
 
-// ── Shared: animated score ring ──────────────────────────────────────────────
+/* ---------- Helpers ---------- */
+function pTone(p: string) { return p === 'high' || p === 'critical' ? 'red' : p === 'medium' ? 'amber' : 'blue'; }
+const SEV_TONE: Record<string, string> = { critical: 'red', high: 'orange', medium: 'amber', low: 'blue', info: 'slate' };
+const SEV_HEX: Record<string, string>  = { critical: '#ef4444', high: '#f97316', medium: '#f59e0b', low: '#3b82f6', info: '#64748b' };
 
-function ScoreRing({ score, size = 100, strokeWidth = 7 }: { score: number; size?: number; strokeWidth?: number }) {
-  const r = (size - strokeWidth * 2) / 2;
-  const circ = 2 * Math.PI * r;
-  const dash = (score / 100) * circ;
-  const color = score >= 80 ? '#10b981' : score >= 60 ? '#3b82f6' : score >= 40 ? '#f59e0b' : '#ef4444';
+/* ---------- Executive header ---------- */
+function ExecutiveReportHeader({ report, onReRun }: { report: ShipMateReport; onReRun: () => void }) {
+  const verdict = toVerdict(report.ship_recommendation);
+  const topBlocker = report.key_blockers[0] ?? 'No critical blockers detected.';
   return (
-    <div className="relative" style={{ width: size, height: size }}>
-      <svg width={size} height={size} style={{ transform: 'rotate(-90deg)' }}>
-        <circle cx={size/2} cy={size/2} r={r} fill="none" stroke="rgba(255,255,255,0.06)" strokeWidth={strokeWidth} />
-        <motion.circle cx={size/2} cy={size/2} r={r} fill="none" stroke={color} strokeWidth={strokeWidth}
-          strokeLinecap="round" strokeDasharray={circ}
-          initial={{ strokeDashoffset: circ }}
-          animate={{ strokeDashoffset: circ - dash }}
-          transition={{ duration: 1.2, ease: 'easeOut' }} />
-      </svg>
-      <div className="absolute inset-0 flex flex-col items-center justify-center">
-        <span className="font-black text-white" style={{ fontSize: size * 0.24 }}>{score}</span>
+    <div className="card glow-border" style={{ position: 'relative', overflow: 'hidden' }}>
+      <RadarBg sweep rings blobs={false} style={{ opacity: 0.3 }} />
+      <div style={{ position: 'relative', display: 'grid', gridTemplateColumns: 'auto 1fr auto', gap: 28, padding: 26, alignItems: 'center' }}>
+        <ScoreRing value={report.readiness_score} size={130} stroke={10} label={verdict.toUpperCase()} />
+
+        <div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginBottom: 8 }}>
+            <span className="eyebrow">Ship Report</span>
+            <span className="mono muted" style={{ fontSize: 11 }}>· {new Date(report.generated_at).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}</span>
+          </div>
+          <h1 style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap', fontSize: 26, fontWeight: 840, margin: '0 0 10px', letterSpacing: '-0.025em', color: '#fff' }}>
+            <span className="mono">{report.repo.owner}/{report.repo.name}</span>
+            <VerdictPill verdict={verdict} />
+          </h1>
+          <div style={{ display: 'flex', alignItems: 'flex-start', gap: 12, padding: '11px 14px', borderRadius: 11, background: 'rgba(239,68,68,0.08)', border: '1px solid rgba(239,68,68,0.22)', maxWidth: 620 }}>
+            <AlertTriangle size={16} style={{ color: '#f87171', flexShrink: 0 }} />
+            <div>
+              <span style={{ fontSize: 11, fontWeight: 700, color: '#fca5a5', marginRight: 8 }}>TOP BLOCKER</span>
+              <span style={{ fontSize: 13, color: 'var(--ink-2)' }}>{topBlocker}</span>
+            </div>
+          </div>
+        </div>
+
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 8, alignSelf: 'flex-start' }}>
+          <button className="btn btn-secondary btn-sm"><Download size={14} /> Download PDF</button>
+          <button className="btn btn-secondary btn-sm"><Share2 size={14} /> Share</button>
+          <button className="btn btn-primary btn-sm" onClick={onReRun}><RotateCcw size={14} /> Re-run</button>
+        </div>
       </div>
     </div>
   );
 }
 
-// ── Animated progress bar ─────────────────────────────────────────────────────
-
-function AnimBar({ value, color, delay = 0 }: { value: number; color: string; delay?: number }) {
-  return (
-    <div className="h-1.5 rounded-full overflow-hidden" style={{ background: 'rgba(255,255,255,0.06)' }}>
-      <motion.div className="h-full rounded-full" style={{ background: color }}
-        initial={{ width: 0 }} animate={{ width: `${value}%` }} transition={{ duration: 1, ease: 'easeOut', delay }} />
-    </div>
-  );
-}
-
-// ── Overview tab ──────────────────────────────────────────────────────────────
-
-const REC: Record<string, { headline: string; verdict: string; textColor: string; bg: string; border: string }> = {
-  ready_to_ship: { headline: '🚀 READY TO SHIP',       verdict: 'SHIP IT',           textColor: '#10b981', bg: 'rgba(16,185,129,0.08)',  border: 'rgba(16,185,129,0.25)'  },
-  mostly_ready:  { headline: '✅ MOSTLY READY TO SHIP', verdict: 'SHIP WITH CONFIDENCE', textColor: '#3b82f6', bg: 'rgba(59,130,246,0.08)',  border: 'rgba(59,130,246,0.25)'  },
-  needs_review:  { headline: '⚠ SHIP WITH CAUTION',    verdict: 'SHIP WITH CAUTION', textColor: '#f59e0b', bg: 'rgba(245,158,11,0.08)',  border: 'rgba(245,158,11,0.25)'  },
-  risky_release: { headline: '🔴 RISKY RELEASE',        verdict: 'DO NOT SHIP YET',   textColor: '#f97316', bg: 'rgba(249,115,22,0.08)',  border: 'rgba(249,115,22,0.25)'  },
-  not_ready:     { headline: '🛑 DO NOT SHIP',           verdict: 'BLOCKED',           textColor: '#ef4444', bg: 'rgba(239,68,68,0.08)',   border: 'rgba(239,68,68,0.25)'   },
-};
-
+/* ---------- Overview tab ---------- */
 function OverviewTab({ report }: { report: ShipMateReport }) {
-  const { score_breakdown: sb, agents, ship_recommendation } = report;
-  const rec = REC[ship_recommendation] ?? REC.not_ready;
-
-  const riskCounts = { critical: 0, high: 0, medium: 0, low: 0, info: 0 };
-  agents.guardrail.findings.forEach((f: SecurityFinding) => {
-    if (f.severity in riskCounts) riskCounts[f.severity as keyof typeof riskCounts]++;
-  });
-
-  const breakdownItems = [
-    { label: 'Repository Health', val: sb.repo_score,     weight: 20, color: '#3b82f6'  },
-    { label: 'Delivery Planning', val: sb.delivery_score, weight: 25, color: '#8b5cf6'  },
-    { label: 'Security',          val: sb.security_score, weight: 30, color: '#f59e0b'  },
-    { label: 'Test Readiness',    val: sb.test_score,     weight: 25, color: '#10b981'  },
+  const verdict = toVerdict(report.ship_recommendation);
+  const counts: Record<string, number> = { critical: 0, high: 0, medium: 0, low: 0 };
+  report.agents.guardrail.findings.forEach((f: SecurityFinding) => { if (f.severity in counts) counts[f.severity]++; });
+  const breakdown = [
+    { key: 'repolens',  label: 'Repo Health', score: report.score_breakdown.repo_score },
+    { key: 'planforge', label: 'Delivery',    score: report.score_breakdown.delivery_score },
+    { key: 'guardrail', label: 'Security',    score: report.score_breakdown.security_score },
+    { key: 'testpilot', label: 'Testing',     score: report.score_breakdown.test_score },
   ];
+  const agentChip = (text: string) => {
+    if (text.toLowerCase().includes('security') || text.toLowerCase().includes('secret') || text.toLowerCase().includes('cors')) return 'GuardRail';
+    if (text.toLowerCase().includes('test') || text.toLowerCase().includes('coverage')) return 'TestPilot';
+    if (text.toLowerCase().includes('delivery') || text.toLowerCase().includes('deploy')) return 'PlanForge';
+    return 'RepoLens';
+  };
+  const agentTone = (name: string) => ({ GuardRail: 'amber', TestPilot: 'cyan', PlanForge: 'purple', RepoLens: 'emerald' }[name] ?? 'blue');
 
   return (
-    <div className="space-y-5">
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
       {/* Top 3 cards */}
-      <div className="grid lg:grid-cols-3 gap-4">
-        {/* Score */}
-        <div className="rounded-2xl p-6 flex flex-col items-center gap-4 border border-white/6" style={{ background: 'rgba(11,18,35,0.9)' }}>
-          <p className="text-xs font-bold text-slate-500 uppercase tracking-wider self-start">Readiness Score</p>
-          <ScoreRing score={report.readiness_score} size={120} />
-          <p className="text-sm font-black text-center" style={{ color: rec.textColor }}>{rec.headline}</p>
-          <p className="text-xs text-slate-500 text-center leading-relaxed">
-            {report.readiness_score >= 80 ? 'Great job! Repository is ready for production.' : 'Address the following issues before deploying to production.'}
-          </p>
-          <button className="text-xs text-blue-400 hover:underline">View Score Breakdown</button>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: 16 }}>
+        <div className="card" style={{ padding: 20, display: 'flex', alignItems: 'center', gap: 16 }}>
+          <ScoreRing value={report.readiness_score} size={92} stroke={8} />
+          <div>
+            <div className="eyebrow">Readiness</div>
+            <div style={{ fontSize: 20, fontWeight: 800, color: '#fff', margin: '4px 0' }}>{verdict}</div>
+            <div className="muted" style={{ fontSize: 12 }}>Synthesized by Ship Report</div>
+          </div>
         </div>
-
-        {/* Verdict */}
-        <div className="rounded-2xl p-6 border flex flex-col gap-4" style={{ background: rec.bg, borderColor: rec.border }}>
-          <p className="text-xs font-bold text-slate-500 uppercase tracking-wider">Release Commander Verdict</p>
-          <div className="inline-flex items-center gap-2 px-3 py-2 rounded-xl self-start"
-            style={{ background: rec.bg, border: `1px solid ${rec.border}` }}>
-            <span className="text-sm font-black" style={{ color: rec.textColor }}>{rec.verdict}</span>
-          </div>
-          <div className="flex items-center gap-2">
-            <span className="text-xs text-slate-400">Confidence:</span>
-            <span className="text-sm font-black text-white">{Math.min(99, Math.round(report.readiness_score * 1.07))}%</span>
-          </div>
-          <p className="text-xs text-slate-400 leading-relaxed flex-1">
-            {report.key_blockers.length > 0
-              ? `Address these issues before deploying: ${report.key_blockers.slice(0, 2).join('; ')}.`
-              : 'All critical checks passed. The team is confident in this release.'}
+        <div className="card" style={{ padding: 20 }}>
+          <div className="eyebrow" style={{ marginBottom: 12 }}>Verdict</div>
+          <VerdictPill verdict={verdict} />
+          <p className="muted" style={{ fontSize: 12.5, lineHeight: 1.5, margin: '12px 0 0' }}>
+            {report.key_blockers.length > 0 ? `Address ${report.key_blockers.length} blocker${report.key_blockers.length > 1 ? 's' : ''} before deploying.` : 'All critical checks passed. Ready to deploy.'}
           </p>
         </div>
-
-        {/* Top Issues */}
-        <div className="rounded-2xl p-6 border border-white/6" style={{ background: 'rgba(11,18,35,0.9)' }}>
-          <p className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-4">Top Issues</p>
-          <div className="space-y-1">
-            {[
-              { sev: 'Critical', count: riskCounts.critical, c: '#ef4444', dot: '#ef4444' },
-              { sev: 'High',     count: riskCounts.high,     c: '#f97316', dot: '#f97316' },
-              { sev: 'Medium',   count: riskCounts.medium,   c: '#f59e0b', dot: '#f59e0b' },
-              { sev: 'Low',      count: riskCounts.low,      c: '#3b82f6', dot: '#3b82f6' },
-            ].map(s => (
-              <div key={s.sev} className="flex items-center justify-between py-2.5 border-b border-white/5 last:border-0">
-                <div className="flex items-center gap-2">
-                  <span className="w-2 h-2 rounded-full flex-shrink-0" style={{ backgroundColor: s.dot }} />
-                  <span className="text-sm font-semibold" style={{ color: s.c }}>{s.sev}</span>
-                </div>
-                <span className="text-sm font-black text-white">{s.count}</span>
+        <div className="card" style={{ padding: 20 }}>
+          <div className="eyebrow" style={{ marginBottom: 14 }}>Issues by severity</div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+            {Object.entries(counts).map(([k, n]) => (
+              <div key={k} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                <span style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12.5, color: 'var(--ink-2)', textTransform: 'capitalize' }}>
+                  <span className="dot" style={{ background: SEV_HEX[k] ?? '#64748b' }} /> {k}
+                </span>
+                <span className="mono" style={{ fontSize: 13, fontWeight: 700, color: '#fff' }}>{n}</span>
               </div>
             ))}
           </div>
-          <button className="mt-3 w-full py-2 rounded-xl text-xs font-semibold text-slate-400 hover:text-white transition-colors border border-white/6 hover:border-white/12">
-            View All Issues
-          </button>
         </div>
       </div>
 
-      {/* Score breakdown: 4 rings */}
-      <div className="rounded-2xl p-6 border border-white/6" style={{ background: 'rgba(11,18,35,0.9)' }}>
-        <p className="text-sm font-bold text-white mb-6">Score Breakdown</p>
-        <div className="grid grid-cols-2 lg:grid-cols-4 gap-6">
-          {breakdownItems.map((s, i) => {
-            const sub = s.val >= 80 ? 'Excellent' : s.val >= 60 ? 'Good' : 'Needs Work';
+      {/* Score breakdown */}
+      <div className="card" style={{ padding: 20 }}>
+        <div className="eyebrow" style={{ marginBottom: 18 }}>Score breakdown</div>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gap: 20 }}>
+          {breakdown.map(b => {
+            const agent = AGENTS.find(a => a.key === b.key);
+            if (!agent) return null;
             return (
-              <div key={s.label} className="flex flex-col items-center gap-3">
-                <ScoreRing score={s.val} size={80} strokeWidth={6} />
-                <div className="text-center">
-                  <p className="text-[11px] font-semibold text-slate-300">{s.label}</p>
-                  <p className="text-[10px] font-bold mt-0.5" style={{ color: s.color }}>{sub}</p>
+              <div key={b.key} style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 10 }}>
+                <ScoreRing value={b.score} size={84} stroke={7} />
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                  <agent.Icon size={14} style={{ color: agent.hex }} />
+                  <span style={{ fontSize: 12.5, fontWeight: 650, color: 'var(--ink-2)' }}>{b.label}</span>
                 </div>
-                <AnimBar value={s.val} color={s.color} delay={i * 0.1} />
               </div>
             );
           })}
@@ -144,154 +125,140 @@ function OverviewTab({ report }: { report: ShipMateReport }) {
 
       {/* Recommended actions */}
       {report.next_actions.length > 0 && (
-        <div className="rounded-2xl p-6 border border-white/6" style={{ background: 'rgba(11,18,35,0.9)' }}>
-          <p className="text-sm font-bold text-white mb-4">Recommended Actions</p>
-          <div className="space-y-1">
-            {report.next_actions.slice(0, 5).map((action, i) => {
-              const isHigh = i < 2;
-              const isMed  = i < 4;
-              const badgeCls = isHigh ? { bg: 'rgba(239,68,68,0.12)', border: 'rgba(239,68,68,0.25)', color: '#fca5a5', label: 'High' }
-                : isMed ? { bg: 'rgba(245,158,11,0.12)', border: 'rgba(245,158,11,0.25)', color: '#fcd34d', label: 'Medium' }
-                : { bg: 'rgba(59,130,246,0.12)', border: 'rgba(59,130,246,0.25)', color: '#93c5fd', label: 'Low' };
+        <div className="card" style={{ padding: 20 }}>
+          <div className="eyebrow" style={{ marginBottom: 16 }}>Recommended actions</div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+            {report.next_actions.slice(0, 5).map((text, i) => {
+              const ag = agentChip(text);
+              const pri = i === 0 ? 'high' : i < 3 ? 'medium' : 'low';
               return (
-                <div key={i} className="flex items-center gap-3 py-3 border-b border-white/5 last:border-0">
-                  <span className="text-xs font-black text-slate-600 w-5 text-right flex-shrink-0">{i + 1}.</span>
-                  <p className="text-[13px] text-slate-300 flex-1 leading-snug">{action}</p>
-                  <span className="text-[10px] font-bold px-2.5 py-0.5 rounded-full flex-shrink-0"
-                    style={{ background: badgeCls.bg, border: `1px solid ${badgeCls.border}`, color: badgeCls.color }}>
-                    {badgeCls.label}
-                  </span>
+                <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '12px 14px', borderRadius: 12, background: 'rgba(255,255,255,0.02)', border: '1px solid var(--line)' }}>
+                  <div style={{ width: 26, height: 26, borderRadius: 8, background: 'rgba(255,255,255,0.05)', display: 'grid', placeItems: 'center', fontWeight: 800, fontSize: 12.5, color: 'var(--ink-2)', flexShrink: 0 }}>{i + 1}</div>
+                  <div style={{ flex: 1, fontSize: 13.5, color: 'var(--ink-2)', lineHeight: 1.45 }}>{text}</div>
+                  <span className={`chip tone-${agentTone(ag)}`}>{ag}</span>
+                  <span className={`chip tone-${pTone(pri)}`} style={{ textTransform: 'capitalize' }}>{pri}</span>
                 </div>
               );
             })}
           </div>
-          {report.next_actions.length > 5 && (
-            <button className="mt-3 w-full py-2 rounded-xl text-xs font-semibold text-slate-400 hover:text-white border border-white/6 transition-colors">
-              View All Recommendations
-            </button>
-          )}
         </div>
       )}
     </div>
   );
 }
 
-// ── RepoLens tab ──────────────────────────────────────────────────────────────
-
+/* ---------- RepoLens tab ---------- */
 function RepoLensTab({ report }: { report: ShipMateReport }) {
   const rl = report.agents.repo_lens;
+  const depCount = Object.values(rl.dependency_summary).reduce((s, arr) => s + (arr as string[]).length, 0);
+  const archChecks = [
+    { label: 'CI/CD',       on: rl.has_ci_cd      },
+    { label: 'Docker',      on: rl.has_dockerfile  },
+    { label: 'Tests',       on: rl.has_tests       },
+  ];
   return (
-    <div className="grid lg:grid-cols-2 gap-4">
-      <div className="rounded-2xl p-5 border border-white/6 space-y-4" style={{ background: 'rgba(11,18,35,0.9)' }}>
-        <div>
-          <p className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-2.5">Tech Stack</p>
-          <div className="flex flex-wrap gap-2">{rl.tech_stack.map(t => (
-            <span key={t} className="px-3 py-1 rounded-full text-xs font-medium border" style={{ background: 'rgba(59,130,246,0.08)', borderColor: 'rgba(59,130,246,0.2)', color: '#93c5fd' }}>{t}</span>
-          ))}</div>
-        </div>
-        <div>
-          <p className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-2">Architecture</p>
-          <p className="text-sm text-slate-200">{rl.architecture_pattern}</p>
-          <div className="flex flex-wrap gap-1.5 mt-2">
-            {rl.has_ci_cd      && <span className="px-2.5 py-1 rounded-full text-[10px] font-semibold border" style={{ background: 'rgba(16,185,129,0.08)', borderColor: 'rgba(16,185,129,0.2)', color: '#6ee7b7' }}>✓ CI/CD</span>}
-            {rl.has_dockerfile && <span className="px-2.5 py-1 rounded-full text-[10px] font-semibold border" style={{ background: 'rgba(59,130,246,0.08)', borderColor: 'rgba(59,130,246,0.2)', color: '#93c5fd' }}>✓ Docker</span>}
-            {rl.has_tests      && <span className="px-2.5 py-1 rounded-full text-[10px] font-semibold border" style={{ background: 'rgba(139,92,246,0.08)', borderColor: 'rgba(139,92,246,0.2)', color: '#c4b5fd' }}>✓ Tests</span>}
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
+        <div className="card" style={{ padding: 20 }}>
+          <div className="eyebrow" style={{ marginBottom: 14 }}>Tech stack</div>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+            {rl.tech_stack.map(s => <span key={s} className="chip tone-emerald mono">{s}</span>)}
           </div>
-        </div>
-      </div>
-      <div className="rounded-2xl p-5 border border-white/6 space-y-4" style={{ background: 'rgba(11,18,35,0.9)' }}>
-        <div>
-          <p className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-2.5">Dependencies</p>
-          {Object.entries(rl.dependency_summary).map(([type, deps]) => (
-            <div key={type} className="mb-3">
-              <p className="text-[10px] text-slate-600 capitalize mb-1.5">{type}</p>
-              <div className="flex flex-wrap gap-1.5">
-                {(deps as string[]).slice(0, 6).map((d: string) => (
-                  <span key={d} className="text-[10px] font-mono text-slate-300 px-2 py-0.5 rounded border" style={{ background: 'rgba(255,255,255,0.04)', borderColor: 'rgba(255,255,255,0.08)' }}>{d}</span>
-                ))}
-              </div>
-            </div>
-          ))}
-        </div>
-        {rl.architecture_risks.length > 0 && (
-          <div>
-            <p className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-2">Architecture Risks</p>
-            {rl.architecture_risks.map((r, i) => (
-              <p key={i} className="text-xs text-slate-400 flex items-start gap-1.5 mb-1">
-                <span className="text-amber-400 flex-shrink-0">⚠</span>{r.risk}
-              </p>
+          <div className="eyebrow" style={{ margin: '20px 0 12px' }}>Architecture</div>
+          <p style={{ fontSize: 13.5, color: 'var(--ink-2)', margin: '0 0 12px' }}>{rl.architecture_pattern}</p>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+            {archChecks.map(x => (
+              <span key={x.label} className={`chip ${x.on ? 'tone-emerald' : 'tone-slate'}`}>
+                {x.on ? <Check size={12} /> : <X size={12} />} {x.label}
+              </span>
             ))}
           </div>
-        )}
+        </div>
+        <div className="card" style={{ padding: 20 }}>
+          <div className="eyebrow" style={{ marginBottom: 14 }}>Dependencies</div>
+          <div style={{ display: 'flex', gap: 12 }}>
+            {[['Total', depCount, 'blue'], ['Outdated', 0, 'amber'], ['Vulnerable', 0, 'red']].map(([k, v, t]) => (
+              <div key={k as string} style={{ flex: 1, padding: 14, borderRadius: 12, background: 'rgba(255,255,255,0.02)', border: '1px solid var(--line)' }}>
+                <div style={{ fontSize: 22, fontWeight: 820, color: `var(--${t})` }}>{v}</div>
+                <div className="muted" style={{ fontSize: 11.5, marginTop: 2 }}>{k}</div>
+              </div>
+            ))}
+          </div>
+          {rl.architecture_risks.length > 0 && (
+            <>
+              <div className="eyebrow" style={{ margin: '20px 0 12px' }}>Architecture risks</div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                {rl.architecture_risks.map((r, i) => (
+                  <div key={i} style={{ display: 'flex', alignItems: 'flex-start', gap: 8, fontSize: 12.5, color: 'var(--ink-2)', lineHeight: 1.5 }}>
+                    <AlertTriangle size={14} style={{ color: 'var(--amber)', flexShrink: 0, marginTop: 1 }} /> {r.risk}
+                  </div>
+                ))}
+              </div>
+            </>
+          )}
+        </div>
       </div>
     </div>
   );
 }
 
-// ── GuardRail tab ─────────────────────────────────────────────────────────────
-
-function GuardRailTab({ report }: { report: ShipMateReport }) {
-  const gr = report.agents.guardrail;
-  const SEV: Record<string, { bg: string; border: string; color: string }> = {
-    critical: { bg: 'rgba(239,68,68,0.08)',  border: 'rgba(239,68,68,0.2)',  color: '#fca5a5' },
-    high:     { bg: 'rgba(249,115,22,0.08)', border: 'rgba(249,115,22,0.2)', color: '#fdba74' },
-    medium:   { bg: 'rgba(245,158,11,0.08)', border: 'rgba(245,158,11,0.2)', color: '#fcd34d' },
-    low:      { bg: 'rgba(59,130,246,0.08)', border: 'rgba(59,130,246,0.2)', color: '#93c5fd' },
-    info:     { bg: 'rgba(100,116,139,0.08)',border: 'rgba(100,116,139,0.2)',color: '#94a3b8' },
-  };
-  return (
-    <div className="space-y-3">
-      {gr.findings.length > 0 ? gr.findings.map((f, i) => {
-        const s = SEV[f.severity] ?? SEV.info;
-        return (
-          <div key={i} className="rounded-2xl p-5 border" style={{ background: s.bg, borderColor: s.border }}>
-            <div className="flex items-start justify-between gap-3 mb-2">
-              <p className="text-sm font-bold text-white">{f.title}</p>
-              <span className="text-[10px] font-bold px-2.5 py-0.5 rounded-full border capitalize flex-shrink-0"
-                style={{ background: s.bg, borderColor: s.border, color: s.color }}>{f.severity}</span>
-            </div>
-            <p className="text-xs text-slate-400 leading-relaxed mb-2">{f.description}</p>
-            <p className="text-xs flex items-center gap-1.5" style={{ color: '#6ee7b7' }}>
-              <ChevronRight size={11} /> {f.recommendation}
-            </p>
-            {f.file && <p className="text-[10px] text-slate-600 font-mono mt-1.5">📁 {f.file}</p>}
-          </div>
-        );
-      }) : (
-        <div className="rounded-2xl p-10 text-center border border-white/6" style={{ background: 'rgba(11,18,35,0.9)' }}>
-          <p className="text-emerald-400 text-sm font-semibold">✓ No security findings detected</p>
-        </div>
-      )}
-    </div>
-  );
-}
-
-// ── PlanForge tab ─────────────────────────────────────────────────────────────
-
+/* ---------- PlanForge tab ---------- */
 function PlanForgeTab({ report }: { report: ShipMateReport }) {
   const pf = report.agents.plan_forge;
   return (
-    <div className="space-y-4">
-      <div className="rounded-2xl p-4 border" style={{ background: 'rgba(59,130,246,0.06)', borderColor: 'rgba(59,130,246,0.2)' }}>
-        <p className="text-[10px] font-bold text-blue-400 uppercase tracking-wider mb-1">Next Best Action</p>
-        <p className="text-sm font-semibold text-slate-200">{pf.next_best_action}</p>
-        <p className="text-xs text-slate-500 mt-1">Estimated effort: {pf.estimated_effort}</p>
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+      <div className="card" style={{ display: 'flex', alignItems: 'flex-start', gap: 12, padding: 18, background: 'rgba(139,92,246,0.07)', borderColor: 'rgba(139,92,246,0.25)' }}>
+        <Compass size={20} style={{ color: 'var(--purple)', flexShrink: 0 }} />
+        <div>
+          <div style={{ fontSize: 11, fontWeight: 700, color: '#c4b5fd', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 3 }}>Next best action</div>
+          <div style={{ fontSize: 14, color: 'var(--ink-2)', lineHeight: 1.5 }}>{pf.next_best_action}</div>
+        </div>
       </div>
-      {pf.milestones.map((m, i) => {
-        const pri = m.priority === 'high' || m.priority === 'critical'
-          ? { bg: 'rgba(239,68,68,0.08)', border: 'rgba(239,68,68,0.2)', color: '#fca5a5' }
-          : m.priority === 'medium'
-          ? { bg: 'rgba(245,158,11,0.08)', border: 'rgba(245,158,11,0.2)', color: '#fcd34d' }
-          : { bg: 'rgba(59,130,246,0.08)', border: 'rgba(59,130,246,0.2)', color: '#93c5fd' };
-        return (
-          <div key={i} className="rounded-2xl p-5 border border-white/6" style={{ background: 'rgba(11,18,35,0.9)' }}>
-            <div className="flex items-center justify-between mb-2">
-              <p className="text-sm font-bold text-white">{m.title}</p>
-              <span className="text-[10px] font-bold px-2.5 py-0.5 rounded-full border capitalize"
-                style={{ background: pri.bg, borderColor: pri.border, color: pri.color }}>{m.priority}</span>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(240px,1fr))', gap: 14 }}>
+        {pf.milestones.map((m, i) => (
+          <div key={i} className="card card-hover" style={{ padding: 18 }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 }}>
+              <span className="chip tone-purple">{m.category}</span>
+              <span className={`chip tone-${pTone(m.priority)}`} style={{ textTransform: 'capitalize' }}>{m.priority}</span>
             </div>
-            <p className="text-xs text-slate-400 leading-relaxed">{m.description}</p>
-            <p className="text-[10px] text-slate-600 mt-2">Est. {m.estimated_days} days · {m.category}</p>
+            <div style={{ fontSize: 15, fontWeight: 700, color: '#fff', lineHeight: 1.35 }}>{m.title}</div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 12, fontSize: 12, color: 'var(--ink-3)' }}>
+              <Clock size={13} /> ~{m.estimated_days} days · est.
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/* ---------- GuardRail tab ---------- */
+function GuardRailTab({ report }: { report: ShipMateReport }) {
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+      {report.agents.guardrail.findings.length === 0 ? (
+        <div className="card" style={{ padding: 40, textAlign: 'center' }}>
+          <p style={{ color: 'var(--emerald)', fontWeight: 600, fontSize: 14 }}>✓ No security findings detected</p>
+        </div>
+      ) : report.agents.guardrail.findings.map((f, i) => {
+        const tone = SEV_TONE[f.severity] ?? 'slate';
+        const hex  = SEV_HEX[f.severity]  ?? '#64748b';
+        return (
+          <div key={i} className="card" style={{ padding: 18, borderColor: `${hex}44`, background: `linear-gradient(180deg, ${hex}0a, var(--panel))` }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <span className={`chip tone-${tone}`} style={{ textTransform: 'uppercase', fontWeight: 700 }}>
+                  <ShieldCheck size={12} /> {f.severity}
+                </span>
+                <span style={{ fontSize: 15, fontWeight: 700, color: '#fff' }}>{f.title}</span>
+              </div>
+              {f.file && <span className="mono muted" style={{ fontSize: 11.5 }}>{f.file}</span>}
+            </div>
+            <p className="muted" style={{ fontSize: 13, lineHeight: 1.55, margin: '0 0 10px' }}>{f.description}</p>
+            <div style={{ display: 'flex', alignItems: 'flex-start', gap: 8, fontSize: 13, color: '#6ee7b7' }}>
+              <ChevronRight size={14} style={{ flexShrink: 0, marginTop: 2 }} />
+              <span><b style={{ color: '#a7f3d0' }}>Fix: </b>{f.recommendation}</span>
+            </div>
           </div>
         );
       })}
@@ -299,107 +266,90 @@ function PlanForgeTab({ report }: { report: ShipMateReport }) {
   );
 }
 
-// ── TestPilot tab ─────────────────────────────────────────────────────────────
-
+/* ---------- TestPilot tab ---------- */
 function TestPilotTab({ report }: { report: ShipMateReport }) {
   const tp = report.agents.testpilot;
   const qaColor = tp.qa_readiness === 'ready' ? '#10b981' : tp.qa_readiness === 'partial' ? '#f59e0b' : '#ef4444';
   return (
-    <div className="space-y-4">
-      <div className="grid grid-cols-3 gap-3">
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: 16 }}>
         {[
-          { val: tp.existing_tests.count, label: 'Test Files', color: '#fff' },
-          { val: `${tp.existing_tests.coverage_estimate}%`, label: 'Coverage', color: '#10b981' },
-          { val: tp.qa_readiness === 'ready' ? 'QA Ready' : tp.qa_readiness === 'partial' ? 'Partial' : 'Not Ready', label: 'QA Status', color: qaColor },
-        ].map(s => (
-          <div key={s.label} className="rounded-xl p-4 text-center border border-white/6" style={{ background: 'rgba(11,18,35,0.9)' }}>
-            <p className="text-2xl font-black" style={{ color: s.color }}>{s.val}</p>
-            <p className="text-xs text-slate-500 mt-1">{s.label}</p>
+          { k: 'Tests',      v: tp.existing_tests.count,                                      tone: 'cyan',    Icon: FlaskConical },
+          { k: 'Coverage',   v: `${tp.existing_tests.coverage_estimate}%`,                    tone: 'blue',    Icon: TrendingUp   },
+          { k: 'QA Status',  v: tp.qa_readiness === 'ready' ? 'QA Ready' : tp.qa_readiness === 'partial' ? 'Partial' : 'Not Ready', tone: 'amber', Icon: ShieldCheck },
+        ].map(item => (
+          <div key={item.k} className="card" style={{ padding: 20 }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+              <div style={{ width: 36, height: 36, borderRadius: 10, background: `var(--${item.tone})18`, border: '1px solid var(--line-2)', color: `var(--${item.tone})`, display: 'grid', placeItems: 'center' }}>
+                <item.Icon size={18} />
+              </div>
+              {item.k === 'Coverage' && <span className="chip tone-emerald"><TrendingUp size={11} /> +{tp.suggested_tests.length * 3}%</span>}
+            </div>
+            <div style={{ fontSize: 24, fontWeight: 820, color: item.k === 'QA Status' ? qaColor : '#fff', marginTop: 14 }}>{item.v}</div>
+            <div className="muted" style={{ fontSize: 11.5, marginTop: 2 }}>{item.k}</div>
           </div>
         ))}
       </div>
-      {tp.suggested_tests.map((t, i) => {
-        const pri = t.priority === 'critical' || t.priority === 'high'
-          ? { bg: 'rgba(239,68,68,0.08)', border: 'rgba(239,68,68,0.2)', color: '#fca5a5' }
-          : { bg: 'rgba(245,158,11,0.08)', border: 'rgba(245,158,11,0.2)', color: '#fcd34d' };
-        return (
-          <div key={i} className="rounded-2xl p-5 border border-white/6" style={{ background: 'rgba(11,18,35,0.9)' }}>
-            <div className="flex items-center justify-between gap-3 mb-2">
-              <p className="text-sm font-bold text-white font-mono">{t.name}</p>
-              <div className="flex gap-1.5 flex-shrink-0">
-                <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full border"
-                  style={{ background: 'rgba(139,92,246,0.08)', borderColor: 'rgba(139,92,246,0.2)', color: '#c4b5fd' }}>{t.type}</span>
-                <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full border"
-                  style={{ background: pri.bg, borderColor: pri.border, color: pri.color }}>{t.priority}</span>
+      <div className="card" style={{ padding: 20 }}>
+        <div className="eyebrow" style={{ marginBottom: 16 }}>Suggested tests · {tp.suggested_tests.length} suites</div>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+          {tp.suggested_tests.map((t, i) => (
+            <div key={i} style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', flexWrap: 'wrap', gap: 10, padding: '13px 14px', borderRadius: 12, background: 'rgba(255,255,255,0.02)', border: '1px solid var(--line)' }}>
+              <div style={{ minWidth: 0 }}>
+                <div className="mono" style={{ fontSize: 13.5, fontWeight: 650, color: '#fff' }}>{t.name}</div>
+                <div className="muted" style={{ fontSize: 12, marginTop: 3 }}>{t.description}</div>
+              </div>
+              <div style={{ display: 'flex', gap: 8, flexShrink: 0 }}>
+                <span className="chip tone-cyan" style={{ textTransform: 'uppercase' }}>{t.type}</span>
+                <span className={`chip tone-${pTone(t.priority)}`} style={{ textTransform: 'capitalize' }}>{t.priority}</span>
               </div>
             </div>
-            <p className="text-xs text-slate-400 leading-relaxed">{t.description}</p>
-          </div>
-        );
-      })}
+          ))}
+        </div>
+      </div>
     </div>
   );
 }
 
-// ── Main ──────────────────────────────────────────────────────────────────────
-
-const TABS = ['Overview', 'RepoLens', 'PlanForge', 'GuardRail', 'TestPilot'] as const;
-type Tab = typeof TABS[number];
+/* ---------- Main ---------- */
+const TABS = [
+  { key: 'overview',  label: 'Overview',  Icon: LayoutGrid  },
+  { key: 'repolens',  label: 'RepoLens',  Icon: Radar        },
+  { key: 'planforge', label: 'PlanForge', Icon: Compass      },
+  { key: 'guardrail', label: 'GuardRail', Icon: ShieldCheck  },
+  { key: 'testpilot', label: 'TestPilot', Icon: FlaskConical },
+] as const;
 
 interface Props { report: ShipMateReport; onReRun: () => void; }
 
 export function ReportsPage({ report, onReRun }: Props) {
-  const [tab, setTab] = useState<Tab>('Overview');
-  const fmt = (d: string) => new Date(d).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+  const [tab, setTab] = useState<typeof TABS[number]['key']>('overview');
 
   return (
-    <div className="px-8 py-7 max-w-[1080px] space-y-5">
-      {/* Header */}
-      <motion.div initial={{ opacity: 0, y: -10 }} animate={{ opacity: 1, y: 0 }} className="flex items-start justify-between flex-wrap gap-3">
-        <div>
-          <h1 className="text-[22px] font-black text-white tracking-tight">Analysis Report</h1>
-          <div className="flex items-center gap-2 mt-1">
-            <span className="text-sm font-semibold text-blue-400">{report.repo.full_name}</span>
-            <ExternalLink size={11} className="text-slate-600" />
-          </div>
-          <p className="text-xs text-slate-500 mt-0.5">
-            Completed {fmt(report.generated_at)} · <span className="text-blue-400">Full Analysis</span>
-          </p>
-        </div>
-        <div className="flex items-center gap-2">
-          <button className="flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-semibold border border-white/8 text-slate-300 hover:text-white hover:border-white/15 transition-all">
-            <Download size={12} /> Download PDF
-          </button>
-          <button className="flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-semibold border border-white/8 text-slate-300 hover:text-white hover:border-white/15 transition-all">
-            <Share2 size={12} /> Share Report
-          </button>
-          <button onClick={onReRun} className="flex items-center gap-1.5 px-4 py-2 rounded-xl text-xs font-bold text-white transition-all"
-            style={{ background: 'linear-gradient(135deg, #1d4ed8, #0891b2)' }}>
-            <RotateCcw size={12} /> Re-run Analysis
-          </button>
-        </div>
-      </motion.div>
+    <motion.div initial={{ opacity: 0, y: 14 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.55, ease: [0.2,0.7,0.2,1] }}
+      style={{ padding: '28px 32px', maxWidth: 1180, margin: '0 auto', width: '100%' }}>
+      <ExecutiveReportHeader report={report} onReRun={onReRun} />
 
-      {/* Tabs */}
-      <div className="flex items-center gap-0 border-b border-white/6">
+      {/* Tab bar */}
+      <div style={{ display: 'flex', gap: 16, borderBottom: '1px solid var(--line)', margin: '22px 0', overflowX: 'auto' }}>
         {TABS.map(t => (
-          <button key={t} onClick={() => setTab(t)}
-            className={`px-5 py-3 text-sm font-semibold border-b-2 -mb-px transition-all ${
-              tab === t ? 'text-white border-blue-500' : 'text-slate-500 border-transparent hover:text-slate-300'
-            }`}>
-            {t}
+          <button key={t.key} className={`tab ${tab === t.key ? 'active' : ''}`} onClick={() => setTab(t.key)}>
+            <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}><t.Icon size={15} /> {t.label}</span>
           </button>
         ))}
       </div>
 
-      {/* Content */}
-      <motion.div key={tab} initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.18 }}>
-        {tab === 'Overview'  && <OverviewTab  report={report} />}
-        {tab === 'RepoLens'  && <RepoLensTab  report={report} />}
-        {tab === 'PlanForge' && <PlanForgeTab report={report} />}
-        {tab === 'GuardRail' && <GuardRailTab report={report} />}
-        {tab === 'TestPilot' && <TestPilotTab report={report} />}
+      {/* Tab content */}
+      <motion.div key={tab} initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.2 }}>
+        {tab === 'overview'  && <OverviewTab  report={report} />}
+        {tab === 'repolens'  && <RepoLensTab  report={report} />}
+        {tab === 'planforge' && <PlanForgeTab report={report} />}
+        {tab === 'guardrail' && <GuardRailTab report={report} />}
+        {tab === 'testpilot' && <TestPilotTab report={report} />}
       </motion.div>
-    </div>
+    </motion.div>
   );
 }
+
+// suppress unused scoreColor
+const _sc = scoreColor; void _sc;
