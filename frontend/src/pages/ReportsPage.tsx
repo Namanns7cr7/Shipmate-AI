@@ -1,16 +1,80 @@
 import { useState } from 'react';
 import { motion } from 'framer-motion';
-import { Download, Share2, RotateCcw, AlertTriangle, Check, X, Clock, Compass, ShieldCheck, FlaskConical, Radar, LayoutGrid, ChevronRight, TrendingUp } from 'lucide-react';
+import { Download, Share2, RotateCcw, AlertTriangle, Check, X, Clock, Compass, ShieldCheck, FlaskConical, Radar, LayoutGrid, ChevronRight, TrendingUp, Sparkles } from 'lucide-react';
 import { ScoreRing } from '../components/ui/ScoreRing';
 import { VerdictPill, toVerdict } from '../components/ui/VerdictPill';
 import { RadarBg } from '../components/ui/RadarBg';
+import { ActuateButton } from '../components/ui/ActuateButton';
 import { AGENTS } from '../lib/agents';
-import type { ShipMateReport, SecurityFinding } from '../types';
+import type { ShipMateReport, SecurityFinding, RepoLensSummary } from '../types';
+
+/* ---------- Actuate context helpers ---------- */
+function makeContext(report: ShipMateReport): RepoLensSummary {
+  const rl = report.agents.repo_lens;
+  return {
+    primary_language: rl.primary_language,
+    tech_stack: rl.tech_stack,
+    entry_points: rl.entry_points,
+    has_ci_cd: rl.has_ci_cd,
+    has_tests: rl.has_tests,
+  };
+}
+
+interface ActuateCtx {
+  owner: string;
+  repo: string;
+  branch: string;
+  accessToken: string | null;
+  context: RepoLensSummary;
+}
 
 /* ---------- Helpers ---------- */
 function pTone(p: string) { return p === 'high' || p === 'critical' ? 'red' : p === 'medium' ? 'amber' : 'blue'; }
 const SEV_TONE: Record<string, string> = { critical: 'red', high: 'orange', medium: 'amber', low: 'blue', info: 'slate' };
 const SEV_HEX: Record<string, string>  = { critical: '#ef4444', high: '#f97316', medium: '#f59e0b', low: '#3b82f6', info: '#64748b' };
+
+/* ---------- AI-discovered badge + rationale tooltip ---------- */
+function AIDiscoveredBadge({ rationale }: { rationale?: string | null }) {
+  return (
+    <span
+      title={rationale || 'Discovered by AI from real repo code'}
+      style={{
+        display: 'inline-flex', alignItems: 'center', gap: 4,
+        padding: '3px 8px', borderRadius: 999, fontSize: 10.5, fontWeight: 700,
+        color: '#c4b5fd',
+        background: 'linear-gradient(135deg, rgba(139,92,246,0.16), rgba(59,130,246,0.16))',
+        border: '1px solid rgba(139,92,246,0.4)',
+        textTransform: 'uppercase', letterSpacing: '0.04em',
+        cursor: rationale ? 'help' : 'default',
+      }}
+    >
+      <Sparkles size={10} /> AI
+    </span>
+  );
+}
+
+function RationaleNote({ rationale }: { rationale?: string | null }) {
+  if (!rationale) return null;
+  return (
+    <div style={{
+      marginTop: 8, padding: '8px 10px', borderRadius: 8,
+      fontSize: 12, lineHeight: 1.5,
+      color: '#c4b5fd',
+      background: 'linear-gradient(135deg, rgba(139,92,246,0.06), rgba(59,130,246,0.06))',
+      border: '1px solid rgba(139,92,246,0.22)',
+      // Break long backticked file paths inside narrow card columns instead
+      // of running off the right edge.
+      overflowWrap: 'anywhere',
+      wordBreak: 'break-word',
+      minWidth: 0,
+    }}>
+      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4, fontWeight: 700, marginRight: 6, color: '#a78bfa' }}>
+        <Sparkles size={11} /> Why:
+      </span>
+      <span style={{ color: 'var(--ink-2)' }}>{rationale}</span>
+    </div>
+  );
+}
 
 /* ---------- Executive header ---------- */
 function ExecutiveReportHeader({ report, onReRun }: { report: ShipMateReport; onReRun: () => void }) {
@@ -203,37 +267,80 @@ function RepoLensTab({ report }: { report: ShipMateReport }) {
 }
 
 /* ---------- PlanForge tab ---------- */
-function PlanForgeTab({ report }: { report: ShipMateReport }) {
+function PlanForgeTab({ report, ctx }: { report: ShipMateReport; ctx: ActuateCtx }) {
   const pf = report.agents.plan_forge;
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
       <div className="card" style={{ display: 'flex', alignItems: 'flex-start', gap: 12, padding: 18, background: 'rgba(139,92,246,0.07)', borderColor: 'rgba(139,92,246,0.25)' }}>
         <Compass size={20} style={{ color: 'var(--purple)', flexShrink: 0 }} />
-        <div>
+        <div style={{ flex: 1 }}>
           <div style={{ fontSize: 11, fontWeight: 700, color: '#c4b5fd', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 3 }}>Next best action</div>
           <div style={{ fontSize: 14, color: 'var(--ink-2)', lineHeight: 1.5 }}>{pf.next_best_action}</div>
         </div>
+        <ActuateButton
+          owner={ctx.owner} repo={ctx.repo} branch={ctx.branch}
+          accessToken={ctx.accessToken} context={ctx.context}
+          finding={{
+            kind: 'next_action',
+            id: 'next-best-action',
+            title: pf.next_best_action.slice(0, 80),
+            description: pf.next_best_action,
+            recommendation: pf.next_best_action,
+            category: 'feature',
+          }}
+          label="Run It"
+        />
       </div>
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(240px,1fr))', gap: 14 }}>
-        {pf.milestones.map((m, i) => (
-          <div key={i} className="card card-hover" style={{ padding: 18 }}>
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 }}>
-              <span className="chip tone-purple">{m.category}</span>
-              <span className={`chip tone-${pTone(m.priority)}`} style={{ textTransform: 'capitalize' }}>{m.priority}</span>
+        {pf.milestones.map((m, i) => {
+          const isAI = m.source === 'discovery';
+          return (
+            <div key={i} className="card card-hover" style={{
+              padding: 18, display: 'flex', flexDirection: 'column', gap: 10,
+              borderColor: isAI ? 'rgba(139,92,246,0.32)' : undefined,
+              background: isAI ? 'linear-gradient(180deg, rgba(139,92,246,0.04), var(--panel))' : undefined,
+            }}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 6 }}>
+                <span className="chip tone-purple">{m.category}</span>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                  {isAI && <AIDiscoveredBadge rationale={m.rationale} />}
+                  <span className={`chip tone-${pTone(m.priority)}`} style={{ textTransform: 'capitalize' }}>{m.priority}</span>
+                </div>
+              </div>
+              <div style={{ fontSize: 15, fontWeight: 700, color: '#fff', lineHeight: 1.35 }}>{m.title}</div>
+              {m.description && (
+                <div className="muted" style={{ fontSize: 12.5, lineHeight: 1.5 }}>{m.description}</div>
+              )}
+              <RationaleNote rationale={m.rationale} />
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: 4, fontSize: 12, color: 'var(--ink-3)' }}>
+                <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                  <Clock size={13} /> ~{m.estimated_days} days · est.
+                </span>
+                <ActuateButton
+                  owner={ctx.owner} repo={ctx.repo} branch={ctx.branch}
+                  accessToken={ctx.accessToken} context={ctx.context}
+                  finding={{
+                    kind: 'milestone',
+                    id: m.title.toLowerCase().replace(/[^a-z0-9]+/g, '-').slice(0, 40),
+                    title: m.title,
+                    description: m.description || m.title,
+                    recommendation: m.rationale || m.description || '',
+                    category: m.category,
+                    severity: m.priority,
+                  }}
+                  label="Build It"
+                />
+              </div>
             </div>
-            <div style={{ fontSize: 15, fontWeight: 700, color: '#fff', lineHeight: 1.35 }}>{m.title}</div>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 12, fontSize: 12, color: 'var(--ink-3)' }}>
-              <Clock size={13} /> ~{m.estimated_days} days · est.
-            </div>
-          </div>
-        ))}
+          );
+        })}
       </div>
     </div>
   );
 }
 
 /* ---------- GuardRail tab ---------- */
-function GuardRailTab({ report }: { report: ShipMateReport }) {
+function GuardRailTab({ report, ctx }: { report: ShipMateReport; ctx: ActuateCtx }) {
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
       {report.agents.guardrail.findings.length === 0 ? (
@@ -243,21 +350,41 @@ function GuardRailTab({ report }: { report: ShipMateReport }) {
       ) : report.agents.guardrail.findings.map((f, i) => {
         const tone = SEV_TONE[f.severity] ?? 'slate';
         const hex  = SEV_HEX[f.severity]  ?? '#64748b';
+        const isAI = f.source === 'discovery';
         return (
           <div key={i} className="card" style={{ padding: 18, borderColor: `${hex}44`, background: `linear-gradient(180deg, ${hex}0a, var(--panel))` }}>
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8, flexWrap: 'wrap', gap: 8 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
                 <span className={`chip tone-${tone}`} style={{ textTransform: 'uppercase', fontWeight: 700 }}>
                   <ShieldCheck size={12} /> {f.severity}
                 </span>
                 <span style={{ fontSize: 15, fontWeight: 700, color: '#fff' }}>{f.title}</span>
+                {isAI && <AIDiscoveredBadge rationale={f.rationale} />}
               </div>
               {f.file && <span className="mono muted" style={{ fontSize: 11.5 }}>{f.file}</span>}
             </div>
             <p className="muted" style={{ fontSize: 13, lineHeight: 1.55, margin: '0 0 10px' }}>{f.description}</p>
-            <div style={{ display: 'flex', alignItems: 'flex-start', gap: 8, fontSize: 13, color: '#6ee7b7' }}>
-              <ChevronRight size={14} style={{ flexShrink: 0, marginTop: 2 }} />
-              <span><b style={{ color: '#a7f3d0' }}>Fix: </b>{f.recommendation}</span>
+            <RationaleNote rationale={f.rationale} />
+            <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap', marginTop: f.rationale ? 10 : 0 }}>
+              <div style={{ display: 'flex', alignItems: 'flex-start', gap: 8, fontSize: 13, color: '#6ee7b7', flex: 1, minWidth: 240 }}>
+                <ChevronRight size={14} style={{ flexShrink: 0, marginTop: 2 }} />
+                <span><b style={{ color: '#a7f3d0' }}>Fix: </b>{f.recommendation}</span>
+              </div>
+              <ActuateButton
+                owner={ctx.owner} repo={ctx.repo} branch={ctx.branch}
+                accessToken={ctx.accessToken} context={ctx.context}
+                finding={{
+                  kind: 'guardrail',
+                  id: f.id,
+                  title: f.title,
+                  description: f.description,
+                  recommendation: f.recommendation || f.rationale || '',
+                  file: f.file,
+                  severity: f.severity,
+                  category: f.category,
+                }}
+                label="Apply Fix"
+              />
             </div>
           </div>
         );
@@ -267,7 +394,7 @@ function GuardRailTab({ report }: { report: ShipMateReport }) {
 }
 
 /* ---------- TestPilot tab ---------- */
-function TestPilotTab({ report }: { report: ShipMateReport }) {
+function TestPilotTab({ report, ctx }: { report: ShipMateReport; ctx: ActuateCtx }) {
   const tp = report.agents.testpilot;
   const qaColor = tp.qa_readiness === 'ready' ? '#10b981' : tp.qa_readiness === 'partial' ? '#f59e0b' : '#ef4444';
   return (
@@ -293,18 +420,50 @@ function TestPilotTab({ report }: { report: ShipMateReport }) {
       <div className="card" style={{ padding: 20 }}>
         <div className="eyebrow" style={{ marginBottom: 16 }}>Suggested tests · {tp.suggested_tests.length} suites</div>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-          {tp.suggested_tests.map((t, i) => (
-            <div key={i} style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', flexWrap: 'wrap', gap: 10, padding: '13px 14px', borderRadius: 12, background: 'rgba(255,255,255,0.02)', border: '1px solid var(--line)' }}>
-              <div style={{ minWidth: 0 }}>
-                <div className="mono" style={{ fontSize: 13.5, fontWeight: 650, color: '#fff' }}>{t.name}</div>
-                <div className="muted" style={{ fontSize: 12, marginTop: 3 }}>{t.description}</div>
+          {tp.suggested_tests.map((t, i) => {
+            const isAI = t.source === 'discovery';
+            return (
+              <div key={i} style={{
+                display: 'flex', flexDirection: 'column', gap: 8,
+                padding: '13px 14px', borderRadius: 12,
+                background: isAI ? 'linear-gradient(180deg, rgba(139,92,246,0.05), rgba(255,255,255,0.02))' : 'rgba(255,255,255,0.02)',
+                border: `1px solid ${isAI ? 'rgba(139,92,246,0.28)' : 'var(--line)'}`,
+              }}>
+                <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', flexWrap: 'wrap', gap: 10 }}>
+                  <div style={{ minWidth: 0, flex: 1 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                      <span className="mono" style={{ fontSize: 13.5, fontWeight: 650, color: '#fff', wordBreak: 'break-all' }}>{t.name}</span>
+                      {isAI && <AIDiscoveredBadge rationale={t.rationale} />}
+                    </div>
+                    <div className="muted" style={{ fontSize: 12, marginTop: 3 }}>{t.description}</div>
+                    {t.target_file && (
+                      <div className="mono muted" style={{ fontSize: 11, marginTop: 4 }}>{t.target_file}</div>
+                    )}
+                  </div>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 }}>
+                    <span className="chip tone-cyan" style={{ textTransform: 'uppercase' }}>{t.type}</span>
+                    <span className={`chip tone-${pTone(t.priority)}`} style={{ textTransform: 'capitalize' }}>{t.priority}</span>
+                    <ActuateButton
+                      owner={ctx.owner} repo={ctx.repo} branch={ctx.branch}
+                      accessToken={ctx.accessToken} context={ctx.context}
+                      finding={{
+                        kind: 'test',
+                        id: t.name,
+                        title: t.name,
+                        description: t.description,
+                        recommendation: t.rationale || t.description,
+                        file: t.target_file,
+                        severity: t.priority,
+                        category: 'testing',
+                      }}
+                      label="Generate Test"
+                    />
+                  </div>
+                </div>
+                <RationaleNote rationale={t.rationale} />
               </div>
-              <div style={{ display: 'flex', gap: 8, flexShrink: 0 }}>
-                <span className="chip tone-cyan" style={{ textTransform: 'uppercase' }}>{t.type}</span>
-                <span className={`chip tone-${pTone(t.priority)}`} style={{ textTransform: 'capitalize' }}>{t.priority}</span>
-              </div>
-            </div>
-          ))}
+            );
+          })}
         </div>
       </div>
     </div>
@@ -320,10 +479,22 @@ const TABS = [
   { key: 'testpilot', label: 'TestPilot', Icon: FlaskConical },
 ] as const;
 
-interface Props { report: ShipMateReport; onReRun: () => void; }
+interface Props {
+  report: ShipMateReport;
+  onReRun: () => void;
+  accessToken: string | null;
+}
 
-export function ReportsPage({ report, onReRun }: Props) {
+export function ReportsPage({ report, onReRun, accessToken }: Props) {
   const [tab, setTab] = useState<typeof TABS[number]['key']>('overview');
+
+  const ctx: ActuateCtx = {
+    owner: report.repo.owner,
+    repo: report.repo.name,
+    branch: report.repo.branch || 'main',
+    accessToken,
+    context: makeContext(report),
+  };
 
   return (
     <motion.div initial={{ opacity: 0, y: 14 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.55, ease: [0.2,0.7,0.2,1] }}
@@ -343,9 +514,9 @@ export function ReportsPage({ report, onReRun }: Props) {
       <motion.div key={tab} initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.2 }}>
         {tab === 'overview'  && <OverviewTab  report={report} />}
         {tab === 'repolens'  && <RepoLensTab  report={report} />}
-        {tab === 'planforge' && <PlanForgeTab report={report} />}
-        {tab === 'guardrail' && <GuardRailTab report={report} />}
-        {tab === 'testpilot' && <TestPilotTab report={report} />}
+        {tab === 'planforge' && <PlanForgeTab report={report} ctx={ctx} />}
+        {tab === 'guardrail' && <GuardRailTab report={report} ctx={ctx} />}
+        {tab === 'testpilot' && <TestPilotTab report={report} ctx={ctx} />}
       </motion.div>
     </motion.div>
   );

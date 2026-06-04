@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect } from 'react';
+import { useState, useCallback, useEffect, useRef } from 'react';
 import { Zap, Bell, GitBranch, BookOpen, Clock } from 'lucide-react';
 import { useGithubAuth } from './hooks/useGithubAuth';
 import { api } from './lib/api';
@@ -19,31 +19,113 @@ const INITIAL_AGENTS: AgentProgress[] = [
   { id: 'testpilot',  label: 'TestPilot', icon: '🧪', status: 'idle', description: 'Test coverage, gaps & QA readiness' },
 ];
 
+/**
+ * Elapsed-time-driven progress simulation.
+ *
+ * Real `/api/analyze` takes ~25-40s end-to-end (RepoLens fetch + 3x heuristic
+ * agents + 3x Bedrock enhance + 2x Bedrock discovery). The backend is sync —
+ * no SSE / polling — so we model expected latency against a wall clock and
+ * snap to 100% when the API resolves.
+ *
+ * Stages (cumulative wall-clock):
+ *   0.0 - 0.5s   : kickoff (repo_lens spinning up)
+ *   0.5 - 5s     : repo_lens running
+ *   5s  - 8s     : repo_lens done, others spinning up sequentially
+ *   8s  - 32s    : plan_forge / guardrail / testpilot running in stagger
+ *   32s+         : hold at 95% until API resolves (markAllComplete) or errors
+ *
+ * Each agent gets fractional progress (0..1) within its window so
+ * AgentCard can render a smooth bar instead of always-55%-while-running.
+ */
+const TOTAL_SIM_MS = 32_000;       // expected wall-clock for a typical analyze
+const HOLD_AT_PCT = 95;            // hold here until real API resolves
+
+interface AgentTiming {
+  id: AgentProgress['id'];
+  startMs: number;
+  endMs: number;
+}
+const TIMINGS: AgentTiming[] = [
+  { id: 'repo_lens',  startMs: 200,    endMs: 5_500  },
+  { id: 'plan_forge', startMs: 5_500,  endMs: 22_000 },  // PlanForge does enhance + discovery
+  { id: 'guardrail',  startMs: 6_500,  endMs: 26_000 },  // GuardRail does enhance + discovery
+  { id: 'testpilot',  startMs: 7_500,  endMs: 30_000 },  // TestPilot now does discovery too
+];
+
 function useAgentSimulation(analyzing: boolean) {
   const [agents, setAgents] = useState<AgentProgress[]>(INITIAL_AGENTS);
+  // Per-agent fractional progress (0..100). Rendered by AgentCard.
+  const [progressByAgent, setProgressByAgent] = useState<Record<AgentProgress['id'], number>>({
+    repo_lens: 0, plan_forge: 0, guardrail: 0, testpilot: 0,
+  });
+  const [overallPct, setOverallPct] = useState(0);
+  const tickerRef = useRef<number | null>(null);
+  const startedAtRef = useRef<number | null>(null);
 
   useEffect(() => {
     if (!analyzing) {
-      // setTimeout(0) avoids synchronous setState inside an effect body
-      const t = setTimeout(() => setAgents(INITIAL_AGENTS), 0);
+      // Reset on the next tick to avoid synchronous setState in effect body.
+      const t = setTimeout(() => {
+        setAgents(INITIAL_AGENTS);
+        setProgressByAgent({ repo_lens: 0, plan_forge: 0, guardrail: 0, testpilot: 0 });
+        setOverallPct(0);
+        startedAtRef.current = null;
+      }, 0);
       return () => clearTimeout(t);
     }
-    const steps: { id: AgentProgress['id']; delay: number }[] = [
-      { id: 'repo_lens',  delay: 200  },
-      { id: 'plan_forge', delay: 2800 },
-      { id: 'guardrail',  delay: 3200 },
-      { id: 'testpilot',  delay: 3600 },
-    ];
-    const timers = steps.map(({ id, delay }) =>
-      setTimeout(() => setAgents(prev => prev.map(a => a.id === id ? { ...a, status: 'running' } : a)), delay),
-    );
-    return () => timers.forEach(clearTimeout);
-  }, [analyzing]);
 
-  function markAllComplete() { setAgents(prev => prev.map(a => ({ ...a, status: 'complete' }))); }
-  function markAllError()    { setAgents(prev => prev.map(a => ({ ...a, status: a.status === 'running' ? 'error' : a.status }))); }
+    startedAtRef.current = performance.now();
 
-  return { agents, markAllComplete, markAllError };
+    const tick = () => {
+      const elapsed = performance.now() - (startedAtRef.current ?? performance.now());
+
+      // Compute per-agent status + progress.
+      setAgents(prev => prev.map(a => {
+        const t = TIMINGS.find(t => t.id === a.id);
+        if (!t) return a;
+        if (elapsed < t.startMs) return { ...a, status: 'idle' };
+        if (elapsed >= t.endMs)   return { ...a, status: a.status === 'error' ? 'error' : 'running' };
+        return { ...a, status: 'running' };
+      }));
+
+      const newProgress = { ...progressByAgent };
+      let touched = false;
+      for (const t of TIMINGS) {
+        const dur = t.endMs - t.startMs;
+        let p: number;
+        if (elapsed < t.startMs) p = 0;
+        else if (elapsed >= t.endMs) p = 95;       // never claim "complete" until API resolves
+        else p = Math.round(((elapsed - t.startMs) / dur) * 95);
+        if (newProgress[t.id] !== p) { newProgress[t.id] = p; touched = true; }
+      }
+      if (touched) setProgressByAgent(newProgress);
+
+      // Overall = avg of per-agent, capped at HOLD_AT_PCT until API resolves.
+      const avg = (newProgress.repo_lens + newProgress.plan_forge + newProgress.guardrail + newProgress.testpilot) / 4;
+      setOverallPct(Math.min(HOLD_AT_PCT, Math.round(avg)));
+
+      if (elapsed < TOTAL_SIM_MS + 60_000) {  // keep ticking (capped) for very slow runs
+        tickerRef.current = requestAnimationFrame(tick);
+      }
+    };
+
+    tickerRef.current = requestAnimationFrame(tick);
+    return () => {
+      if (tickerRef.current !== null) cancelAnimationFrame(tickerRef.current);
+    };
+  }, [analyzing]);  // eslint-disable-line react-hooks/exhaustive-deps
+
+  function markAllComplete() {
+    setAgents(prev => prev.map(a => ({ ...a, status: 'complete' })));
+    setProgressByAgent({ repo_lens: 100, plan_forge: 100, guardrail: 100, testpilot: 100 });
+    setOverallPct(100);
+  }
+
+  function markAllError() {
+    setAgents(prev => prev.map(a => ({ ...a, status: a.status === 'running' ? 'error' : a.status })));
+  }
+
+  return { agents, progressByAgent, overallPct, markAllComplete, markAllError };
 }
 
 export default function App() {
@@ -58,7 +140,7 @@ export default function App() {
   const [report, setReport]                 = useState<ShipMateReport | null>(null);
   const [analyzing, setAnalyzing]           = useState(false);
 
-  const { agents, markAllComplete, markAllError } = useAgentSimulation(analyzing);
+  const { agents, progressByAgent, overallPct, markAllComplete, markAllError } = useAgentSimulation(analyzing);
 
   useEffect(() => {
     if (!auth.isAuthenticated || !auth.accessToken) return;
@@ -208,12 +290,15 @@ export default function App() {
           <AnalysisPage
             selectedRepo={selectedRepo} selectedBranch={selectedBranch}
             selectedPull={selectedPull} agents={agents}
+            progressByAgent={progressByAgent}
+            overallPct={overallPct}
             onCancel={() => { setAnalyzing(false); setPage('repos'); }}
           />
         )}
         {activePage === 'reports' && report && (
           <ReportsPage
             report={report}
+            accessToken={auth.accessToken}
             onReRun={() => selectedRepo ? handleAnalyze(selectedRepo) : setPage('repos')}
           />
         )}

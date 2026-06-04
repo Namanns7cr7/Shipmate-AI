@@ -196,8 +196,10 @@ class GuardRailAgent(BaseAgent):
             dependency_vulnerabilities=dep_vulns,
             security_score=score,
         )
-        # Optional LLM rewrite of finding descriptions / recommendations.
-        return LLMService.enhance(self.name, context, base)
+        # Step 1: rewrite prose on heuristic findings.
+        enhanced = LLMService.enhance(self.name, context, base)
+        # Step 2: append LLM-discovered findings grounded in real auth/CORS code.
+        return LLMService.discover_guardrail(context, enhanced)
 
     def _score(self, findings: List[SecurityFinding], secrets: List[str]) -> int:
         s = 100

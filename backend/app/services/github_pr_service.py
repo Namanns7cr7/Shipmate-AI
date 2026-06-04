@@ -1,0 +1,185 @@
+"""
+GitHub write-side helpers for the Coder/actuate flow.
+
+Parallel structure to GitHubAPIService (which is read-only). Splitting
+writes into a dedicated module keeps the read service unchanged and makes
+auditing the new write paths straightforward.
+
+Auth: same `_headers(token)` shape as github_api_service.py. Scope `repo`
+is already granted at GitHubAuthService.get_auth_url, so all of these
+calls succeed without re-prompting the user.
+
+Failure semantics: every method propagates httpx.HTTPStatusError on non-2xx
+responses with the actual GitHub error body attached, so the orchestrator's
+500-handler shows the real reason (e.g. branch already exists, protected
+branch, file too large).
+"""
+
+from __future__ import annotations
+
+import base64
+import logging
+from typing import Any, Dict, Optional
+
+import httpx
+
+logger = logging.getLogger("shipmate.github_pr_service")
+
+_BASE = "https://api.github.com"
+_TIMEOUT = httpx.Timeout(20.0)
+
+
+def _headers(token: str) -> Dict[str, str]:
+    return {
+        "Authorization": f"token {token}",
+        "Accept": "application/vnd.github.v3+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+
+async def _raise_with_body(resp: httpx.Response, action: str) -> None:
+    """Raise a clean error message including GitHub's response body."""
+    try:
+        detail = resp.json()
+        message = detail.get("message") or str(detail)
+    except Exception:
+        message = resp.text
+    raise httpx.HTTPStatusError(
+        f"GitHub {action} failed ({resp.status_code}): {message}",
+        request=resp.request,
+        response=resp,
+    )
+
+
+class GitHubPRService:
+
+    @staticmethod
+    async def get_branch_sha(token: str, owner: str, repo: str, branch: str) -> str:
+        """Return the commit SHA at the tip of `branch`."""
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+            resp = await client.get(
+                f"{_BASE}/repos/{owner}/{repo}/git/refs/heads/{branch}",
+                headers=_headers(token),
+            )
+            if resp.status_code >= 400:
+                await _raise_with_body(resp, f"get_branch_sha({branch})")
+            data = resp.json()
+            sha = data.get("object", {}).get("sha")
+            if not sha:
+                raise RuntimeError(f"GitHub returned no sha for {owner}/{repo}@{branch}")
+            return sha
+
+    @staticmethod
+    async def create_branch(
+        token: str, owner: str, repo: str, new_branch: str, base_sha: str,
+    ) -> None:
+        """Create a fresh ref off base_sha. 422 means the branch already exists."""
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+            resp = await client.post(
+                f"{_BASE}/repos/{owner}/{repo}/git/refs",
+                headers=_headers(token),
+                json={"ref": f"refs/heads/{new_branch}", "sha": base_sha},
+            )
+            if resp.status_code >= 400:
+                await _raise_with_body(resp, f"create_branch({new_branch})")
+            logger.info("Created branch %s/%s/%s @ %s", owner, repo, new_branch, base_sha[:7])
+
+    @staticmethod
+    async def get_file_sha(
+        token: str, owner: str, repo: str, path: str, branch: str,
+    ) -> Optional[str]:
+        """
+        Return the file's blob sha on `branch`, or None if the file does not exist.
+        Used to decide whether `put_file` needs the `sha` field (update vs create).
+        """
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+            resp = await client.get(
+                f"{_BASE}/repos/{owner}/{repo}/contents/{path}",
+                headers=_headers(token),
+                params={"ref": branch},
+            )
+            if resp.status_code == 404:
+                return None
+            if resp.status_code >= 400:
+                await _raise_with_body(resp, f"get_file_sha({path})")
+            data = resp.json()
+            return data.get("sha")
+
+    @staticmethod
+    async def put_file(
+        token: str,
+        owner: str,
+        repo: str,
+        path: str,
+        content: str,
+        message: str,
+        branch: str,
+        sha: Optional[str] = None,
+    ) -> None:
+        """
+        Create or update a file via the Contents API. If `sha` is provided, the
+        call updates the existing file; otherwise it creates a new file.
+        """
+        encoded = base64.b64encode(content.encode("utf-8")).decode("ascii")
+        body: Dict[str, Any] = {
+            "message": message,
+            "content": encoded,
+            "branch": branch,
+        }
+        if sha is not None:
+            body["sha"] = sha
+
+        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
+            resp = await client.put(
+                f"{_BASE}/repos/{owner}/{repo}/contents/{path}",
+                headers=_headers(token),
+                json=body,
+            )
+            if resp.status_code >= 400:
+                await _raise_with_body(resp, f"put_file({path})")
+            logger.info("Wrote %s/%s/%s on %s (%s)",
+                        owner, repo, path, branch, "update" if sha else "create")
+
+    @staticmethod
+    async def create_pull_request(
+        token: str,
+        owner: str,
+        repo: str,
+        title: str,
+        body: str,
+        head: str,
+        base: str,
+    ) -> str:
+        """Open a PR. Returns the html_url."""
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+            resp = await client.post(
+                f"{_BASE}/repos/{owner}/{repo}/pulls",
+                headers=_headers(token),
+                json={
+                    "title": title,
+                    "body": body,
+                    "head": head,
+                    "base": base,
+                    "maintainer_can_modify": True,
+                },
+            )
+            if resp.status_code >= 400:
+                await _raise_with_body(resp, "create_pull_request")
+            data = resp.json()
+            url = data.get("html_url")
+            if not url:
+                raise RuntimeError("GitHub PR creation returned no html_url")
+            logger.info("Opened PR %s -> %s on %s/%s", head, base, owner, repo)
+            return url
+
+    @staticmethod
+    async def get_default_branch(token: str, owner: str, repo: str) -> str:
+        """Fetch the repo's default branch name (used as the PR base)."""
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+            resp = await client.get(
+                f"{_BASE}/repos/{owner}/{repo}",
+                headers=_headers(token),
+            )
+            if resp.status_code >= 400:
+                await _raise_with_body(resp, "get_default_branch")
+            return resp.json().get("default_branch", "main")

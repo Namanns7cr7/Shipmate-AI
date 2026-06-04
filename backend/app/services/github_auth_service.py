@@ -63,7 +63,9 @@ class GitHubAuthService:
         params = {
             "client_id": client_id,
             "redirect_uri": redirect_uri,
-            "scope": "repo read:user user:email",  # Real scopes needed
+            # `workflow` is REQUIRED to create/edit files under .github/workflows/
+            # via the Contents API — GitHub returns 404 (not 403!) if missing.
+            "scope": "repo workflow read:user user:email",
             "state": state,
             "allow_signup": "true"
         }
