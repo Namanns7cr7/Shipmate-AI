@@ -5,6 +5,7 @@ from .base_agent import BaseAgent
 from ..schemas.agent_schemas import (
     TestPilotOutput, ExistingTests, SuggestedTest, RepoLensOutput
 )
+from ..services.llm_service import LLMService
 
 _TEST_FRAMEWORKS_PY = {"pytest", "unittest", "nose", "hypothesis", "behave"}
 _TEST_FRAMEWORKS_JS = {"jest", "vitest", "mocha", "jasmine", "cypress", "playwright", "@testing-library"}
@@ -53,7 +54,7 @@ class TestPilotAgent(BaseAgent):
         qa_readiness = "ready" if coverage_est >= 60 else ("partial" if test_files else "not_ready")
         score = self._score(test_files, coverage_est, missing)
 
-        return TestPilotOutput(
+        base = TestPilotOutput(
             existing_tests=ExistingTests(
                 count=len(test_files),
                 coverage_estimate=coverage_est,
@@ -65,6 +66,8 @@ class TestPilotAgent(BaseAgent):
             qa_readiness=qa_readiness,
             test_score=score,
         )
+        # Optional LLM rewrite of suggested-test prose + missing-coverage gaps.
+        return LLMService.enhance(self.name, context, base)
 
     def _detect_frameworks(self, kf: Dict[str, str], tree: List[str]) -> List[str]:
         found = []

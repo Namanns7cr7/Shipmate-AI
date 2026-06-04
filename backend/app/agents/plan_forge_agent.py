@@ -4,6 +4,7 @@ from .base_agent import BaseAgent
 from ..schemas.agent_schemas import (
     PlanForgeOutput, Milestone, Blocker, RepoLensOutput
 )
+from ..services.llm_service import LLMService
 
 
 class PlanForgeAgent(BaseAgent):
@@ -22,7 +23,7 @@ class PlanForgeAgent(BaseAgent):
         effort = self._estimate_effort(milestones)
         score = self._score(blockers, milestones)
 
-        return PlanForgeOutput(
+        base = PlanForgeOutput(
             milestones=milestones,
             blockers=blockers,
             dependencies=deps,
@@ -30,6 +31,8 @@ class PlanForgeAgent(BaseAgent):
             estimated_effort=effort,
             delivery_score=score,
         )
+        # Optional LLM rewrite of prose fields (no-op if LLM_PROVIDER unset).
+        return LLMService.enhance(self.name, context, base)
 
     def _build_milestones(self, rl: RepoLensOutput, feature_ctx: str) -> List[Milestone]:
         ms: List[Milestone] = []

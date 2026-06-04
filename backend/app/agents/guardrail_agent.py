@@ -3,6 +3,7 @@ from typing import Any, Dict, List
 
 from .base_agent import BaseAgent
 from ..schemas.agent_schemas import GuardRailOutput, SecurityFinding, Severity
+from ..services.llm_service import LLMService
 
 # Patterns that suggest hardcoded secrets
 _SECRET_PATTERNS = [
@@ -187,7 +188,7 @@ class GuardRailAgent(BaseAgent):
         SEV_ORDER = {Severity.CRITICAL: 0, Severity.HIGH: 1, Severity.MEDIUM: 2, Severity.LOW: 3, Severity.INFO: 4}
         findings.sort(key=lambda f: SEV_ORDER.get(f.severity, 99))
 
-        return GuardRailOutput(
+        base = GuardRailOutput(
             findings=findings,
             exposed_secrets=exposed_secrets,
             cors_issues=cors_issues,
@@ -195,6 +196,8 @@ class GuardRailAgent(BaseAgent):
             dependency_vulnerabilities=dep_vulns,
             security_score=score,
         )
+        # Optional LLM rewrite of finding descriptions / recommendations.
+        return LLMService.enhance(self.name, context, base)
 
     def _score(self, findings: List[SecurityFinding], secrets: List[str]) -> int:
         s = 100
