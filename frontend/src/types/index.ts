@@ -190,6 +190,16 @@ export interface AnalyzeResponse {
   report: ShipMateReport;
 }
 
+// ── SSE Stream Events ─────────────────────────────────────────────────────────
+
+export interface AgentStreamEvent {
+  type: 'agent_result';
+  agent: 'repo_lens' | 'plan_forge' | 'guardrail' | 'testpilot';
+  status: 'complete' | 'error';
+  data?: any;
+  error?: string;
+}
+
 // ── Analysis History ──────────────────────────────────────────────────────────
 
 export interface AnalysisHistoryRecord {
