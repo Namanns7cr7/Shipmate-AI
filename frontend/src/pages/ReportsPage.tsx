@@ -4,7 +4,7 @@ import { Download, Share2, RotateCcw, AlertTriangle, Check, X, Clock, Compass, S
 import { ScoreRing } from '../components/ui/ScoreRing';
 import { VerdictPill, toVerdict } from '../components/ui/VerdictPill';
 import { RadarBg } from '../components/ui/RadarBg';
-import { AGENTS, scoreColor } from '../lib/agents';
+import { AGENTS } from '../lib/agents';
 import type { ShipMateReport, SecurityFinding } from '../types';
 
 /* ---------- Helpers ---------- */
@@ -350,6 +350,3 @@ export function ReportsPage({ report, onReRun }: Props) {
     </motion.div>
   );
 }
-
-// suppress unused scoreColor
-const _sc = scoreColor; void _sc;

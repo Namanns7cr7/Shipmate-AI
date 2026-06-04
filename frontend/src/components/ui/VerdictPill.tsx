@@ -20,6 +20,7 @@ export function VerdictPill({ verdict, small = false }: VerdictPillProps) {
 }
 
 /** Map our 5-state backend recommendation to the simpler 3-state verdict */
+// eslint-disable-next-line react-refresh/only-export-components
 export function toVerdict(rec: string): string {
   if (rec === 'ready_to_ship' || rec === 'mostly_ready') return 'Ready';
   if (rec === 'not_ready' || rec === 'risky_release')    return 'Blocked';

@@ -10,7 +10,7 @@ import { AnalysisPage } from './pages/AnalysisPage';
 import { ReportsPage } from './pages/ReportsPage';
 import { Spinner } from './components/ui/GitHubConnectButton';
 import type { Page } from './components/app/AppSidebar';
-import type { AgentProgress, GitHubRepo, GitHubBranch, GitHubPR, ShipMateReport } from './types';
+import type { AgentProgress, GitHubRepo, GitHubPR, ShipMateReport } from './types';
 
 const INITIAL_AGENTS: AgentProgress[] = [
   { id: 'repo_lens',  label: 'RepoLens',  icon: '🔍', status: 'idle', description: 'Repo structure, tech stack & architecture risks' },
@@ -23,7 +23,11 @@ function useAgentSimulation(analyzing: boolean) {
   const [agents, setAgents] = useState<AgentProgress[]>(INITIAL_AGENTS);
 
   useEffect(() => {
-    if (!analyzing) { setAgents(INITIAL_AGENTS); return; }
+    if (!analyzing) {
+      // setTimeout(0) avoids synchronous setState inside an effect body
+      const t = setTimeout(() => setAgents(INITIAL_AGENTS), 0);
+      return () => clearTimeout(t);
+    }
     const steps: { id: AgentProgress['id']; delay: number }[] = [
       { id: 'repo_lens',  delay: 200  },
       { id: 'plan_forge', delay: 2800 },
@@ -49,9 +53,7 @@ export default function App() {
   const [repos, setRepos]                   = useState<GitHubRepo[]>([]);
   const [loadingRepos, setLoadingRepos]     = useState(false);
   const [selectedRepo, setSelectedRepo]     = useState<GitHubRepo | null>(null);
-  const [_branches, setBranches]            = useState<GitHubBranch[]>([]);
   const [selectedBranch, setSelectedBranch] = useState('main');
-  const [_pulls, setPulls]                  = useState<GitHubPR[]>([]);
   const [selectedPull]                      = useState<GitHubPR | null>(null);
   const [report, setReport]                 = useState<ShipMateReport | null>(null);
   const [analyzing, setAnalyzing]           = useState(false);
@@ -60,28 +62,23 @@ export default function App() {
 
   useEffect(() => {
     if (!auth.isAuthenticated || !auth.accessToken) return;
-    setLoadingRepos(true);
+    let cancelled = false;
+    setTimeout(() => { if (!cancelled) setLoadingRepos(true); }, 0);
     api.getRepos(auth.accessToken)
-      .then(r => { setRepos(r); if (r.length > 0 && !selectedRepo) setSelectedRepo(r[0]); })
+      .then(r => { if (!cancelled) { setRepos(r); if (r.length > 0) setSelectedRepo(prev => prev ?? r[0]); } })
       .catch(e => console.error('Failed to load repos', e))
-      .finally(() => setLoadingRepos(false));
+      .finally(() => { if (!cancelled) setLoadingRepos(false); });
+    return () => { cancelled = true; };
   }, [auth.isAuthenticated, auth.accessToken]);
 
   const handleSelectRepo = useCallback(async (repo: GitHubRepo) => {
     setSelectedRepo(repo);
     setSelectedBranch(repo.default_branch || 'main');
-    setBranches([]);
-    setPulls([]);
     if (!auth.accessToken) return;
     const [owner, repoName] = repo.full_name.split('/');
     try {
-      const [b, p] = await Promise.all([
-        api.getBranches(owner, repoName, auth.accessToken),
-        api.getPulls(owner, repoName, auth.accessToken),
-      ]);
-      setBranches(b);
-      setPulls(p);
-      setSelectedBranch(repo.default_branch || b[0]?.name || 'main');
+      const branches = await api.getBranches(owner, repoName, auth.accessToken);
+      setSelectedBranch(repo.default_branch || branches[0]?.name || 'main');
     } catch (e) { console.error('Failed to load repo data', e); }
   }, [auth.accessToken]);
 

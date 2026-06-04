@@ -1,76 +1,61 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Loader, AlertCircle, CheckCircle } from 'lucide-react';
 import { api } from '../lib/api';
 
 export default function GitHubCallback() {
   const [status, setStatus] = useState<'loading' | 'success' | 'error'>('loading');
   const [error, setError] = useState<string | null>(null);
+  // Guard against React StrictMode double-invoking the effect in development.
+  // OAuth codes are single-use — a second exchange attempt always returns 400.
+  const called = useRef(false);
 
   useEffect(() => {
+    if (called.current) return;
+    called.current = true;
+
     const handleCallback = async () => {
       try {
-        // Get code and state from URL
         const params = new URLSearchParams(window.location.search);
         const code = params.get('code');
         const state = params.get('state');
         const errorParam = params.get('error');
         const errorDesc = params.get('error_description');
 
-        // Check for OAuth error
         if (errorParam) {
           setStatus('error');
           setError(errorDesc || errorParam);
-          // Redirect to home after 3 seconds
-          setTimeout(() => {
-            window.location.href = '/';
-          }, 3000);
+          setTimeout(() => { window.location.href = '/'; }, 3000);
           return;
         }
 
-        // Validate code
         if (!code || !state) {
           setStatus('error');
           setError('Missing authorization code. Please try again.');
-          setTimeout(() => {
-            window.location.href = '/';
-          }, 3000);
+          setTimeout(() => { window.location.href = '/'; }, 3000);
           return;
         }
 
-        // Exchange code for token
         const response = await api.handleCallback(code, state);
 
-        if (!response.success) {
-          throw new Error(response.detail || 'Authentication failed');
-        }
+        if (!response.success) throw new Error(response.detail || 'Authentication failed');
 
         setStatus('success');
 
-        // If opened as a popup, postMessage to parent and close
         if (window.opener && !window.opener.closed) {
           window.opener.postMessage(
             { type: 'GITHUB_AUTH_SUCCESS', access_token: response.access_token, user: response.user },
-            window.location.origin
+            window.location.origin,
           );
           setTimeout(() => window.close(), 800);
         } else {
-          // Opened as a redirect (not popup) — store and navigate
           localStorage.setItem('github_access_token', response.access_token);
           localStorage.setItem('github_user', JSON.stringify(response.user));
           setTimeout(() => { window.location.href = '/'; }, 1000);
         }
       } catch (err) {
         setStatus('error');
-        setError(
-          err instanceof Error
-            ? err.message
-            : 'Failed to authenticate. Please try again.'
-        );
-
-        // Redirect to home on error after 3 seconds
-        setTimeout(() => {
-          window.location.href = '/';
-        }, 3000);
+        setError(err instanceof Error ? err.message : 'Failed to authenticate. Please try again.');
+        setTimeout(() => { window.location.href = '/'; }, 3000);
       }
     };
 
@@ -78,52 +63,31 @@ export default function GitHubCallback() {
   }, []);
 
   return (
-    <div className="flex min-h-screen items-center justify-center bg-slate-950">
-      <div className="text-center">
+    <div style={{ display: 'flex', minHeight: '100vh', alignItems: 'center', justifyContent: 'center', background: 'var(--bg)' }}>
+      <div className="card" style={{ padding: '40px 48px', textAlign: 'center', maxWidth: 400, width: '100%' }}>
         {status === 'loading' && (
           <>
-            <div className="mb-4 flex justify-center">
-              <Loader size={48} className="animate-spin text-blue-400" />
-            </div>
-            <h1 className="text-2xl font-bold text-white">
-              Connecting to GitHub...
-            </h1>
-            <p className="mt-2 text-slate-400">
-              Please wait while we complete your authentication.
-            </p>
+            <Loader size={48} style={{ color: 'var(--blue-2)', margin: '0 auto 16px', animation: 'spin .7s linear infinite' }} />
+            <h1 style={{ fontSize: 20, fontWeight: 800, color: '#fff', margin: '0 0 8px' }}>Connecting to GitHub…</h1>
+            <p className="muted" style={{ fontSize: 14 }}>Please wait while we complete your authentication.</p>
           </>
         )}
-
         {status === 'success' && (
           <>
-            <div className="mb-4 flex justify-center">
-              <CheckCircle size={48} className="text-green-400" />
-            </div>
-            <h1 className="text-2xl font-bold text-white">
-              Authentication Successful!
-            </h1>
-            <p className="mt-2 text-slate-400">
-              Redirecting to dashboard...
-            </p>
+            <CheckCircle size={48} style={{ color: 'var(--emerald)', margin: '0 auto 16px' }} />
+            <h1 style={{ fontSize: 20, fontWeight: 800, color: '#fff', margin: '0 0 8px' }}>Authentication Successful!</h1>
+            <p className="muted" style={{ fontSize: 14 }}>Redirecting to your command center…</p>
           </>
         )}
-
         {status === 'error' && (
           <>
-            <div className="mb-4 flex justify-center">
-              <AlertCircle size={48} className="text-red-400" />
-            </div>
-            <h1 className="text-2xl font-bold text-white">
-              Authentication Failed
-            </h1>
-            <p className="mt-2 text-red-400">{error}</p>
-            <p className="mt-4 text-slate-400">
-              Redirecting to home page...
-            </p>
+            <AlertCircle size={48} style={{ color: 'var(--red)', margin: '0 auto 16px' }} />
+            <h1 style={{ fontSize: 20, fontWeight: 800, color: '#fff', margin: '0 0 8px' }}>Authentication Failed</h1>
+            <p style={{ fontSize: 13, color: 'var(--red)', margin: '0 0 12px' }}>{error}</p>
+            <p className="muted" style={{ fontSize: 13 }}>Redirecting to home page…</p>
           </>
         )}
       </div>
     </div>
   );
 }
-

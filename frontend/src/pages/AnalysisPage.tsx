@@ -110,7 +110,11 @@ function useActivityLog(running: boolean): LogLine[] {
   const idxRef = useRef(0);
 
   useEffect(() => {
-    if (!running) { setLogs([]); idxRef.current = 0; return; }
+    if (!running) {
+      // Reset via a microtask to avoid synchronous setState in effect body
+      const t = setTimeout(() => { setLogs([]); idxRef.current = 0; }, 0);
+      return () => clearTimeout(t);
+    }
     const tick = () => {
       const line = LOG_SCRIPT[idxRef.current];
       if (!line) return;

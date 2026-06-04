@@ -2,171 +2,148 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Design System
-
-### Color Palette
-- **Page background:** `#070c18` / `#080c14` (near-black navy)
-- **Card background:** `rgba(11,18,35,0.9)` — dark navy with slight transparency
-- **Sidebar background:** `linear-gradient(180deg, #070d1a 0%, #060b16 100%)`
-- **Borders:** `rgba(255,255,255,0.06)` (subtle) · `rgba(255,255,255,0.1)` (hover)
-- **Text primary:** `text-white` / `text-slate-200`
-- **Text secondary:** `text-slate-400` / `text-slate-500`
-- **Text muted:** `text-slate-600`
-
-**Accent colors (used consistently for agents, badges, tags):**
-| Color | Hex | Use |
-|-------|-----|-----|
-| Blue | `#3b82f6` | Primary actions, active nav, repo health |
-| Cyan | `#0891b2` | Button gradients, secondary accent |
-| Purple | `#8b5cf6` | PlanForge agent, delivery planning |
-| Emerald | `#10b981` | Success, "ready", RepoLens agent |
-| Amber | `#f59e0b` | Warning, GuardRail agent, medium severity |
-| Red | `#ef4444` | Critical/error |
-| Orange | `#f97316` | High severity |
-
-### Global CSS Classes (`src/index.css`)
-- `.glass-card` — `bg-[#111827]/85 backdrop-blur-[12px]` with subtle blue border, glows on hover
-- `.gradient-border` — wraps element with an animated blue→purple→cyan gradient border (pseudo-element)
-- `.neon-text` — blue-to-purple gradient text (`#60a5fa` → `#a78bfa`)
-- `.neon-green` — green-to-cyan gradient text
-- `.grid-bg` — subtle 40px dot-grid background overlay (blue tint, 3% opacity)
-- `.btn-primary` — blue→purple gradient button, lifts on hover with blue glow shadow
-- `.btn-secondary` — dark transparent button with subtle border, glows blue on hover
-- `.shimmer` — animated shimmer loading effect
-- `.score-ring` — drop-shadow filter for SVG score rings
-- `.tab-active` / `.tab-inactive` — tab button states
-
-**Badge classes:**
-- `.badge-critical` — red · `.badge-high` — orange · `.badge-medium` — amber · `.badge-low` — green
-
-### Typography
-- Font: `Inter` (body), `JetBrains Mono` / `font-mono` (code, repo names, timestamps)
-- Page headings: `text-[22px] font-black text-white tracking-tight`
-- Section labels: `text-xs font-bold text-slate-500 uppercase tracking-wider`
-- Body: `text-sm text-slate-400 leading-relaxed`
-
-### Shared UI Patterns
-- **Cards:** `rounded-2xl p-5 border border-white/6` + `background: rgba(11,18,35,0.9)`
-- **Small cards:** `rounded-xl p-4`
-- **Pill badges:** `text-[10px] font-bold px-2.5 py-0.5 rounded-full border`
-- **Tag chips:** `text-[10px] font-medium px-2 py-0.5 rounded-full border`
-- **Primary gradient button:** `background: linear-gradient(135deg, #1d4ed8, #0891b2)` + `rounded-xl text-xs font-bold text-white`
-- **Ghost button:** `border border-white/8 text-slate-300 hover:text-white hover:border-white/15 rounded-xl`
-- **Score rings:** SVG circle with `stroke-dasharray` animation (Framer Motion), color thresholds: ≥80 emerald, ≥60 blue, ≥40 amber, else red
-- **Animated progress bar:** `h-1.5 rounded-full` track + Motion `width` animation from 0 to value%
-- **Page enter animation:** `initial={{ opacity: 0, y: -10 }} animate={{ opacity: 1, y: 0 }}` on page headers
-- **Card stagger:** `transition={{ delay: index * 0.05 }}` on list items
-
----
-
-## Pages
-
-### Landing Page (`src/components/landing/`)
-Full-screen marketing page shown when not authenticated. Background: `bg-slate-950`. Sections stacked vertically:
-
-**Navbar** (`Navbar.tsx`) — fixed, `h-16`, 3-column grid (`logo | nav links | CTA`). Transparent until scrolled, then `bg-slate-950/90 backdrop-blur-lg border-b border-slate-800/60`. Logo: 🚢 emoji + "ShipMate **AI**" (blue). Desktop nav links: text buttons. CTA: white button with GitHub SVG icon. Mobile: hamburger menu slides down.
-
-**Hero** (`Hero.tsx`) — two-column grid (text left, mock dashboard card right). Background uses `.grid-bg` + 3 animated blur blobs (blue/purple/cyan, `blur-3xl`). Left: badge chip → H1 with `.neon-text` gradient → subtitle → two CTA buttons (`.btn-primary` + `.btn-secondary`) → trust checkmarks. Right: `.gradient-border` wrapping a `.glass-card` showing a mock readiness score ring, 3 stat rows, 2×2 agent mini-cards, footer stats. Scroll indicator at bottom animates with bounce.
-
-**AgentCards** (`AgentCards.tsx`) — section with 4 agent feature cards in a grid.
-
-**WorkflowSection** (`WorkflowSection.tsx`) — step-by-step workflow explanation.
-
-**DashboardPreview** (`DashboardPreview.tsx`) — scrollable preview of the app UI.
-
-**SecuritySection** (`SecuritySection.tsx`) — security feature highlights.
-
-**CTASection** (`CTASection.tsx`) — final call-to-action with GitHub connect button.
-
----
-
-### App Shell (authenticated)
-Layout: `flex min-h-screen bg-[#070c18]`. Left: fixed `w-56` sidebar. Right: `flex-1 overflow-y-auto h-screen` with a sticky topbar.
-
-**Sidebar** (`src/components/app/AppSidebar.tsx`) — `w-56`, dark navy gradient. Sections:
-1. Brand: 🚢 icon in blue→cyan gradient square + "ShipMate **AI**" text
-2. `<hr>` divider (`bg-white/5`)
-3. Nav items: icon + label, `rounded-xl px-4 py-2.5`. Active state: blue gradient background (`rgba(37,99,235,0.25)`) + blue border + blue dot indicator. Disabled items: `text-slate-600 cursor-not-allowed`
-4. Bottom: "All Systems Operational" pill (emerald glow) + user avatar row (avatar, name, logout button reveals on hover)
-
-**Topbar** (in `App.tsx`) — `h-14 sticky top-0 bg-[#070c18]/95 backdrop-blur-xl border-b border-slate-800/50`. Left: breadcrumb "ShipMate AI / PageName". Right: animated emerald pulse dot + `@username` + avatar.
-
----
-
-### Dashboard Page (`src/pages/DashboardPage.tsx`)
-`px-8 py-7 max-w-[1080px] space-y-6`
-
-1. **Header row** — greeting text (`text-[22px] font-black`) + "View Reports" ghost button
-2. **4-column stat row** — `StatCard` components: icon in colored square (`w-9 h-9 rounded-xl`), large number (`text-2xl font-black`), label, trend badge (emerald up / red down with `TrendingUp`/`TrendingDown` lucide icons). Backgrounds: blue/purple/emerald/red tinted.
-3. **Two-column layout** (table left, insights right):
-   - *Recent Analyses table* — dark card, thead with 10px uppercase labels, rows hover `bg-white/3`. Score shown as `ScorePill` (colored rounded badge). Status as colored pill badge using `REC` map.
-   - *AI Insights panel* — highest risk repo with red-tinted card + critical issue + recommendation + "View Analysis" gradient button. Below: *Trends bar chart* — 7 bars (`h-14`), last bar blue gradient, others `rgba(59,130,246,0.2)`, day labels below.
-
----
-
-### Repositories Page (`src/pages/RepositoriesPage.tsx`)
-`px-8 py-7 max-w-[1080px] space-y-6`
-
-1. **Header row** — "Repositories" title + "Connect Repository" gradient button
-2. **4 mini stat cards** — colored tinted backgrounds (blue/emerald/purple/red), large number + label
-3. **Search + filter bar** — search input with `Search` icon inset left, language `<select>`, sort `<select>`. All inputs: dark navy bg, `border-white/7`, `rounded-xl`
-4. **Repo list** — `RepoCard` per repo:
-   - Icon (🔒 private / 📁 public) in `w-10 h-10 rounded-xl`
-   - Repo name (`font-bold text-slate-200`) + description
-   - Tag chips: language dot + name, private/public badge, star count
-   - Right side: `ScoreRing` (56px animated SVG) if analyzed
-   - Footer divider: last-analyzed time OR default branch · "View Report" ghost button + "Analyze" gradient button
-   - Loading skeleton: 3 `animate-pulse rounded-2xl h-28` placeholders
-
----
-
-### Analysis Page (`src/pages/AnalysisPage.tsx`)
-`px-8 py-7 max-w-[1080px] space-y-6`
-
-1. **Header** — "Analysis in Progress" + repo name + branch info + "Cancel Analysis" red-tinted button
-2. **3-column grid:**
-   - *Left column* — 2 `AgentCard` components (RepoLens, PlanForge)
-   - *Center column*:
-     - "Ship hologram" — `radial-gradient` dark card (`h-200`), 2 spinning rings (outer slow, inner fast reverse), blue blur glow, floating 🚢 emoji (`drop-shadow` blue glow, bounce animation)
-     - Progress bar card — "Overall Progress" label, `%` counter, gradient progress bar
-     - Live activity log — pulsing blue dot, scrollable timestamped log entries (monospace timestamps)
-   - *Right column* — 2 `AgentCard` components (GuardRail, TestPilot) + "Analysis Information" info card (icon + label + value rows)
-
-**AgentCard** — colored border/bg per agent (emerald/amber/blue/purple). Shows: icon square, name, subtitle, status badge (Complete/Running/Pending/Error). Running: spinner + color text. Complete: 2×2 stat mini-grid (`bg-black/20 rounded-lg`).
-
----
-
-### Reports Page (`src/pages/ReportsPage.tsx`)
-`px-8 py-7 max-w-[1080px] space-y-5`
-
-**Header** — repo name + timestamp + 3 action buttons (Download PDF / Share Report ghost buttons + Re-run gradient button)
-
-**Tab bar** — `border-b border-white/6`, tabs are `px-5 py-3 text-sm font-semibold border-b-2 -mb-px`. Active: `text-white border-blue-500`. Inactive: `text-slate-500 border-transparent`. Tabs: Overview · RepoLens · PlanForge · GuardRail · TestPilot. Tab content animates in with `opacity: 0→1, y: 8→0`.
-
-**Overview tab:**
-- 3-column top row: Score card (120px `ScoreRing` + headline), Verdict card (tinted bg per recommendation), Top Issues card (severity counts with colored dots)
-- Score Breakdown row: 4×80px score rings in a card with animated progress bars below each
-- Recommended Actions list: numbered, priority badge (high=red/medium=amber/low=blue)
-
-**RepoLens tab:** 2-column grid — Tech stack tags (blue chips) + architecture badges (CI/CD, Docker, Tests). Dependencies grouped by type (monospace font chips). Architecture risks with amber ⚠ icon.
-
-**PlanForge tab:** "Next Best Action" banner (blue tint). Milestones as cards with priority badge + days estimate + category.
-
-**GuardRail tab:** Security findings as full-width cards, colored by severity (critical=red, high=orange, medium=amber, low=blue). Each: title, description, recommendation (emerald ›), file path (monospace).
-
-**TestPilot tab:** 3-column stat row (test count, coverage %, QA status). Suggested tests as cards: test name (monospace font), type badge (purple), priority badge, description.
-
----
-
 ## Commands
 
 ```bash
-# Frontend
-cd frontend && npm run dev       # port 5173
+# Frontend — port MUST be 5173 (OAuth redirect URI is hardcoded to this port)
+cd frontend && npm run dev       # starts on port 5173
 npm run build                    # tsc -b && vite build
 npm run lint
+npx tsc --noEmit                 # type-check only
 
 # Backend
 cd backend && venv\Scripts\activate
 uvicorn app.main:app --reload --port 8000
 ```
+
+> **Port note:** If port 5173 is already in use, Vite falls back to 5174 and GitHub OAuth breaks. Kill any process holding 5173 before starting the dev server.
+
+---
+
+## Architecture
+
+### Frontend (`frontend/src/`)
+
+```
+src/
+├── App.tsx                  — App shell: auth gate, routing (page state), sidebar + topbar, agent simulation
+├── main.tsx                 — Entry; routes /github/callback to GitHubCallback, else App
+├── index.css                — Full design system (CSS vars, utility classes, keyframes)
+├── lib/
+│   ├── agents.ts            — AGENTS[], PIPE[], scoreColor(), scoreTone(), LANG_COLORS
+│   └── api.ts               — Axios API client (getRepos, getBranches, getPulls, analyze)
+├── hooks/
+│   └── useGithubAuth.ts     — GitHub OAuth: popup flow, localStorage token, postMessage listener
+├── types/index.ts           — All TypeScript interfaces (GitHubRepo, ShipMateReport, AgentProgress…)
+├── components/
+│   ├── ui/                  — Reusable design-system components
+│   │   ├── LogoMark.tsx     — Geometric compass SVG mark + Wordmark
+│   │   ├── RadarBg.tsx      — Radar/compass backdrop (aurora blobs, compass rings, sweep)
+│   │   ├── ScoreRing.tsx    — Animated SVG score ring with CountUp
+│   │   ├── VerdictPill.tsx  — Ready / Needs Fixes / Blocked chip + toVerdict() helper
+│   │   ├── GitHubConnectButton.tsx — White/primary button with GitHub SVG icon
+│   │   ├── GitHubIcon.tsx   — Inline GitHub SVG (lucide-react 1.x has no Github export)
+│   │   ├── WorkflowPipeline.tsx — Autoplay node pipeline band
+│   │   ├── AgentCard.tsx    — Agent status card (pending/running/complete/error + stats)
+│   │   ├── LiveActivityLog.tsx — Terminal-style timestamped log stream
+│   │   ├── EmptyState.tsx   — GitHub-first empty state with radar texture
+│   │   ├── RepoCard.tsx     — Repository card with score ring + analyze button
+│   │   └── Reveal.tsx       — Transform-only scroll-reveal (whileInView, no opacity stranding)
+│   ├── app/
+│   │   └── AppSidebar.tsx   — 248px sidebar: LogoMark, repo switcher dropdown, nav items, user row
+│   └── landing/
+│       ├── LandingPage.tsx  — Root; composes all landing sections
+│       ├── Navbar.tsx       — Fixed 68px nav: LogoMark, centered links, Sign in + Connect GitHub
+│       ├── Hero.tsx         — Two-column: headline + LiveAgentPreview + workflow pipeline band
+│       ├── LiveAgentPreview.tsx — Animated preview card cycling agent states
+│       ├── ValueBadges.tsx  — 5 feature chips (PR Risk, Security, Tests, CI/CD, Score)
+│       ├── AgentCards.tsx   — 5 agent cards grid (4 agents + Ship Report)
+│       ├── WhySection.tsx   — 3 "why" cards
+│       └── CTASection.tsx   — Radar-texture CTA glass card + footer
+└── pages/
+    ├── DashboardPage.tsx    — Deployment Readiness hero card, agent summary row, analyses table, AI insights
+    ├── RepositoriesPage.tsx — EmptyState or stat cards + search/filter + RepoCard list
+    ├── AnalysisPage.tsx     — PipelineRadar + live log + per-agent AgentCards
+    ├── ReportsPage.tsx      — ExecutiveReportHeader + 5 tabs (Overview/RepoLens/PlanForge/GuardRail/TestPilot)
+    └── GitHubCallback.tsx   — OAuth callback handler (popup postMessage or redirect)
+```
+
+### Backend (`backend/app/`)
+
+```
+app/
+├── main.py                  — FastAPI app, CORS, routes
+├── api/routes/
+│   ├── auth.py              — GET /api/auth/github/* (login, callback, me, repos, branches, pulls)
+│   └── analysis.py          — POST /api/analyze (triggers 4-agent pipeline)
+├── orchestrator/
+│   └── shipmate_orchestrator.py — RepoLens → PlanForge/GuardRail/TestPilot → Scoring → Report
+├── agents/                  — base_agent.py + 4 agent implementations
+├── services/                — llm_service, github_api_service, repo_analysis_service, scoring_service, report_service
+└── schemas/                 — agent_schemas.py (ShipMateReport + per-agent outputs), api_schemas.py
+```
+
+---
+
+## Design System
+
+### CSS Variables (`src/index.css`)
+
+| Token | Value | Use |
+|---|---|---|
+| `--bg` | `#070c18` | Page background |
+| `--panel` | `rgba(13,21,40,0.72)` | Glass card background |
+| `--line` | `rgba(255,255,255,0.07)` | Default hairlines |
+| `--line-2` | `rgba(255,255,255,0.12)` | Hover / emphasis borders |
+| `--ink` | `#f3f6fc` | Primary text |
+| `--ink-2` | `#aeb9cf` | Secondary text |
+| `--ink-3` | `#6f7d97` | Muted text |
+| `--ink-4` | `#495368` | Faint / disabled text |
+
+**Accent hex values:** `--blue #3b82f6` · `--blue-2 #60a5fa` · `--cyan #22d3ee` · `--purple #8b5cf6` · `--emerald #10b981` · `--amber #f59e0b` · `--orange #f97316` · `--red #ef4444`
+
+### Key CSS Classes
+
+| Class | Purpose |
+|---|---|
+| `.card` | Glass card: `var(--panel)` bg + `var(--line)` border + `blur(14px)` |
+| `.card-hover` | Lift + blue glow on hover |
+| `.glow-border` | Gradient hairline border (blue→purple→cyan via mask-composite) |
+| `.grid-bg` | Radar grid: radial glow + 46px line grid |
+| `.compass-ring` | Decorative concentric circle |
+| `.radar-sweep` | Rotating conic-gradient cyan sector |
+| `.aurora` | Blurred radial blob (position with inline style) |
+| `.btn` · `.btn-primary` · `.btn-secondary` · `.btn-light` · `.btn-ghost` · `.btn-danger` | Button variants |
+| `.btn-sm` · `.btn-lg` | Button size modifiers |
+| `.pill` | Rounded-full label chip |
+| `.chip` | 8px-radius label chip |
+| `.tone-{blue\|cyan\|purple\|emerald\|amber\|orange\|red\|slate}` | Semantic color modifier for `.pill` / `.chip` |
+| `.nav-item` · `.nav-item.active` · `.nav-item.disabled` | Sidebar nav button states |
+| `.tbl` | Table base styles |
+| `.tab` · `.tab.active` | Tab bar button states |
+| `.input` | Form input base |
+| `.track` | Progress bar track; fill with `<i style="width:X%">` |
+| `.eyebrow` | `11px / 700 / uppercase / 0.18em spacing` label |
+| `.mono` | JetBrains Mono font |
+| `.muted` | `color: var(--ink-3)` |
+| `.skel` | Shimmer skeleton block |
+| `.dot` · `.dot-pulse` | 7px status dot with ping animation |
+
+### Agent Colors
+
+| Agent | Hex | Tone class |
+|---|---|---|
+| RepoLens | `#10b981` | `tone-emerald` |
+| PlanForge | `#8b5cf6` | `tone-purple` |
+| GuardRail | `#f59e0b` | `tone-amber` |
+| TestPilot | `#22d3ee` | `tone-cyan` |
+| Ship Report | `#60a5fa` | `tone-blue` |
+
+Score thresholds: `≥80 → emerald` · `≥60 → blue` · `≥40 → amber` · else `red`
+
+### Important Notes
+
+- **`Github` is not in lucide-react 1.x** — use `src/components/ui/GitHubIcon.tsx` instead.
+- **`Reveal` uses transform-only** (`initial={{ y: 20 }}`) — never animates opacity, so content is never stranded invisible.
+- **Routing** is a `page` useState variable in `App.tsx`, not a router library.
+- **Agent simulation** is client-side timed delays in `App.tsx#useAgentSimulation`; the real pipeline runs synchronously in the backend.

@@ -1,9 +1,11 @@
-import { useMemo } from 'react';
+import { useId } from 'react';
 
 interface LogoMarkProps { size?: number; glow?: boolean; }
 
 export function LogoMark({ size = 34, glow = true }: LogoMarkProps) {
-  const id = useMemo(() => 'lg' + Math.random().toString(36).slice(2, 7), []);
+  const uid = useId();
+  const id = `lg${uid.replace(/:/g, '')}`;
+
   return (
     <svg width={size} height={size} viewBox="0 0 48 48" aria-label="ShipMate"
       style={{ filter: glow ? 'drop-shadow(0 6px 16px rgba(37,99,235,0.45))' : 'none', flexShrink: 0 }}>

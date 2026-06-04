@@ -3,7 +3,6 @@ import { motion } from 'framer-motion';
 import { Search, Plus, BookOpen, AlertTriangle, Gauge } from 'lucide-react';
 import { RepoCard } from '../components/ui/RepoCard';
 import { EmptyState } from '../components/ui/EmptyState';
-import { scoreColor } from '../lib/agents';
 import type { GitHubRepo, ShipMateReport } from '../types';
 
 interface Props {
@@ -125,7 +124,3 @@ export function RepositoriesPage({ repos, loadingRepos, selectedRepo, analyzing,
     </motion.div>
   );
 }
-
-// silence unused import
-const _scoreColor = scoreColor;
-void _scoreColor;

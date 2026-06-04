@@ -8,13 +8,15 @@ interface WorkflowPipelineProps {
 }
 
 export function WorkflowPipeline({ active = -1, autoplay = false, compact = false }: WorkflowPipelineProps) {
-  const [step, setStep] = useState(autoplay ? 0 : active);
+  const [autoStep, setAutoStep] = useState(0);
+  // When not autoplaying, derive step from prop directly (no state needed)
+  const step = autoplay ? autoStep : active;
 
   useEffect(() => {
-    if (!autoplay) { setStep(active); return; }
-    const id = setInterval(() => setStep(s => (s + 1) % (PIPE.length + 2)), 1100);
+    if (!autoplay) return;
+    const id = setInterval(() => setAutoStep(s => (s + 1) % (PIPE.length + 2)), 1100);
     return () => clearInterval(id);
-  }, [autoplay, active]);
+  }, [autoplay]);
 
   return (
     <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: compact ? 6 : 10, justifyContent: 'center' }}>

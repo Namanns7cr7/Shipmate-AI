@@ -29,14 +29,16 @@ interface ScoreRingProps {
 }
 
 export function ScoreRing({ value = 0, size = 120, stroke = 9, label, sub, animate = true, delay = 200 }: ScoreRingProps) {
-  const [v, setV] = useState(animate ? 0 : value);
+  const [displayed, setDisplayed] = useState(0);
   const r = (size - stroke) / 2;
   const c = 2 * Math.PI * r;
   const color = scoreColor(value);
+  // When not animating, derive v directly; when animating, use the timed state
+  const v = animate ? displayed : value;
 
   useEffect(() => {
-    if (!animate) { setV(value); return; }
-    const t = setTimeout(() => setV(value), delay);
+    if (!animate) return;
+    const t = setTimeout(() => setDisplayed(value), delay);
     return () => clearTimeout(t);
   }, [value, animate, delay]);
 
