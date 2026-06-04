@@ -190,6 +190,23 @@ export interface AnalyzeResponse {
   report: ShipMateReport;
 }
 
+// ── Analysis History ──────────────────────────────────────────────────────────
+
+export interface AnalysisHistoryRecord {
+  id: string;
+  repo: string;
+  readiness_score: number;
+  ship_recommendation: ShipRecommendation;
+  score_breakdown: ScoreBreakdown;
+  created_at: string;
+}
+
+export interface AnalysisHistoryResponse {
+  repo: string;
+  history: AnalysisHistoryRecord[];
+  total_count: number;
+}
+
 // ── App state ─────────────────────────────────────────────────────────────────
 
 export type AppState =
