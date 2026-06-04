@@ -2,8 +2,9 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import os
+import re
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 import uvicorn
@@ -27,6 +28,34 @@ ALLOWED_ORIGINS: list[str] = [
     origin.strip() for origin in _raw_origins.split(",") if origin.strip()
 ]
 
+# ---------------------------------------------------------------------------
+# Dangerous pattern blocklist for input sanitization.
+# These patterns cover the most common dynamic-execution vectors that could
+# be injected via user-controlled strings (prompt inputs, API parameters).
+# ---------------------------------------------------------------------------
+_DANGEROUS_PATTERNS: list[re.Pattern] = [
+    re.compile(r"\beval\s*\(", re.IGNORECASE),
+    re.compile(r"\bexec\s*\(", re.IGNORECASE),
+    re.compile(r"__import__\s*\(", re.IGNORECASE),
+    re.compile(r"__builtins__", re.IGNORECASE),
+    re.compile(r"__globals__", re.IGNORECASE),
+    re.compile(r"__locals__", re.IGNORECASE),
+    re.compile(r"compile\s*\(", re.IGNORECASE),
+    re.compile(r"importlib\.import_module\s*\(", re.IGNORECASE),
+    re.compile(r"subprocess\s*\.", re.IGNORECASE),
+    re.compile(r"os\.system\s*\(", re.IGNORECASE),
+    re.compile(r"os\.popen\s*\(", re.IGNORECASE),
+]
+
+
+def _contains_dangerous_pattern(value: str) -> bool:
+    """Return True if *value* matches any known dangerous execution pattern."""
+    for pattern in _DANGEROUS_PATTERNS:
+        if pattern.search(value):
+            return True
+    return False
+
+
 app = FastAPI(
     title="ShipMate AI",
     description="AI-native multi-agent release readiness platform",
@@ -34,6 +63,53 @@ app = FastAPI(
     docs_url="/docs",
     redoc_url="/redoc",
 )
+
+
+# ---------------------------------------------------------------------------
+# Input sanitization middleware
+# Runs before every request and rejects any payload that contains patterns
+# associated with dynamic code execution (eval, exec, __import__, etc.).
+# ---------------------------------------------------------------------------
+@app.middleware("http")
+async def sanitize_input_middleware(request: Request, call_next):
+    # --- Check query parameters ---
+    for key, value in request.query_params.items():
+        if _contains_dangerous_pattern(key) or _contains_dangerous_pattern(value):
+            return JSONResponse(
+                status_code=400,
+                content={"detail": "Request contains disallowed content."},
+            )
+
+    # --- Check selected headers (User-Agent, Referer, custom X- headers) ---
+    _checked_headers = {
+        k: v
+        for k, v in request.headers.items()
+        if k.lower() not in ("authorization", "cookie")
+    }
+    for key, value in _checked_headers.items():
+        if _contains_dangerous_pattern(value):
+            return JSONResponse(
+                status_code=400,
+                content={"detail": "Request contains disallowed content."},
+            )
+
+    # --- Check request body for JSON/text content types ---
+    content_type = request.headers.get("content-type", "")
+    if any(ct in content_type for ct in ("application/json", "text/", "application/x-www-form-urlencoded")):
+        try:
+            body_bytes = await request.body()
+            body_text = body_bytes.decode("utf-8", errors="replace")
+            if _contains_dangerous_pattern(body_text):
+                return JSONResponse(
+                    status_code=400,
+                    content={"detail": "Request contains disallowed content."},
+                )
+        except Exception:
+            # If we cannot read the body, let the route handler deal with it.
+            pass
+
+    return await call_next(request)
+
 
 app.add_middleware(
     CORSMiddleware,
