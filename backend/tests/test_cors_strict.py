@@ -67,8 +67,8 @@ class TestCORSMiddlewareIntegration:
         response = client.get("/health", headers={"Origin": valid})
         assert response.headers.get("access-control-allow-origin") == valid
 
-    def test_spoofed_preflight_returns_403(self, client):
-        """OPTIONS preflight from a spoofed origin must be rejected with 403."""
+    def test_spoofed_preflight_returns_4xx(self, client):
+        """OPTIONS preflight from a spoofed origin must be rejected (Starlette returns 400)."""
         spoofed = "http://localhost:5173.evil.com"
         response = client.options(
             "/health",
@@ -77,7 +77,7 @@ class TestCORSMiddlewareIntegration:
                 "Access-Control-Request-Method": "GET",
             },
         )
-        assert response.status_code == 403
+        assert response.status_code in (400, 403)
 
     def test_legitimate_preflight_is_not_403(self, client):
         """OPTIONS preflight from a valid origin must not be rejected."""

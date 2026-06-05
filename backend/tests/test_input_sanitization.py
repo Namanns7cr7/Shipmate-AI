@@ -1,4 +1,5 @@
 import pytest
+from fastapi import Request
 from fastapi.testclient import TestClient
 from app.main import app
 
@@ -13,7 +14,7 @@ class TestInputSanitizationMiddleware:
         """POST with valid JSON body should be received intact by the route handler."""
         # Create a test endpoint that echoes back the received JSON
         @app.post("/test/echo")
-        async def echo_handler(request):
+        async def echo_handler(request: Request):
             body = await request.json()
             return {"received": body}
         

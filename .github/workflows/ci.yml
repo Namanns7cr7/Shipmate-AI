@@ -4,12 +4,14 @@ on:
   push:
     branches:
       - main
+      - Naman
       - feat/bedrock-on-v2
       - feat/**
       - fix/**
   pull_request:
     branches:
       - main
+      - Naman
       - feat/bedrock-on-v2
       - feat/**
       - fix/**

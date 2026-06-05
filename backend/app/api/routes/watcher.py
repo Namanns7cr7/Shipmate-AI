@@ -1,19 +1,16 @@
 """
-GET /api/watcher          — list active CI watchers
-GET /api/watcher/{owner}/{repo}/{pr_number} — single watcher state
-DELETE /api/watcher/{owner}/{repo}/{pr_number} — stop watching
+GET    /api/watcher                              — list active CI watchers (read-only, public)
+GET    /api/watcher/{owner}/{repo}/{pr_number}   — single watcher state (read-only, public)
+DELETE /api/watcher/{owner}/{repo}/{pr_number}   — stop watching (requires Authorization header)
 
-The frontend can poll /api/watcher every ~10-15s to render a live "PRs
-under auto-fix" strip on the dashboard or report. No auth required to
-read state — registry is in-memory and only contains finding metadata
-+ token-less identifiers (the access_token is held internally, never
-exposed in responses).
+The frontend can poll /api/watcher every ~10-15s to render a live "PRs under auto-fix" strip.
+The access_token is held internally by CIWatcher and never exposed in responses.
 """
 
 import logging
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Header
 
 from app.services.ci_watcher import CIWatcher
 
@@ -35,5 +32,12 @@ async def get_watcher(owner: str, repo: str, pr_number: int) -> Dict[str, Any]:
 
 
 @router.delete("/watcher/{owner}/{repo}/{pr_number}")
-async def stop_watcher(owner: str, repo: str, pr_number: int) -> Dict[str, bool]:
+async def stop_watcher(
+    owner: str,
+    repo: str,
+    pr_number: int,
+    authorization: Optional[str] = Header(None),
+) -> Dict[str, bool]:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
     return {"stopped": CIWatcher.stop(owner, repo, pr_number)}
