@@ -285,6 +285,17 @@ class TestDangerousPatternDetection:
         for pattern in _DANGEROUS_PATTERNS:
             assert isinstance(pattern, re.Pattern)
 
+    def test_contains_dangerous_pattern_case_insensitive_exec_returns_true(self):
+        """Verify all patterns use re.IGNORECASE flag by testing mixed-case variants."""
+        # Test mixed-case variants of exec to ensure re.IGNORECASE is applied
+        assert _contains_dangerous_pattern("EXEC(") is True
+        assert _contains_dangerous_pattern("Exec(") is True
+        assert _contains_dangerous_pattern("eXeC(") is True
+        # Test mixed-case variants of eval
+        assert _contains_dangerous_pattern("EVAL(") is True
+        assert _contains_dangerous_pattern("Eval(") is True
+        assert _contains_dangerous_pattern("eVaL(") is True
+
 
 class TestCORSConfiguration:
     """Test CORS configuration."""
