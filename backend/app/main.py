@@ -2,8 +2,10 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import os
+import re
+from typing import Callable
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 import uvicorn
@@ -13,6 +15,72 @@ from app.api.routes.analysis import router as analysis_router
 from app.api.routes.actuate import router as actuate_router
 from app.api.routes.watcher import router as watcher_router
 from app.api.routes.branches import router as branches_router
+
+# ---------------------------------------------------------------------------
+# Input Sanitization: Dangerous Pattern Detection
+# ---------------------------------------------------------------------------
+_DANGEROUS_PATTERNS = [
+    re.compile(r'\beval\s*\(', re.IGNORECASE),
+    re.compile(r'\bexec\s*\(', re.IGNORECASE),
+    re.compile(r'\b__import__\b', re.IGNORECASE),
+    re.compile(r'\b__builtins__\b', re.IGNORECASE),
+    re.compile(r'\b__globals__\b', re.IGNORECASE),
+    re.compile(r'\b__locals__\b', re.IGNORECASE),
+    re.compile(r'\bcompile\s*\(', re.IGNORECASE),
+    re.compile(r'\bimportlib\.import_module\b', re.IGNORECASE),
+    re.compile(r'\bsubprocess\b', re.IGNORECASE),
+    re.compile(r'\bos\.system\b', re.IGNORECASE),
+    re.compile(r'\bos\.popen\b', re.IGNORECASE),
+]
+
+
+def _contains_dangerous_pattern(text: str) -> bool:
+    """Check if text contains any dangerous patterns."""
+    if not isinstance(text, str):
+        return False
+    for pattern in _DANGEROUS_PATTERNS:
+        if pattern.search(text):
+            return True
+    return False
+
+
+async def input_sanitization_middleware(request: Request, call_next: Callable):
+    """Middleware to block requests with dangerous patterns in query, headers, and body."""
+    # Check query parameters
+    for key, value in request.query_params.items():
+        if _contains_dangerous_pattern(value):
+            return JSONResponse(
+                status_code=400,
+                content={"detail": "Request contains disallowed content"},
+            )
+    
+    # Check headers (skip Authorization and Cookie)
+    skip_headers = {"authorization", "cookie"}
+    for key, value in request.headers.items():
+        if key.lower() not in skip_headers and _contains_dangerous_pattern(value):
+            return JSONResponse(
+                status_code=400,
+                content={"detail": "Request contains disallowed content"},
+            )
+    
+    # Check body for JSON and form data
+    if request.method in ["POST", "PUT", "PATCH"]:
+        content_type = request.headers.get("content-type", "")
+        if "application/json" in content_type or "application/x-www-form-urlencoded" in content_type:
+            try:
+                body = await request.body()
+                if body:
+                    body_str = body.decode("utf-8", errors="ignore")
+                    if _contains_dangerous_pattern(body_str):
+                        return JSONResponse(
+                            status_code=400,
+                            content={"detail": "Request contains disallowed content"},
+                        )
+            except Exception:
+                pass
+    
+    return await call_next(request)
+
 
 # ---------------------------------------------------------------------------
 # CORS origin allowlist
@@ -46,6 +114,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.middleware("http")(input_sanitization_middleware)
+
 app.include_router(auth_router, prefix="/api")
 app.include_router(analysis_router, prefix="/api")
 app.include_router(actuate_router, prefix="/api")
@@ -75,7 +145,7 @@ async def github_callback_html():
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <title>ShipMate AI \u2013 GitHub Auth</title>
+  <title>ShipMate AI – GitHub Auth</title>
   <style>
     *{margin:0;padding:0;box-sizing:border-box}
     body{font-family:system-ui,sans-serif;background:#0f172a;display:flex;align-items:center;
@@ -94,7 +164,7 @@ async def github_callback_html():
 <body>
   <div class="box">
     <div class="spinner"></div>
-    <h1>Completing GitHub authorization\u2026</h1>
+    <h1>Completing GitHub authorization…</h1>
     <p>This window will close automatically.</p>
     <div id="err"></div>
   </div>
