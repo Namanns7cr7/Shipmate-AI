@@ -20,6 +20,54 @@ from app.api.routes.watcher import router as watcher_router
 from app.api.routes.branches import router as branches_router
 
 # ---------------------------------------------------------------------------
+# Startup: Enforce HTTPS for all configured service endpoint URLs
+# ---------------------------------------------------------------------------
+
+# Environment variables that may carry service endpoint URLs and must use HTTPS
+# when set to a non-localhost/non-loopback value.
+_ENDPOINT_ENV_VARS = [
+    "BEDROCK_ENDPOINT",
+    "API_BASE_URL",
+    "INTERNAL_API_URL",
+    "GITHUB_API_URL",
+    "OPENAI_API_BASE",
+    "ANTHROPIC_API_URL",
+]
+
+# Hostnames that are considered local-only and are exempt from the HTTPS
+# requirement (plain HTTP is acceptable for loopback-only traffic).
+_LOCAL_HOSTS = frozenset([
+    "localhost",
+    "127.0.0.1",
+    "::1",
+    "0.0.0.0",
+])
+
+
+def _validate_endpoint_urls() -> None:
+    """Raise ValueError if any configured endpoint URL uses plain HTTP with a
+    non-local host.  Called at module import time so the application refuses to
+    start with an insecure configuration.
+    """
+    for var in _ENDPOINT_ENV_VARS:
+        value = os.getenv(var, "").strip()
+        if not value:
+            continue
+        parsed = urlparse(value)
+        if parsed.scheme == "http":
+            host = (parsed.hostname or "").lower()
+            if host not in _LOCAL_HOSTS:
+                raise ValueError(
+                    f"Environment variable {var!r} is set to a plain HTTP URL "
+                    f"({value!r}). Auth tokens must not be transmitted over "
+                    "unencrypted connections. Change the URL scheme to 'https://' "
+                    "before starting the application."
+                )
+
+
+_validate_endpoint_urls()
+
+# ---------------------------------------------------------------------------
 # Input Sanitization: Dangerous Pattern Detection
 # ---------------------------------------------------------------------------
 _DANGEROUS_PATTERNS = [
