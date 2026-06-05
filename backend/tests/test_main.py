@@ -186,6 +186,11 @@ class TestMiddlewareSetup:
         response = client.get("/", headers={"Authorization": "Bearer eval(1)"})
         assert response.status_code == 200
 
+    def test_sanitize_input_middleware_authorization_header_with_dangerous_pattern_passes(self):
+        """Verify Authorization header containing dangerous pattern is not blocked, validating intentional exclusion."""
+        response = client.get("/", headers={"Authorization": "Bearer eval(x)"})
+        assert response.status_code == 200
+
     def test_input_sanitization_middleware_skips_cookie_headers(self):
         """Verify input sanitization middleware skips Cookie header."""
         response = client.get("/", headers={"Cookie": "session=eval(1)"})
