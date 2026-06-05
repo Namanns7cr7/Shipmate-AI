@@ -63,10 +63,18 @@ _STATE_PATH = Path("/tmp/coder_loop_state.json")
 def _load_state() -> Dict[str, Any]:
     if _STATE_PATH.exists():
         try:
-            return json.loads(_STATE_PATH.read_text())
+            data = json.loads(_STATE_PATH.read_text())
+            # Backfill new fields for older state files.
+            data.setdefault("attempts", {})  # signature -> attempt count
+            data.setdefault("parked", [])     # signatures permanently skipped
+            return data
         except Exception:
             pass
-    return {"seen_signatures": [], "baseline_passing": None}
+    return {"seen_signatures": [], "baseline_passing": None,
+            "attempts": {}, "parked": []}
+
+
+_MAX_ATTEMPTS = 2  # findings that fail this many times go to `parked`
 
 
 def _save_state(state: Dict[str, Any]) -> None:
@@ -200,6 +208,7 @@ def _pick_top_per_kind(
     report: Dict[str, Any],
     seen_signatures: set,
     cooled_paths: set,
+    parked: set = None,
 ) -> List[FindingPayload]:
     """Return ≤1 of each kind: guardrail, milestone, blocker, test.
 
@@ -214,10 +223,13 @@ def _pick_top_per_kind(
     out: List[FindingPayload] = []
 
     SEV = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
+    parked = parked or set()
 
     def _eligible(kind: str, title: str, file_hint: Optional[str]) -> bool:
         sig = _finding_signature(kind, title, file_hint)
         if sig in seen_signatures:
+            return False
+        if sig in parked:
             return False
         if file_hint and file_hint in cooled_paths:
             return False
@@ -463,7 +475,8 @@ async def run_round(
     report = await _fetch_findings(base_url, owner, repo, branch, token)
     print(f"  analyze: {round(time.time()-t0,1)}s — score={report.get('readiness_score')}")
 
-    findings = _pick_top_per_kind(report, seen_signatures, cooled_paths)
+    parked = set(state.get("parked") or [])
+    findings = _pick_top_per_kind(report, seen_signatures, cooled_paths, parked)
     if not findings:
         print("  no fresh findings — loop is dry")
         return 0, 0, 0
@@ -495,27 +508,33 @@ async def run_round(
     cooled_paths.clear()
 
     # Detect file-collision: two `good` patches both writing the same path.
-    # If so, keep only the first one (deterministic by kind order) so we
-    # don't rewrite a file twice in one round.
+    # The COMPLETE conflicting patch is dropped (not partially merged), so
+    # the next round can re-pick that finding and see the new file state.
+    # Earlier kind ordering wins: guardrail > blocker > milestone > test.
     if apply:
+        KIND_ORDER = {"guardrail": 0, "blocker": 1, "milestone": 2, "test": 3}
+        recs.sort(key=lambda r: KIND_ORDER.get(r.get("finding_kind", "z"), 99))
         seen_paths: set = set()
         for rec in recs:
             if rec.get("verdict") != "good":
                 continue
-            keep_files = []
-            dropped = []
-            for f in rec.get("_files_full", []):
-                if f["path"] in seen_paths:
-                    dropped.append(f["path"])
-                else:
-                    seen_paths.add(f["path"])
-                    keep_files.append(f)
-            if dropped:
-                print(f"  ⚠ [{rec['finding_kind']}] dropped {len(dropped)} colliding file(s): {dropped}")
-                rec["_files_full"] = keep_files
+            files = rec.get("_files_full", [])
+            paths_in_rec = {f["path"] for f in files}
+            collision = paths_in_rec & seen_paths
+            if collision:
+                # Drop entire patch — partial application is worse than waiting.
+                print(f"  ⚠ [{rec['finding_kind']}] DROPPED entire patch (path collision: {collision})")
+                rec["_files_full"] = []
                 rec.setdefault("reasons", []).append(
-                    f"dropped colliding writes (already taken by an earlier patch this round): {dropped}"
+                    f"deferred to next round — path collision with earlier patch: {sorted(collision)}"
                 )
+                # Remove this finding's signature so it can re-actuate next round
+                # AGAINST the new file state.
+                seen_signatures.discard(_finding_signature(
+                    rec["finding_kind"], rec["finding_title"], rec.get("finding_target")
+                ))
+            else:
+                seen_paths.update(paths_in_rec)
 
     good = bad = applied_count = reverted = 0
     if apply:
@@ -572,6 +591,28 @@ async def run_round(
 
     if reverted:
         print(f"  reverted: {reverted} patch(es) due to test regression")
+
+    # Increment attempt counters for findings that didn't land cleanly.
+    # After _MAX_ATTEMPTS consecutive non-`good` rounds, park the finding so
+    # the loop stops wasting tokens on it. A successful apply resets it.
+    attempts: Dict[str, int] = dict(state.get("attempts") or {})
+    parked: List[str] = list(state.get("parked") or [])
+    for rec in recs:
+        sig = _finding_signature(
+            rec["finding_kind"], rec["finding_title"], rec.get("finding_target")
+        )
+        if rec.get("verdict") == "good" and rec.get("_files_full"):
+            attempts.pop(sig, None)
+        elif rec.get("verdict") in ("bad", "reverted", "skipped", "error"):
+            attempts[sig] = attempts.get(sig, 0) + 1
+            if attempts[sig] >= _MAX_ATTEMPTS and sig not in parked:
+                parked.append(sig)
+                attempts.pop(sig, None)
+                print(f"  ⛔ parked (≥{_MAX_ATTEMPTS} failed attempts): {rec['finding_title'][:60]}")
+    state["attempts"] = attempts
+    state["parked"] = parked
+    _save_state(state)
+
     return good, bad, applied_count
 
 
