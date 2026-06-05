@@ -84,6 +84,23 @@ def _save_state(state: Dict[str, Any]) -> None:
 # ── Pytest gate ──────────────────────────────────────────────────────────────
 
 
+def _smoke_imports() -> Tuple[bool, str]:
+    """Fast pre-pytest check: can we even import app.main? If not, the patch
+    broke a top-level import and pytest will give a misleading 0p/68f result.
+    Bounded by 10s. Returns (ok, error_text)."""
+    import subprocess
+    cwd = REPO_ROOT / "backend"
+    try:
+        proc = subprocess.run(
+            ["./venv/bin/python", "-c", "import app.main"],
+            cwd=str(cwd),
+            capture_output=True, text=True, timeout=10,
+        )
+    except subprocess.TimeoutExpired:
+        return False, "import smoke timeout"
+    return proc.returncode == 0, (proc.stderr or proc.stdout or "")[-500:]
+
+
 def _run_pytest(target: str = "backend/tests/") -> Tuple[int, int, str]:
     """Returns (passed, failed, raw_summary). Runs the test suite from
     REPO_ROOT/backend so app.* imports resolve. Uses -q + --tb=no for speed.
@@ -224,8 +241,23 @@ def _pick_top_per_kind(
 
     SEV = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
     parked = parked or set()
+    # Track files about to be hit this round so we don't pick 4 findings
+    # that all target backend/app/main.py.
+    target_files_used: set = set()
 
-    def _eligible(kind: str, title: str, file_hint: Optional[str]) -> bool:
+    # Many guardrail findings (CORS, injection, sanitization, secrets,
+    # config) have no `finding.file` but Coder's target resolver always
+    # picks backend/app/main.py for them. Treat those as implicitly
+    # claiming main.py so we don't pick four such findings that all
+    # collide on the same file. Same for "ci_cd" findings → ci.yml.
+    _MAIN_PY_CATEGORIES = {"cors", "secrets", "auth", "injection",
+                            "config", "input_validation"}
+    _CI_YAML_CATEGORIES = {"ci_cd"}
+
+    def _eligible(
+        kind: str, title: str, file_hint: Optional[str],
+        category: Optional[str] = None,
+    ) -> bool:
         sig = _finding_signature(kind, title, file_hint)
         if sig in seen_signatures:
             return False
@@ -233,14 +265,35 @@ def _pick_top_per_kind(
             return False
         if file_hint and file_hint in cooled_paths:
             return False
+        if file_hint and file_hint in target_files_used:
+            return False
+        # Category-implied collision: guardrail/injection (with no explicit
+        # file) will be resolved to backend/app/main.py — block if main.py
+        # is already taken.
+        if not file_hint and _category_implies_main(category):
+            if "backend/app/main.py" in target_files_used:
+                return False
         return True
+
+    def _claim(file_hint: Optional[str], category: Optional[str] = None) -> None:
+        if file_hint:
+            target_files_used.add(file_hint)
+        cat = (category or "").lower()
+        if cat in _MAIN_PY_CATEGORIES:
+            target_files_used.add("backend/app/main.py")
+        elif cat in _CI_YAML_CATEGORIES:
+            target_files_used.add(".github/workflows/ci.yml")
+
+    def _category_implies_main(cat: Optional[str]) -> bool:
+        return (cat or "").lower() in _MAIN_PY_CATEGORIES
 
     # GuardRail
     for f in sorted(
         agents.get("guardrail", {}).get("findings", []) or [],
         key=lambda f: -SEV.get((f.get("severity") or "").lower(), 0),
     ):
-        if not _eligible("guardrail", f.get("title") or "", f.get("file")):
+        cat = f.get("category")
+        if not _eligible("guardrail", f.get("title") or "", f.get("file"), cat):
             continue
         out.append(FindingPayload(
             kind="guardrail", id=f.get("id") or "",
@@ -248,8 +301,9 @@ def _pick_top_per_kind(
             description=f.get("description") or "",
             recommendation=f.get("recommendation") or "",
             file=f.get("file"), severity=f.get("severity"),
-            category=f.get("category"),
+            category=cat,
         ))
+        _claim(f.get("file"), cat)
         break
 
     # Blocker
@@ -257,7 +311,8 @@ def _pick_top_per_kind(
         agents.get("plan_forge", {}).get("blockers", []) or [],
         key=lambda b: -SEV.get((b.get("severity") or "").lower(), 0),
     ):
-        if not _eligible("blocker", b.get("title") or "", None):
+        cat = b.get("category")
+        if not _eligible("blocker", b.get("title") or "", None, cat):
             continue
         out.append(FindingPayload(
             kind="blocker",
@@ -265,15 +320,17 @@ def _pick_top_per_kind(
             title=b.get("title") or "",
             description=b.get("description") or "",
             recommendation=b.get("resolution") or "",
-            severity=b.get("severity"), category=b.get("category"),
+            severity=b.get("severity"), category=cat,
         ))
+        _claim(None, cat)
         break
 
     # Milestone (feature/tweak — non-testing)
     for m in agents.get("plan_forge", {}).get("milestones", []) or []:
-        if (m.get("category") or "").lower() == "testing":
+        cat = m.get("category")
+        if (cat or "").lower() == "testing":
             continue
-        if not _eligible("milestone", m.get("title") or "", None):
+        if not _eligible("milestone", m.get("title") or "", None, cat):
             continue
         out.append(FindingPayload(
             kind="milestone",
@@ -281,19 +338,30 @@ def _pick_top_per_kind(
             title=m.get("title") or "",
             description=m.get("description") or "",
             recommendation="",
-            severity=m.get("priority"), category=m.get("category"),
+            severity=m.get("priority"), category=cat,
         ))
+        _claim(None, cat)
         break
 
-    # Test — highest priority, prefer ones with target_file
+    # Test — highest priority, prefer discovery over heuristic. The
+    # heuristic fallbacks (test_main, test_error_handling, test_auth_flows)
+    # produce universally bad output (vague target, no real assertion to
+    # write) so we always skip them.
+    _HEURISTIC_TEST_BLOCKLIST = {
+        "test_main", "test_error_handling", "test_auth_flows",
+        "test_e2e_happy_path", "test_index",
+    }
     for t in sorted(
         agents.get("testpilot", {}).get("suggested_tests", []) or [],
         key=lambda t: (
+            0 if t.get("source") == "discovery" else 1,
             0 if t.get("target_file") else 1,
             {"high": 0, "medium": 1, "low": 2}.get(
                 (t.get("priority") or "").lower(), 3),
         ),
     ):
+        if (t.get("name") or "") in _HEURISTIC_TEST_BLOCKLIST:
+            continue
         if not _eligible("test", t.get("name") or "", t.get("target_file")):
             continue
         out.append(FindingPayload(
@@ -305,6 +373,7 @@ def _pick_top_per_kind(
             file=t.get("target_file"), severity=t.get("priority"),
             category="testing",
         ))
+        _claim(t.get("target_file"))
         break
 
     return out
@@ -561,6 +630,21 @@ async def run_round(
                     paths = [f["path"] for f in files]
                     snap = _snapshot_files(paths)
                     touched = _apply_to_working_tree(rec)
+                    # Fast smoke: import app.main. If this fails we know
+                    # pytest will return 0p/Nf and the misleading number
+                    # would tank baseline_passing.
+                    smoke_ok, smoke_err = _smoke_imports()
+                    if not smoke_ok:
+                        _restore_snapshot(snap)
+                        good -= 1
+                        bad += 1
+                        reverted += 1
+                        rec["verdict"] = "reverted"
+                        rec.setdefault("reasons", []).append(
+                            f"REVERTED: import smoke failed — {smoke_err[:200]}"
+                        )
+                        print(f"      ✗ REVERTED — import smoke failed")
+                        continue
                     passed, failed, _ = _run_pytest()
                     if passed < baseline_passing:
                         # Regression. Revert.
