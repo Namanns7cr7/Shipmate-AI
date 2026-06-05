@@ -749,7 +749,9 @@ async def main() -> None:
             state["seen_signatures"] = sorted(seen_signatures)
             _save_state(state)
         except Exception as e:
-            print(f"  round {r} crashed: {e}")
+            import traceback
+            print(f"  round {r} crashed: {type(e).__name__}: {e}")
+            traceback.print_exc()
             break
         totals["good"] += g
         totals["bad"] += b

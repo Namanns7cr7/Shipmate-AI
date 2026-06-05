@@ -1,135 +1,63 @@
-"""Shared GitHub API client for authenticated requests.
+"""Centralized GitHub API client factory.
 
-This module provides a single authenticated GitHub client that centralizes
-token management, rate-limit handling, and HTTP session lifecycle.
+This module provides a single shared GitHubClient factory to eliminate
+duplication of header/auth setup logic across service files. All services
+should import and use this factory rather than constructing their own
+GitHub API clients.
 """
 
 import os
 from typing import Optional
 
-import httpx
-
 
 class GitHubClient:
-    """Authenticated GitHub API client with centralized token and session management.
-    
-    Attributes:
-        token: GitHub personal access token or OAuth token.
-        base_url: GitHub API base URL (default: https://api.github.com).
-        timeout: Request timeout in seconds (default: 30).
+    """GitHub API client with centralized auth and header configuration."""
+
+    def __init__(self, token: Optional[str] = None):
+        """Initialize GitHub client with optional token.
+
+        Args:
+            token: GitHub personal access token or app token. If not provided,
+                   falls back to GITHUB_TOKEN environment variable.
+        """
+        self.token = token or os.getenv("GITHUB_TOKEN")
+        self.base_url = "https://api.github.com"
+        self.headers = self._build_headers()
+
+    def _build_headers(self) -> dict[str, str]:
+        """Build standard GitHub API headers with auth.
+
+        Returns:
+            Dictionary of headers including Authorization if token is available.
+        """
+        headers = {
+            "Accept": "application/vnd.github.v3+json",
+            "User-Agent": "ShipMate-AI/2.0.0",
+        }
+        if self.token:
+            headers["Authorization"] = f"token {self.token}"
+        return headers
+
+    def get_headers(self) -> dict[str, str]:
+        """Return a copy of the standard headers for this client.
+
+        Returns:
+            Dictionary of headers to use in GitHub API requests.
+        """
+        return self.headers.copy()
+
+
+def create_github_client(token: Optional[str] = None) -> GitHubClient:
+    """Factory function to create a GitHub API client.
+
+    This is the single point of instantiation for GitHub clients across
+    the application. All services should use this factory rather than
+    constructing GitHubClient directly.
+
+    Args:
+        token: Optional GitHub token. If not provided, uses GITHUB_TOKEN env var.
+
+    Returns:
+        Configured GitHubClient instance.
     """
-
-    def __init__(
-        self,
-        token: Optional[str] = None,
-        base_url: str = "https://api.github.com",
-        timeout: float = 30.0,
-    ):
-        """Initialize the GitHub client.
-        
-        Args:
-            token: GitHub token. If None, reads from GITHUB_TOKEN env var.
-            base_url: GitHub API base URL.
-            timeout: Request timeout in seconds.
-        """
-        self.token = token or os.getenv("GITHUB_TOKEN", "")
-        self.base_url = base_url
-        self.timeout = timeout
-        self._session: Optional[httpx.Client] = None
-
-    @property
-    def session(self) -> httpx.Client:
-        """Lazy-initialize and return the httpx session.
-        
-        Returns:
-            An httpx.Client configured with GitHub auth headers.
-        """
-        if self._session is None:
-            headers = {}
-            if self.token:
-                headers["Authorization"] = f"token {self.token}"
-            headers["Accept"] = "application/vnd.github.v3+json"
-            self._session = httpx.Client(
-                base_url=self.base_url,
-                headers=headers,
-                timeout=self.timeout,
-            )
-        return self._session
-
-    def close(self) -> None:
-        """Close the underlying httpx session."""
-        if self._session is not None:
-            self._session.close()
-            self._session = None
-
-    def __enter__(self):
-        """Context manager entry."""
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        """Context manager exit."""
-        self.close()
-
-    def get(self, path: str, **kwargs) -> httpx.Response:
-        """Perform a GET request.
-        
-        Args:
-            path: API endpoint path (relative to base_url).
-            **kwargs: Additional arguments passed to httpx.Client.get().
-        
-        Returns:
-            httpx.Response object.
-        """
-        return self.session.get(path, **kwargs)
-
-    def post(self, path: str, **kwargs) -> httpx.Response:
-        """Perform a POST request.
-        
-        Args:
-            path: API endpoint path (relative to base_url).
-            **kwargs: Additional arguments passed to httpx.Client.post().
-        
-        Returns:
-            httpx.Response object.
-        """
-        return self.session.post(path, **kwargs)
-
-    def put(self, path: str, **kwargs) -> httpx.Response:
-        """Perform a PUT request.
-        
-        Args:
-            path: API endpoint path (relative to base_url).
-            **kwargs: Additional arguments passed to httpx.Client.put().
-        
-        Returns:
-            httpx.Response object.
-        """
-        return self.session.put(path, **kwargs)
-
-    def patch(self, path: str, **kwargs) -> httpx.Response:
-        """Perform a PATCH request.
-        
-        Args:
-            path: API endpoint path (relative to base_url).
-            **kwargs: Additional arguments passed to httpx.Client.patch().
-        
-        Returns:
-            httpx.Response object.
-        """
-        return self.session.patch(path, **kwargs)
-
-    def delete(self, path: str, **kwargs) -> httpx.Response:
-        """Perform a DELETE request.
-        
-        Args:
-            path: API endpoint path (relative to base_url).
-            **kwargs: Additional arguments passed to httpx.Client.delete().
-        
-        Returns:
-            httpx.Response object.
-        """
-        return self.session.delete(path, **kwargs)
-
-
-# Module-level singleton instance for convenient import and use.
-github_client = GitHubClient()
+    return GitHubClient(token=token)

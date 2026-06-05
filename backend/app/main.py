@@ -90,6 +90,22 @@ class _BodyReplayRequest(Request):
         }
 
 
+# Content-type prefixes that carry text payloads and must be scanned.
+_TEXT_CONTENT_TYPES = (
+    "application/json",
+    "application/x-www-form-urlencoded",
+    "multipart/form-data",
+    "text/plain",
+    "text/",
+)
+
+
+def _is_text_content_type(content_type: str) -> bool:
+    """Return True when the content-type indicates a text-based body."""
+    ct_lower = content_type.lower()
+    return any(ct_lower.startswith(prefix) or prefix in ct_lower for prefix in _TEXT_CONTENT_TYPES)
+
+
 async def input_sanitization_middleware(request: Request, call_next: Callable):
     """Middleware to block requests with dangerous patterns in query, headers, and body."""
     # Check query parameters
@@ -109,10 +125,10 @@ async def input_sanitization_middleware(request: Request, call_next: Callable):
                 content={"detail": "Request contains disallowed content"},
             )
     
-    # Check body for JSON and form data
+    # Check body for all text-based content types
     if request.method in ["POST", "PUT", "PATCH"]:
         content_type = request.headers.get("content-type", "")
-        if "application/json" in content_type or "application/x-www-form-urlencoded" in content_type:
+        if _is_text_content_type(content_type):
             try:
                 body = await request.body()
                 if body:
@@ -134,7 +150,8 @@ async def input_sanitization_middleware(request: Request, call_next: Callable):
                                     content={"detail": "Request contains disallowed content"},
                                 )
                     else:
-                        # For form data, scan the raw string
+                        # For form data, multipart, plain text, and other text types,
+                        # scan the raw decoded string.
                         if _contains_dangerous_pattern(body_str):
                             return JSONResponse(
                                 status_code=400,
@@ -296,7 +313,7 @@ async def github_callback_html():
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <title>ShipMate AI – GitHub Auth</title>
+  <title>ShipMate AI \u2013 GitHub Auth</title>
   <style>
     *{margin:0;padding:0;box-sizing:border-box}
     body{font-family:system-ui,sans-serif;background:#0f172a;display:flex;align-items:center;
@@ -315,7 +332,7 @@ async def github_callback_html():
 <body>
   <div class="box">
     <div class="spinner"></div>
-    <h1>Completing GitHub authorization…</h1>
+    <h1>Completing GitHub authorization\u2026</h1>
     <p>This window will close automatically.</p>
     <div id="err"></div>
   </div>
