@@ -1,56 +1,96 @@
-from app.schemas.agent_schemas import AgentName
+from datetime import datetime, timezone
+from typing import Any, Dict
+
+from ..agents.repo_lens_agent import RepoLensAgent
+from ..agents.plan_forge_agent import PlanForgeAgent
+from ..agents.guardrail_agent import GuardRailAgent
+from ..agents.testpilot_agent import TestPilotAgent
+from ..services.scoring_service import ScoringService
+from ..services.report_service import ReportService
+from ..schemas.agent_schemas import (
+    AgentOutputs, ShipMateReport, RepoInfo, ShipRecommendation
+)
 
 
 class ShipMateOrchestrator:
-    """Orchestrates execution of multiple agents in sequence."""
+    """
+    Runs the 4-agent pipeline and assembles the final ShipMateReport.
+
+    Execution order:
+      1. RepoLens  — repo structure, tech stack, architecture risks (context builder)
+      2. PlanForge, GuardRail, TestPilot  — run with enriched context (parallel-safe)
+      3. ScoringService  — deterministic weighted score
+      4. ReportService   — final report assembly
+    """
 
     def __init__(self):
-        """Initialize the orchestrator with available agents."""
-        self.agents = {
-            AgentName.REPO_LENS: self._execute_repo_lens,
-            AgentName.PLAN_FORGE: self._execute_plan_forge,
-            AgentName.GUARDRAIL: self._execute_guardrail,
-            AgentName.TESTPILOT: self._execute_testpilot,
-        }
+        self.repo_lens = RepoLensAgent()
+        self.plan_forge = PlanForgeAgent()
+        self.guardrail = GuardRailAgent()
+        self.testpilot = TestPilotAgent()
 
-    async def execute_all(self, repo_url: str, branch: str = "main") -> dict:
-        """Execute all agents and aggregate results."""
-        results = {}
-        for agent_name in AgentName:
-            try:
-                results[agent_name.value] = await self.agents[agent_name](
-                    repo_url, branch
-                )
-            except Exception as e:
-                results[agent_name.value] = {"error": str(e)}
-        return results
+    def run(self, repo_context: Dict[str, Any]) -> ShipMateReport:
+        """
+        Args:
+            repo_context: dict with keys:
+                - repo_info: dict (from GitHub API)
+                - file_tree: List[str]
+                - key_files: Dict[str, str]
+                - branch: str
+                - feature_context: str (optional)
+                - pr_info: dict (optional)
+        Returns:
+            ShipMateReport
+        """
+        # ── Step 1: RepoLens (must run first — other agents need its output) ──
+        repo_lens_out = self.repo_lens.run(repo_context)
 
-    async def execute_agent(self, agent_name: str, repo_url: str, branch: str = "main") -> dict:
-        """Execute a specific agent by name."""
-        try:
-            agent_enum = AgentName(agent_name)
-        except ValueError:
-            raise ValueError(
-                f"Unknown agent: {agent_name}. Valid agents: {', '.join([a.value for a in AgentName])}"
-            )
-        return await self.agents[agent_enum](repo_url, branch)
+        # Enrich context with RepoLens output
+        enriched = {**repo_context, "repo_lens": repo_lens_out}
 
-    async def _execute_repo_lens(self, repo_url: str, branch: str) -> dict:
-        """Execute RepoLens agent."""
-        # Implementation placeholder
-        return {"agent": AgentName.REPO_LENS.value, "status": "completed"}
+        # ── Step 2: Run remaining agents (all consume enriched context) ──
+        plan_forge_out = self.plan_forge.run(enriched)
+        guardrail_out = self.guardrail.run(enriched)
+        testpilot_out = self.testpilot.run(enriched)
 
-    async def _execute_plan_forge(self, repo_url: str, branch: str) -> dict:
-        """Execute PlanForge agent."""
-        # Implementation placeholder
-        return {"agent": AgentName.PLAN_FORGE.value, "status": "completed"}
+        # ── Step 3: Score ──
+        score_breakdown = ScoringService.calculate(
+            repo_lens_out, plan_forge_out, guardrail_out, testpilot_out
+        )
+        final_score = score_breakdown["final_score"]
+        recommendation = ScoringService.recommendation(final_score)
 
-    async def _execute_guardrail(self, repo_url: str, branch: str) -> dict:
-        """Execute GuardRail agent."""
-        # Implementation placeholder
-        return {"agent": AgentName.GUARDRAIL.value, "status": "completed"}
+        # ── Step 4: Assemble report ──
+        info = repo_context.get("repo_info", {})
+        branch = repo_context.get("branch", "main")
 
-    async def _execute_testpilot(self, repo_url: str, branch: str) -> dict:
-        """Execute TestPilot agent."""
-        # Implementation placeholder
-        return {"agent": AgentName.TESTPILOT.value, "status": "completed"}
+        repo_info = RepoInfo(
+            owner=info.get("owner", {}).get("login", "") if isinstance(info.get("owner"), dict) else info.get("owner", ""),
+            name=info.get("name", ""),
+            full_name=info.get("full_name", ""),
+            branch=branch,
+            description=info.get("description"),
+            language=info.get("language"),
+            stars=info.get("stargazers_count", 0),
+            file_count=repo_lens_out.file_count,
+            html_url=info.get("html_url", ""),
+        )
+
+        key_blockers = ReportService.extract_blockers(plan_forge_out, guardrail_out)
+        next_actions = ReportService.extract_next_actions(plan_forge_out, guardrail_out, testpilot_out)
+
+        return ShipMateReport(
+            repo=repo_info,
+            readiness_score=final_score,
+            ship_recommendation=recommendation,
+            score_breakdown=score_breakdown["breakdown"],
+            agents=AgentOutputs(
+                repo_lens=repo_lens_out,
+                plan_forge=plan_forge_out,
+                guardrail=guardrail_out,
+                testpilot=testpilot_out,
+            ),
+            key_blockers=key_blockers,
+            next_actions=next_actions,
+            generated_at=datetime.now(timezone.utc).isoformat(),
+        )
