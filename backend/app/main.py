@@ -11,7 +11,6 @@ import uvicorn
 
 from app.api.routes.auth import router as auth_router
 from app.api.routes.analysis import router as analysis_router
-from app.db.database import init_db
 
 # ---------------------------------------------------------------------------
 # CORS origin allowlist
@@ -124,12 +123,6 @@ app.include_router(auth_router, prefix="/api")
 app.include_router(analysis_router, prefix="/api")
 
 
-@app.on_event("startup")
-async def startup_event():
-    """Initialize database on application startup."""
-    init_db()
-
-
 @app.get("/")
 async def root():
     return {
@@ -152,7 +145,7 @@ async def github_callback_html():
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <title>ShipMate AI – GitHub Auth</title>
+  <title>ShipMate AI \u2013 GitHub Auth</title>
   <style>
     *{margin:0;padding:0;box-sizing:border-box}
     body{font-family:system-ui,sans-serif;background:#0f172a;display:flex;align-items:center;
@@ -171,7 +164,7 @@ async def github_callback_html():
 <body>
   <div class="box">
     <div class="spinner"></div>
-    <h1>Completing GitHub authorization…</h1>
+    <h1>Completing GitHub authorization\u2026</h1>
     <p>This window will close automatically.</p>
     <div id="err"></div>
   </div>
