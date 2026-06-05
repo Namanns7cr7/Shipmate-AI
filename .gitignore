@@ -17,9 +17,8 @@ dist/
 downloads/
 eggs/
 .eggs/
-# Anchored to repo root so we don't shadow `frontend/src/lib/`.
-/lib/
-/lib64/
+lib/
+lib64/
 parts/
 sdist/
 var/

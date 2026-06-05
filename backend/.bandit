@@ -1,3 +1,0 @@
-[bandit]
-tests = B302,B307,B102,B103,B322
-skips =
