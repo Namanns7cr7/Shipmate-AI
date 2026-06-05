@@ -1,12 +1,11 @@
 # Byte-compiled / optimized / DLL files
 __pycache__/
-**/__pycache__/
 *.py[cod]
 *$py.class
-*.pyc
-**/*.pyc
+*.so
 
 # C extensions
+*.c
 *.so
 
 # Distribution / packaging
@@ -127,8 +126,6 @@ dmypy.json
 
 # Node modules
 node_modules/
-.npm
-.eslintcache
 
 # IDE
 .vscode/
@@ -141,4 +138,8 @@ node_modules/
 # Build outputs
 dist/
 build/
-*.tsbuildinfo
+*.egg-info/
+
+# Environment
+.env.local
+.env.*.local

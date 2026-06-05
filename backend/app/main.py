@@ -5,6 +5,8 @@ import os
 import re
 import json
 import time
+import hmac
+import hashlib
 from io import BytesIO
 from typing import Callable, Any
 from urllib.parse import urlparse
@@ -98,6 +100,9 @@ _auth_limiter = _RateLimiter(capacity=2, refill_rate=10.0 / 60.0)
 # Analysis endpoint: 30 requests per minute per IP (burst of 5)
 _analysis_limiter = _RateLimiter(capacity=5, refill_rate=30.0 / 60.0)
 
+# Webhook endpoint: 60 requests per minute per IP (burst of 10)
+_webhook_limiter = _RateLimiter(capacity=10, refill_rate=60.0 / 60.0)
+
 
 def _get_client_ip(request: Request) -> str:
     """Extract client IP from request, accounting for proxies.
@@ -134,6 +139,18 @@ async def rate_limit_analysis_middleware(request: Request, call_next: Callable):
             return JSONResponse(
                 status_code=429,
                 content={"detail": "Rate limit exceeded. Too many analysis requests."},
+            )
+    return await call_next(request)
+
+
+async def rate_limit_webhook_middleware(request: Request, call_next: Callable):
+    """Rate limit the /webhooks/github endpoint."""
+    if request.url.path == "/webhooks/github":
+        client_ip = _get_client_ip(request)
+        if not _webhook_limiter.is_allowed(client_ip):
+            return JSONResponse(
+                status_code=429,
+                content={"detail": "Rate limit exceeded. Too many webhook requests."},
             )
     return await call_next(request)
 
@@ -428,6 +445,33 @@ async def strict_cors_middleware(request: Request, call_next: Callable):
     return response
 
 
+# ---------------------------------------------------------------------------
+# GitHub Webhook Signature Validation
+# ---------------------------------------------------------------------------
+
+def _verify_github_webhook_signature(payload_bytes: bytes, signature: str) -> bool:
+    """Verify GitHub webhook signature using HMAC-SHA256.
+    
+    Args:
+        payload_bytes: Raw request body bytes.
+        signature: X-Hub-Signature-256 header value (format: sha256=<hex>).
+    
+    Returns:
+        True if signature is valid, False otherwise.
+    """
+    secret = os.getenv("GITHUB_WEBHOOK_SECRET", "").encode()
+    if not secret:
+        return False
+    
+    expected_signature = "sha256=" + hmac.new(
+        secret,
+        payload_bytes,
+        hashlib.sha256
+    ).hexdigest()
+    
+    return hmac.compare_digest(signature, expected_signature)
+
+
 app = FastAPI(
     title="ShipMate AI",
     description="AI-native multi-agent release readiness platform",
@@ -450,6 +494,7 @@ app.add_middleware(
 
 app.middleware("http")(rate_limit_auth_middleware)
 app.middleware("http")(rate_limit_analysis_middleware)
+app.middleware("http")(rate_limit_webhook_middleware)
 app.middleware("http")(strict_cors_middleware)
 app.middleware("http")(input_sanitization_middleware)
 
@@ -474,6 +519,96 @@ async def root():
 @app.get("/health")
 async def health():
     return {"status": "healthy", "agents": 4}
+
+
+@app.post("/webhooks/github")
+async def github_webhook(request: Request):
+    """Handle GitHub webhook events for push and pull_request.
+    
+    Validates webhook signature, extracts repository and branch info,
+    and triggers automatic analysis.
+    """
+    # Get raw body for signature verification
+    body_bytes = await request.body()
+    
+    # Verify webhook signature
+    signature = request.headers.get("x-hub-signature-256", "")
+    if not _verify_github_webhook_signature(body_bytes, signature):
+        return JSONResponse(
+            status_code=401,
+            content={"detail": "Invalid webhook signature"},
+        )
+    
+    # Parse payload
+    try:
+        payload = json.loads(body_bytes.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return JSONResponse(
+            status_code=400,
+            content={"detail": "Invalid JSON payload"},
+        )
+    
+    event_type = request.headers.get("x-github-event", "")
+    
+    # Handle push and pull_request events
+    if event_type == "push":
+        repo_name = payload.get("repository", {}).get("full_name")
+        branch = payload.get("ref", "").split("/")[-1]  # Extract branch from refs/heads/branch
+        
+        if not repo_name or not branch:
+            return JSONResponse(
+                status_code=400,
+                content={"detail": "Missing repository or branch info"},
+            )
+        
+        return JSONResponse(
+            status_code=202,
+            content={
+                "status": "accepted",
+                "message": f"Analysis queued for {repo_name}:{branch}",
+                "event": "push",
+            },
+        )
+    
+    elif event_type == "pull_request":
+        repo_name = payload.get("repository", {}).get("full_name")
+        pr_number = payload.get("pull_request", {}).get("number")
+        action = payload.get("action")
+        
+        if not repo_name or not pr_number:
+            return JSONResponse(
+                status_code=400,
+                content={"detail": "Missing repository or PR info"},
+            )
+        
+        # Only trigger on opened, synchronize, and reopened actions
+        if action not in ["opened", "synchronize", "reopened"]:
+            return JSONResponse(
+                status_code=202,
+                content={
+                    "status": "ignored",
+                    "message": f"PR action '{action}' does not trigger analysis",
+                    "event": "pull_request",
+                },
+            )
+        
+        return JSONResponse(
+            status_code=202,
+            content={
+                "status": "accepted",
+                "message": f"Analysis queued for {repo_name} PR #{pr_number}",
+                "event": "pull_request",
+            },
+        )
+    
+    else:
+        return JSONResponse(
+            status_code=202,
+            content={
+                "status": "ignored",
+                "message": f"Event type '{event_type}' is not processed",
+            },
+        )
 
 
 @app.get("/github-callback.html", response_class=HTMLResponse)
