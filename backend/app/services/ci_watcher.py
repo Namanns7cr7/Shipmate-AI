@@ -1,0 +1,441 @@
+"""
+CIWatcher — closed-loop CI feedback for Coder-opened PRs.
+
+Flow per registered PR:
+  1. Wait for CI to land at HEAD of the PR's branch (poll every 30s, then
+     backoff if it lingers).
+  2. If all checks pass → drop the registry entry, done.
+  3. If any check failed → fetch logs, build a CoderBrief carrying the
+     failure context + the original finding + the current file contents
+     of the failing-area, ask Coder for a corrective patch, commit it
+     to the SAME branch (pushes auto-trigger CI again).
+  4. Loop. Cap at 3 attempts, hard 45min wall-clock per PR. Bail early on
+     identical-patch hash (Coder is hallucinating in a loop).
+  5. On cap exhaustion → post a PR comment escalating to a human.
+
+In-memory registry only — fine for hackathon. Production: persist to
+SQLite (Guardian pulls that in next).
+
+Supervisor runs as an asyncio.Task, so /api/actuate latency is unchanged
+(the orchestrator returns immediately after register()).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import logging
+import time
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple
+
+from app.agents.coder_agent import CoderAgent, CoderBrief, CoderOutput
+from app.schemas.api_schemas import FindingPayload, RepoLensSummary
+from app.services.github_actions_service import (
+    CheckRunStatus, GitHubActionsService,
+)
+from app.services.github_api_service import GitHubAPIService
+from app.services.github_pr_service import GitHubPRService
+
+logger = logging.getLogger("shipmate.ci_watcher")
+
+# ── Tunables ────────────────────────────────────────────────────────────────
+MAX_ATTEMPTS = 3
+TOTAL_WALL_CLOCK_LIMIT_S = 45 * 60          # bail after 45min regardless
+INITIAL_POLL_INTERVAL_S = 30
+MAX_POLL_INTERVAL_S = 300
+POLL_BACKOFF_AFTER_N = 10                   # # of polls before linear backoff
+ATTEMPT_BACKOFF_S = (0, 60, 180)            # gap between fix attempts
+
+
+@dataclass
+class WatchEntry:
+    owner: str
+    repo: str
+    pr_number: int
+    branch: str
+    base_branch: str
+    access_token: str
+    finding: FindingPayload
+    repo_lens: Optional[RepoLensSummary]
+    started_at: float = field(default_factory=time.monotonic)
+    attempts: int = 0
+    history: List[Dict[str, Any]] = field(default_factory=list)
+    last_patch_hash: Optional[str] = None
+    status: str = "watching"  # watching | fixing | passed | gave_up | crashed
+    last_error: Optional[str] = None
+    last_event_at: float = field(default_factory=time.monotonic)
+    pr_url: Optional[str] = None
+
+    def key(self) -> Tuple[str, str, int]:
+        return (self.owner, self.repo, self.pr_number)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "owner": self.owner,
+            "repo": self.repo,
+            "pr_number": self.pr_number,
+            "pr_url": self.pr_url,
+            "branch": self.branch,
+            "status": self.status,
+            "attempts": self.attempts,
+            "max_attempts": MAX_ATTEMPTS,
+            "history": self.history,
+            "last_error": self.last_error,
+            "started_ago_s": int(time.monotonic() - self.started_at),
+            "last_event_ago_s": int(time.monotonic() - self.last_event_at),
+            "finding_id": self.finding.id,
+            "finding_title": self.finding.title,
+        }
+
+
+class CIWatcher:
+    """Singleton manager — keyed by (owner, repo, pr_number)."""
+
+    _registry: Dict[Tuple[str, str, int], WatchEntry] = {}
+    _tasks: Dict[Tuple[str, str, int], asyncio.Task] = {}
+
+    # ── Public API ──────────────────────────────────────────────────────
+
+    @classmethod
+    def register(
+        cls,
+        *,
+        owner: str,
+        repo: str,
+        pr_number: int,
+        pr_url: str,
+        branch: str,
+        base_branch: str,
+        access_token: str,
+        finding: FindingPayload,
+        repo_lens: Optional[RepoLensSummary],
+    ) -> None:
+        """
+        Register a freshly-opened PR for CI watching. Spawns a background
+        task that owns its lifecycle. Idempotent — calling twice cancels
+        the prior task and starts fresh.
+        """
+        entry = WatchEntry(
+            owner=owner, repo=repo, pr_number=pr_number, branch=branch,
+            base_branch=base_branch, access_token=access_token,
+            finding=finding, repo_lens=repo_lens, pr_url=pr_url,
+        )
+        key = entry.key()
+        # Cancel prior watcher for the same PR if present.
+        if key in cls._tasks:
+            cls._tasks[key].cancel()
+        cls._registry[key] = entry
+        # Bind the asyncio task so it stays alive even after register() returns.
+        cls._tasks[key] = asyncio.create_task(
+            cls._supervise(entry), name=f"ci-watch-{owner}-{repo}-{pr_number}",
+        )
+        logger.info(
+            "CIWatcher.register: %s/%s#%s on branch %s (finding=%s)",
+            owner, repo, pr_number, branch, finding.id,
+        )
+
+    @classmethod
+    def list_active(cls) -> List[Dict[str, Any]]:
+        return [e.to_dict() for e in cls._registry.values()]
+
+    @classmethod
+    def get(cls, owner: str, repo: str, pr_number: int) -> Optional[Dict[str, Any]]:
+        e = cls._registry.get((owner, repo, pr_number))
+        return e.to_dict() if e else None
+
+    @classmethod
+    def stop(cls, owner: str, repo: str, pr_number: int) -> bool:
+        key = (owner, repo, pr_number)
+        task = cls._tasks.pop(key, None)
+        cls._registry.pop(key, None)
+        if task and not task.done():
+            task.cancel()
+            return True
+        return False
+
+    # ── Supervisor loop ─────────────────────────────────────────────────
+
+    @classmethod
+    async def _supervise(cls, entry: WatchEntry) -> None:
+        """Owns the watcher lifecycle — runs until terminal state."""
+        try:
+            while True:
+                # Hard wall-clock guard.
+                if time.monotonic() - entry.started_at > TOTAL_WALL_CLOCK_LIMIT_S:
+                    logger.warning(
+                        "CIWatcher: %s/%s#%s exceeded %ds wall-clock; giving up",
+                        entry.owner, entry.repo, entry.pr_number, TOTAL_WALL_CLOCK_LIMIT_S,
+                    )
+                    entry.status = "gave_up"
+                    entry.last_error = "wall-clock limit reached"
+                    await cls._escalate(entry, reason="wall-clock limit reached (45min)")
+                    return
+
+                # Wait for CI to land.
+                status = await cls._await_ci(entry)
+                if status is None:
+                    # Watcher cancelled or fatal error — _await_ci logged it.
+                    return
+
+                # No checks at all? Repo has no CI. Drop quietly.
+                if status.is_empty:
+                    logger.info(
+                        "CIWatcher: %s/%s#%s has no check-runs (no CI configured); dropping",
+                        entry.owner, entry.repo, entry.pr_number,
+                    )
+                    entry.status = "passed"  # nothing to fail
+                    cls._touch(entry, "no-ci")
+                    return
+
+                if status.all_passed:
+                    logger.info(
+                        "CIWatcher: %s/%s#%s CI passed after %d attempt(s); done",
+                        entry.owner, entry.repo, entry.pr_number, entry.attempts,
+                    )
+                    entry.status = "passed"
+                    cls._touch(entry, "passed")
+                    if entry.attempts > 0:
+                        await GitHubActionsService.post_pr_comment(
+                            entry.access_token, entry.owner, entry.repo, entry.pr_number,
+                            f"✅ ShipMate auto-fixed CI in {entry.attempts} attempt(s).",
+                        )
+                    return
+
+                # CI failed. Try a fix?
+                if entry.attempts >= MAX_ATTEMPTS:
+                    logger.warning(
+                        "CIWatcher: %s/%s#%s exhausted %d attempts; escalating",
+                        entry.owner, entry.repo, entry.pr_number, MAX_ATTEMPTS,
+                    )
+                    entry.status = "gave_up"
+                    entry.last_error = "max attempts exhausted"
+                    await cls._escalate(entry, reason=f"exhausted {MAX_ATTEMPTS} auto-fix attempts")
+                    return
+
+                # Backoff before this attempt.
+                gap = ATTEMPT_BACKOFF_S[min(entry.attempts, len(ATTEMPT_BACKOFF_S) - 1)]
+                if gap > 0:
+                    await asyncio.sleep(gap)
+
+                ok = await cls._attempt_fix(entry, status)
+                if not ok:
+                    # Fix step crashed (Bedrock failure, GitHub write rejected,
+                    # identical patch). _attempt_fix logged + updated entry.
+                    return
+                # Fix committed; loop back to await_ci on the new SHA.
+
+        except asyncio.CancelledError:
+            logger.info("CIWatcher: %s/%s#%s cancelled", entry.owner, entry.repo, entry.pr_number)
+            raise
+        except Exception as e:
+            logger.exception("CIWatcher: %s/%s#%s supervisor crashed: %s",
+                             entry.owner, entry.repo, entry.pr_number, e)
+            entry.status = "crashed"
+            entry.last_error = str(e)
+        finally:
+            # Always remove the task ref; entry stays for status queries.
+            cls._tasks.pop(entry.key(), None)
+
+    @classmethod
+    async def _await_ci(cls, entry: WatchEntry) -> Optional[CheckRunStatus]:
+        """Poll until all check-runs are completed. None on cancel/fatal."""
+        polls = 0
+        while True:
+            try:
+                head_sha = await GitHubActionsService.get_branch_head_sha(
+                    entry.access_token, entry.owner, entry.repo, entry.branch,
+                )
+                status = await GitHubActionsService.list_check_runs(
+                    entry.access_token, entry.owner, entry.repo, head_sha,
+                )
+            except Exception as e:
+                # OAuth expired / repo deleted / network. Bail loudly.
+                logger.warning(
+                    "CIWatcher: %s/%s#%s GitHub poll failed: %s",
+                    entry.owner, entry.repo, entry.pr_number, e,
+                )
+                entry.status = "crashed"
+                entry.last_error = f"github poll: {e}"
+                return None
+
+            polls += 1
+            cls._touch(entry, f"poll[{polls}] runs={len(status.runs)} completed={status.all_completed}")
+
+            if status.is_empty and polls >= 6:
+                # 3 minutes of empty checks — repo has no CI at all.
+                return status
+            if status.all_completed:
+                return status
+
+            # Wall-clock check inside the wait loop too.
+            if time.monotonic() - entry.started_at > TOTAL_WALL_CLOCK_LIMIT_S:
+                return status  # let _supervise handle the gave-up path
+
+            interval = INITIAL_POLL_INTERVAL_S
+            if polls > POLL_BACKOFF_AFTER_N:
+                # Linear ramp: 30s -> 60s -> 90s ... capped at MAX_POLL_INTERVAL_S
+                interval = min(MAX_POLL_INTERVAL_S, INITIAL_POLL_INTERVAL_S + 30 * (polls - POLL_BACKOFF_AFTER_N))
+            await asyncio.sleep(interval)
+
+    @classmethod
+    async def _attempt_fix(cls, entry: WatchEntry, status: CheckRunStatus) -> bool:
+        """
+        Pull failure logs, ask Coder for a fix, commit it to the branch.
+        Returns True if a fix was committed (loop should continue), False
+        if we should stop (identical patch / Bedrock failure / commit failed).
+        """
+        entry.status = "fixing"
+        entry.attempts += 1
+        attempt_idx = entry.attempts
+        cls._touch(entry, f"attempt[{attempt_idx}] starting")
+
+        # Fetch failure logs.
+        try:
+            failure_blob = await GitHubActionsService.collect_failure_context(
+                entry.access_token, entry.owner, entry.repo, status,
+            )
+        except Exception as e:
+            logger.warning("CIWatcher: failure-log fetch failed: %s", e)
+            entry.last_error = f"log fetch: {e}"
+            await cls._escalate(entry, reason=f"could not fetch CI logs: {e}")
+            entry.status = "gave_up"
+            return False
+
+        # Ask Coder to diagnose + patch.
+        try:
+            coder_out = await asyncio.to_thread(
+                cls._invoke_coder, entry, failure_blob,
+            )
+        except Exception as e:
+            logger.warning("CIWatcher: Coder failed during fix attempt: %s", e)
+            entry.last_error = f"coder: {e}"
+            await cls._escalate(entry, reason=f"Coder agent failed: {e}")
+            entry.status = "gave_up"
+            return False
+
+        if not coder_out.files:
+            logger.info("CIWatcher: Coder returned no files; nothing to commit")
+            entry.last_error = "Coder produced no patch"
+            await cls._escalate(
+                entry,
+                reason="Coder agent saw the failure but had no patch to offer.",
+            )
+            entry.status = "gave_up"
+            return False
+
+        # Identical-patch bailout.
+        patch_hash = cls._hash_files(coder_out.files)
+        if patch_hash == entry.last_patch_hash:
+            logger.warning("CIWatcher: identical patch hash %s — Coder is looping; bailing",
+                           patch_hash[:10])
+            entry.last_error = "Coder produced identical patch twice"
+            await cls._escalate(
+                entry,
+                reason="Auto-fix loop detected — Coder produced the same patch twice. Manual review needed.",
+            )
+            entry.status = "gave_up"
+            return False
+        entry.last_patch_hash = patch_hash
+
+        # Commit each file to the existing branch.
+        try:
+            for cf in coder_out.files:
+                existing_sha = await GitHubPRService.get_file_sha(
+                    entry.access_token, entry.owner, entry.repo, cf.path, entry.branch,
+                )
+                await GitHubPRService.put_file(
+                    entry.access_token, entry.owner, entry.repo,
+                    cf.path, cf.new_content,
+                    f"shipmate(ci-fix): attempt {attempt_idx} — {cf.path}",
+                    entry.branch, sha=existing_sha,
+                )
+        except Exception as e:
+            logger.warning("CIWatcher: commit failed: %s", e)
+            entry.last_error = f"commit: {e}"
+            await cls._escalate(entry, reason=f"commit failed: {e}")
+            entry.status = "gave_up"
+            return False
+
+        entry.history.append({
+            "attempt": attempt_idx,
+            "files_changed": [cf.path for cf in coder_out.files],
+            "summary": coder_out.summary,
+            "patch_hash": patch_hash[:10],
+        })
+        cls._touch(entry, f"attempt[{attempt_idx}] committed {len(coder_out.files)} file(s)")
+        return True
+
+    # ── Helpers ─────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _invoke_coder(entry: WatchEntry, failure_blob: str) -> CoderOutput:
+        """Synchronous Coder invocation (runs on worker thread)."""
+        # We DON'T re-fetch every file in the repo — that's expensive. We
+        # let Coder reason from the failure logs + the original finding's
+        # context. Coder's prompt already says "produce full new file
+        # content"; in CI-fix mode we pass the failure blob as the dominant
+        # piece of context.
+        target_files = {
+            "ci_failure.log": failure_blob,
+        }
+        ctx = entry.repo_lens or RepoLensSummary()
+        brief = CoderBrief(
+            task=(
+                f"The previous patch you generated was committed and CI failed. "
+                f"Read the FAILING CI LOGS in `target_files['ci_failure.log']` and "
+                f"produce a corrective patch. The originating finding was: "
+                f"{entry.finding.title}. "
+                f"Description: {entry.finding.description}. "
+                f"Apply the SMALLEST possible fix that makes CI green. "
+                f"Don't refactor unrelated code. If the failure is in a config "
+                f"file (linter, requirements, workflow yaml), fix it there. "
+                f"If the failure is in your test or source code, fix that. "
+                f"This is attempt #{entry.attempts} of {MAX_ATTEMPTS}."
+            ),
+            repo_full_name=f"{entry.owner}/{entry.repo}",
+            primary_language=ctx.primary_language,
+            tech_stack=ctx.tech_stack,
+            entry_points=ctx.entry_points,
+            target_files=target_files,
+            finding_kind="ci_failure",
+            finding_id=f"{entry.finding.id}-fix-{entry.attempts}",
+            finding_severity="high",
+        )
+        return CoderAgent().run(brief, deployment_hint="smart")
+
+    @staticmethod
+    def _hash_files(files: List[Any]) -> str:
+        """Deterministic hash of (path, content) tuples for loop detection."""
+        h = hashlib.sha256()
+        for cf in sorted(files, key=lambda f: f.path):
+            h.update(cf.path.encode())
+            h.update(b"\0")
+            h.update((cf.new_content or "").encode())
+            h.update(b"\0")
+        return h.hexdigest()
+
+    @staticmethod
+    def _touch(entry: WatchEntry, msg: str) -> None:
+        entry.last_event_at = time.monotonic()
+        logger.info(
+            "CIWatcher[%s/%s#%s]: %s",
+            entry.owner, entry.repo, entry.pr_number, msg,
+        )
+
+    @staticmethod
+    async def _escalate(entry: WatchEntry, reason: str) -> None:
+        """Post a PR comment when watcher gives up. Best-effort — don't raise."""
+        body = (
+            f"⚠️ **ShipMate AI auto-fix exhausted.**\n\n"
+            f"**Reason:** {reason}\n"
+            f"**Attempts:** {entry.attempts} / {MAX_ATTEMPTS}\n"
+            f"**Originating finding:** `{entry.finding.kind}` / `{entry.finding.id}` — {entry.finding.title}\n\n"
+            f"Manual review recommended. The branch has each attempt as a separate commit so you can `git revert` if needed."
+        )
+        try:
+            await GitHubActionsService.post_pr_comment(
+                entry.access_token, entry.owner, entry.repo, entry.pr_number, body,
+            )
+        except Exception as e:
+            logger.warning("CIWatcher: escalation comment failed: %s", e)

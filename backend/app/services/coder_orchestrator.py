@@ -323,8 +323,9 @@ class CoderOrchestrator:
 
         # 6. Open PR (optional).
         pr_url: Optional[str] = None
+        pr_number: Optional[int] = None
         if req.open_pr:
-            pr_url = await GitHubPRService.create_pull_request(
+            pr_url, pr_number = await GitHubPRService.create_pull_request(
                 req.access_token,
                 req.owner,
                 req.repo,
@@ -333,6 +334,27 @@ class CoderOrchestrator:
                 head=branch_name,
                 base=req.branch,
             )
+
+            # 7. Register the PR with CIWatcher so we can self-heal CI failures.
+            #    Lazy import keeps the orchestrator import-light and avoids
+            #    a cycle (ci_watcher imports coder_agent).
+            try:
+                from app.services.ci_watcher import CIWatcher
+                CIWatcher.register(
+                    owner=req.owner,
+                    repo=req.repo,
+                    pr_number=pr_number,
+                    pr_url=pr_url,
+                    branch=branch_name,
+                    base_branch=req.branch,
+                    access_token=req.access_token,
+                    finding=req.finding,
+                    repo_lens=ctx,
+                )
+            except Exception as e:
+                # Watcher registration is best-effort — don't fail the actuate
+                # call if the watcher couldn't start.
+                logger.warning("CIWatcher.register failed: %s — PR opened without auto-fix", e)
 
         return ActuateResponse(
             status="complete",

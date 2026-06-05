@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import base64
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import httpx
 
@@ -149,8 +149,8 @@ class GitHubPRService:
         body: str,
         head: str,
         base: str,
-    ) -> str:
-        """Open a PR. Returns the html_url."""
+    ) -> Tuple[str, int]:
+        """Open a PR. Returns (html_url, number)."""
         async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
             resp = await client.post(
                 f"{_BASE}/repos/{owner}/{repo}/pulls",
@@ -167,10 +167,11 @@ class GitHubPRService:
                 await _raise_with_body(resp, "create_pull_request")
             data = resp.json()
             url = data.get("html_url")
-            if not url:
-                raise RuntimeError("GitHub PR creation returned no html_url")
-            logger.info("Opened PR %s -> %s on %s/%s", head, base, owner, repo)
-            return url
+            number = data.get("number")
+            if not url or not number:
+                raise RuntimeError("GitHub PR creation returned no html_url/number")
+            logger.info("Opened PR #%s %s -> %s on %s/%s", number, head, base, owner, repo)
+            return url, number
 
     @staticmethod
     async def get_default_branch(token: str, owner: str, repo: str) -> str:
