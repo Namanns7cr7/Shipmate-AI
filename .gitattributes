@@ -1,7 +1,0 @@
-# Ensure consistent line endings
-* text=auto
-
-# Explicitly exclude compiled Python bytecode from exports and diffs
-**/__pycache__/ export-ignore
-*.pyc export-ignore
-*.pyo export-ignore
