@@ -2,8 +2,9 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import os
+import re
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 import uvicorn
@@ -27,6 +28,32 @@ ALLOWED_ORIGINS: list[str] = [
     origin.strip() for origin in _raw_origins.split(",") if origin.strip()
 ]
 
+# ---------------------------------------------------------------------------
+# Input sanitization — block code injection patterns in query params / headers
+# / request body before they reach any route handler.
+# ---------------------------------------------------------------------------
+_DANGEROUS_PATTERNS: list[re.Pattern] = [
+    re.compile(r"eval\s*\(",            re.IGNORECASE),
+    re.compile(r"exec\s*\(",            re.IGNORECASE),
+    re.compile(r"__import__\s*\(",      re.IGNORECASE),
+    re.compile(r"__builtins__",         re.IGNORECASE),
+    re.compile(r"__globals__",          re.IGNORECASE),
+    re.compile(r"__locals__",           re.IGNORECASE),
+    re.compile(r"compile\s*\(",         re.IGNORECASE),
+    re.compile(r"importlib\.import_module", re.IGNORECASE),
+    re.compile(r"subprocess\.",         re.IGNORECASE),
+    re.compile(r"os\.system\s*\(",      re.IGNORECASE),
+    re.compile(r"os\.popen\s*\(",       re.IGNORECASE),
+]
+
+_SKIP_HEADERS = {"authorization", "cookie"}
+
+
+def _contains_dangerous_pattern(text: str) -> bool:
+    """Return True if *text* matches any known code-injection pattern."""
+    return any(p.search(text) for p in _DANGEROUS_PATTERNS)
+
+
 app = FastAPI(
     title="ShipMate AI",
     description="AI-native multi-agent release readiness platform",
@@ -42,6 +69,55 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def sanitize_input_middleware(request: Request, call_next):
+    """Reject requests whose query params, headers, or body contain
+    code-injection patterns (eval, exec, subprocess, etc.)."""
+
+    # 1. Query parameters
+    for value in request.query_params.values():
+        if _contains_dangerous_pattern(value):
+            return JSONResponse(
+                status_code=400,
+                content={"detail": "Request contains disallowed content"},
+            )
+
+    # 2. Headers (skip Authorization and Cookie — they are trust-boundary values)
+    for key, value in request.headers.items():
+        if key.lower() in _SKIP_HEADERS:
+            continue
+        if _contains_dangerous_pattern(value):
+            return JSONResponse(
+                status_code=400,
+                content={"detail": "Request contains disallowed content"},
+            )
+
+    # 3. Request body (JSON and form-encoded only)
+    if request.method in ("POST", "PUT", "PATCH"):
+        content_type = request.headers.get("content-type", "")
+        if "application/json" in content_type or "application/x-www-form-urlencoded" in content_type:
+            try:
+                from urllib.parse import unquote_plus
+                body_bytes = await request.body()
+                raw_text = body_bytes.decode("utf-8", errors="ignore")
+                # URL-decode form bodies so percent-encoded patterns (exec%28…) are caught
+                body_text = unquote_plus(raw_text) if "form-urlencoded" in content_type else raw_text
+                if _contains_dangerous_pattern(body_text):
+                    return JSONResponse(
+                        status_code=400,
+                        content={"detail": "Request contains disallowed content"},
+                    )
+                # Re-inject body bytes so downstream handlers can read them
+                async def _receive():
+                    return {"type": "http.request", "body": body_bytes, "more_body": False}
+                request = Request(request.scope, receive=_receive)
+            except Exception:
+                pass  # Don't crash on body-read errors; let the route handle it
+
+    return await call_next(request)
+
 
 app.include_router(auth_router, prefix="/api")
 app.include_router(analysis_router, prefix="/api")
@@ -69,7 +145,7 @@ async def github_callback_html():
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <title>ShipMate AI \u2013 GitHub Auth</title>
+  <title>ShipMate AI – GitHub Auth</title>
   <style>
     *{margin:0;padding:0;box-sizing:border-box}
     body{font-family:system-ui,sans-serif;background:#0f172a;display:flex;align-items:center;
@@ -88,7 +164,7 @@ async def github_callback_html():
 <body>
   <div class="box">
     <div class="spinner"></div>
-    <h1>Completing GitHub authorization\u2026</h1>
+    <h1>Completing GitHub authorization…</h1>
     <p>This window will close automatically.</p>
     <div id="err"></div>
   </div>
