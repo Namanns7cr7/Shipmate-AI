@@ -128,25 +128,50 @@ def _slug(s: str, n: int = 40) -> str:
     return re.sub(r"[^a-zA-Z0-9]+", "-", (s or "").lower()).strip("-")[:n] or "x"
 
 
-def _pick_top_per_kind(report: Dict[str, Any], applied_ids: set) -> List[FindingPayload]:
+def _finding_signature(kind: str, title: str, file_hint: Optional[str]) -> str:
+    """Stable cross-round identifier. Heuristic agents regenerate ids each
+    run (e.g. always 'SEC-002') so id alone is too coarse — same id on
+    different repos. Title + file is more durable across analyses."""
+    return f"{kind}::{(title or '').strip().lower()[:80]}::{(file_hint or '').lower()}"
+
+
+def _pick_top_per_kind(
+    report: Dict[str, Any],
+    seen_signatures: set,
+    cooled_paths: set,
+) -> List[FindingPayload]:
     """Return ≤1 of each kind: guardrail, milestone, blocker, test.
-    Skips findings whose id is already in `applied_ids` — avoids re-actuating
-    the same fix across rounds."""
+
+    Skips:
+      - any finding whose (kind, title, file) signature was already attempted
+        in this loop run (prevents the same heuristic re-firing every round)
+      - any finding whose target_file is in `cooled_paths` — files modified
+        in an earlier round are likely to re-trigger their own heuristics
+        (false positives), so we sit on them for one round
+    """
     agents = report.get("agents", {})
     out: List[FindingPayload] = []
 
-    # GuardRail — sort by severity (critical > high > medium > low)
     SEV = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
-    findings = sorted(
+
+    def _eligible(kind: str, title: str, file_hint: Optional[str]) -> bool:
+        sig = _finding_signature(kind, title, file_hint)
+        if sig in seen_signatures:
+            return False
+        if file_hint and file_hint in cooled_paths:
+            return False
+        return True
+
+    # GuardRail
+    for f in sorted(
         agents.get("guardrail", {}).get("findings", []) or [],
         key=lambda f: -SEV.get((f.get("severity") or "").lower(), 0),
-    )
-    for f in findings:
-        fid = f.get("id") or ""
-        if fid in applied_ids:
+    ):
+        if not _eligible("guardrail", f.get("title") or "", f.get("file")):
             continue
         out.append(FindingPayload(
-            kind="guardrail", id=fid, title=f.get("title") or "",
+            kind="guardrail", id=f.get("id") or "",
+            title=f.get("title") or "",
             description=f.get("description") or "",
             recommendation=f.get("recommendation") or "",
             file=f.get("file"), severity=f.get("severity"),
@@ -154,33 +179,33 @@ def _pick_top_per_kind(report: Dict[str, Any], applied_ids: set) -> List[Finding
         ))
         break
 
-    # Blocker (plan-level) — highest severity first
-    blockers = sorted(
+    # Blocker
+    for b in sorted(
         agents.get("plan_forge", {}).get("blockers", []) or [],
         key=lambda b: -SEV.get((b.get("severity") or "").lower(), 0),
-    )
-    for b in blockers:
-        bid = b.get("id") or _slug(b.get("title") or "blocker")
-        if bid in applied_ids:
+    ):
+        if not _eligible("blocker", b.get("title") or "", None):
             continue
         out.append(FindingPayload(
-            kind="blocker", id=bid, title=b.get("title") or "",
+            kind="blocker",
+            id=b.get("id") or _slug(b.get("title") or "blocker"),
+            title=b.get("title") or "",
             description=b.get("description") or "",
             recommendation=b.get("resolution") or "",
             severity=b.get("severity"), category=b.get("category"),
         ))
         break
 
-    # Milestone (feature/tweak) — pick the first non-`testing` one
-    # (we already have a `test` slot below for that).
+    # Milestone (feature/tweak — non-testing)
     for m in agents.get("plan_forge", {}).get("milestones", []) or []:
-        mid = _slug(m.get("title") or "milestone")
-        if mid in applied_ids:
-            continue
         if (m.get("category") or "").lower() == "testing":
-            continue  # let the `test` slot cover this
+            continue
+        if not _eligible("milestone", m.get("title") or "", None):
+            continue
         out.append(FindingPayload(
-            kind="milestone", id=mid, title=m.get("title") or "",
+            kind="milestone",
+            id=_slug(m.get("title") or "milestone"),
+            title=m.get("title") or "",
             description=m.get("description") or "",
             recommendation="",
             severity=m.get("priority"), category=m.get("category"),
@@ -188,20 +213,20 @@ def _pick_top_per_kind(report: Dict[str, Any], applied_ids: set) -> List[Finding
         break
 
     # Test — highest priority, prefer ones with target_file
-    tests = agents.get("testpilot", {}).get("suggested_tests", []) or []
-    tests_sorted = sorted(
-        tests,
+    for t in sorted(
+        agents.get("testpilot", {}).get("suggested_tests", []) or [],
         key=lambda t: (
             0 if t.get("target_file") else 1,
-            {"high": 0, "medium": 1, "low": 2}.get((t.get("priority") or "").lower(), 3),
+            {"high": 0, "medium": 1, "low": 2}.get(
+                (t.get("priority") or "").lower(), 3),
         ),
-    )
-    for t in tests_sorted:
-        tid = t.get("name") or _slug(t.get("description") or "test")
-        if tid in applied_ids:
+    ):
+        if not _eligible("test", t.get("name") or "", t.get("target_file")):
             continue
         out.append(FindingPayload(
-            kind="test", id=tid, title=t.get("name") or "",
+            kind="test",
+            id=t.get("name") or _slug(t.get("description") or "test"),
+            title=t.get("name") or "",
             description=t.get("description") or "",
             recommendation="",
             file=t.get("target_file"), severity=t.get("priority"),
@@ -331,11 +356,19 @@ async def run_round(
     repo: str,
     branch: str,
     token: str,
-    applied_ids: set,
+    seen_signatures: set,
+    cooled_paths: set,
     out_path: Path,
     apply: bool,
 ) -> Tuple[int, int, int]:
-    """Returns (good_count, bad_count, applied_count)."""
+    """Returns (good_count, bad_count, applied_count).
+
+    `seen_signatures` accumulates (kind+title+file) of every attempted finding
+    across all rounds — prevents re-actuating the same surface finding even if
+    a heuristic regenerates it next round. `cooled_paths` accumulates files
+    we just modified — heuristics often re-fire on our own patches as false
+    positives, so we sit on those files for one round.
+    """
     print(f"\n{'='*60}\nROUND {round_num}\n{'='*60}")
 
     print(f"→ Fetching findings…")
@@ -343,10 +376,16 @@ async def run_round(
     report = await _fetch_findings(base_url, owner, repo, branch, token)
     print(f"  analyze: {round(time.time()-t0,1)}s — score={report.get('readiness_score')}")
 
-    findings = _pick_top_per_kind(report, applied_ids)
+    findings = _pick_top_per_kind(report, seen_signatures, cooled_paths)
     if not findings:
         print("  no fresh findings — loop is dry")
         return 0, 0, 0
+
+    # Mark every selected finding as seen IMMEDIATELY so a `bad` verdict
+    # doesn't pull the same finding back in next round. This is the fix
+    # for the "round 1 and 2 keep showing the same 4 items" bug.
+    for f in findings:
+        seen_signatures.add(_finding_signature(f.kind, f.title, f.file))
 
     print(f"  selected {len(findings)} findings:")
     for f in findings:
@@ -355,7 +394,7 @@ async def run_round(
     ctx = _build_repo_lens(report)
     file_tree = await GitHubAPIService.get_file_tree(token, owner, repo, branch)
 
-    # Parallel actuate (4 in flight, max).
+    # Parallel actuate (≤4 in flight).
     print(f"→ Actuating {len(findings)} in parallel…")
     t0 = time.time()
     recs = await asyncio.gather(*[
@@ -363,6 +402,10 @@ async def run_round(
         for f in findings
     ])
     print(f"  actuate: {round(time.time()-t0,1)}s")
+
+    # Refresh cooled_paths each round: only files modified IN THIS round
+    # are cooled, not forever — they get a 1-round cooloff.
+    cooled_paths.clear()
 
     good = bad = applied_count = 0
     for rec in recs:
@@ -379,11 +422,10 @@ async def run_round(
                 applied_count += len(touched)
                 if touched:
                     print(f"      → applied {len(touched)} file(s) locally: {touched}")
-                applied_ids.add(rec["finding_id"])
+                cooled_paths.update(touched)
         elif v == "bad":
             bad += 1
 
-        # Persist (drop the heavy file content before writing JSONL).
         rec.pop("_files_full", None)
         rec["round"] = round_num
         with out_path.open("a") as fh:
@@ -415,7 +457,8 @@ async def main() -> None:
     out_path = Path(args.out)
     out_path.write_text("")
 
-    applied_ids: set = set()
+    seen_signatures: set = set()
+    cooled_paths: set = set()
     apply = not args.no_apply
     print(f"Mode: {'APPLY (will modify local working tree)' if apply else 'DRY-RUN (verdicts only)'}")
     print(f"Rounds: up to {args.rounds}")
@@ -425,7 +468,7 @@ async def main() -> None:
         try:
             g, b, a = await run_round(
                 r, args.base_url, args.owner, args.repo, args.branch,
-                token, applied_ids, out_path, apply,
+                token, seen_signatures, cooled_paths, out_path, apply,
             )
         except Exception as e:
             print(f"  round {r} crashed: {e}")
