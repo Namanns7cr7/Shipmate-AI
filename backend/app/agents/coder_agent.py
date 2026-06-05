@@ -37,7 +37,12 @@ _SYSTEM_PROMPT = (
     "(c) the current contents of 1-5 target files. For each file you choose "
     "to change, output the COMPLETE new file content — no diffs, no '...', "
     "no placeholders, no truncation. Match existing style: indentation, "
-    "import order, naming. Hard cap: 5 modified files.\n\n"
+    "import order, naming. The patch should be focused — touch only the "
+    "files genuinely required for THIS finding. There is no enforced "
+    "file cap, but a smaller, surgical patch is always preferred over a "
+    "broad rewrite. If a finding genuinely needs many files (e.g. an "
+    "end-to-end feature touching service + route + tests + types), do "
+    "all of it correctly; if you need 1 file, return 1.\n\n"
 
     "## Hard rules — violations are rejected\n\n"
 
@@ -255,8 +260,15 @@ class CoderAgent:
             schema_class=CoderOutput,
             deployment_hint=deployment_hint,
         )
-        # Hard cap defense (in case Bedrock ignores the prompt cap).
-        if len(result.files) > 5:
-            logger.warning("Coder returned %d files; truncating to 5", len(result.files))
-            result.files = result.files[:5]
+        # Sanity-only soft cap. Anything above 25 files in a single patch
+        # is almost certainly a runaway generation — log and trim. Below
+        # that, trust the model: real refactors and feature work
+        # legitimately need >5 files.
+        _RUNAWAY_FILE_LIMIT = 25
+        if len(result.files) > _RUNAWAY_FILE_LIMIT:
+            logger.warning(
+                "Coder returned %d files (over runaway limit %d); truncating",
+                len(result.files), _RUNAWAY_FILE_LIMIT,
+            )
+            result.files = result.files[:_RUNAWAY_FILE_LIMIT]
         return result

@@ -204,14 +204,20 @@ def _resolve_target_paths(
     if not paths:
         paths.append("README.md")
 
-    # Dedupe + cap.
+    # Dedupe + soft cap. The cap is on the INPUT context size (how many
+    # files we fetch from GitHub and feed Coder), not the output. We keep
+    # this generous (15) so Coder has enough context for cross-file
+    # changes; it's still bounded so the prompt doesn't blow up token
+    # budget on huge target_files blobs. Each file is also independently
+    # truncated at 30k chars by the Coder agent's _truncate_for_prompt.
+    _CONTEXT_PATH_LIMIT = 15
     seen = set()
     deduped: List[str] = []
     for p in paths:
         if p and p not in seen:
             seen.add(p)
             deduped.append(p)
-        if len(deduped) >= 5:
+        if len(deduped) >= _CONTEXT_PATH_LIMIT:
             break
     return deduped
 
