@@ -6,13 +6,28 @@ github_auth_service so that any regression in the CSRF fix is caught.
 """
 
 import os
+import tempfile
 import time
 import pytest
 
-# Point the state DB at a temp file so tests don't pollute the real DB
-os.environ.setdefault("OAUTH_STATE_DB", ":memory:")
+# Point the state DB at a per-process temp FILE (not :memory: — that's
+# per-connection in sqlite, which would silently pass-fail this suite).
+_TMP_DB = tempfile.NamedTemporaryFile(suffix=".db", delete=False).name
+os.environ["OAUTH_STATE_DB"] = _TMP_DB
 
 from app.services.github_auth_service import _store_state, _consume_state  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _wipe_db():
+    """Each test starts with a clean state table."""
+    import sqlite3
+    conn = sqlite3.connect(_TMP_DB)
+    conn.execute("CREATE TABLE IF NOT EXISTS oauth_states (state TEXT PRIMARY KEY, redirect_uri TEXT, created_at REAL)")
+    conn.execute("DELETE FROM oauth_states")
+    conn.commit()
+    conn.close()
+    yield
 
 
 def test_valid_state_is_consumed_and_returns_redirect_uri():

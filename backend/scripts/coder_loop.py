@@ -55,6 +55,67 @@ logger.setLevel(logging.INFO)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
+# Persistent dedup state — survives across `python coder_loop.py` invocations
+# so we don't re-pick the same finding every time you re-run. Wipe with --reset.
+_STATE_PATH = Path("/tmp/coder_loop_state.json")
+
+
+def _load_state() -> Dict[str, Any]:
+    if _STATE_PATH.exists():
+        try:
+            return json.loads(_STATE_PATH.read_text())
+        except Exception:
+            pass
+    return {"seen_signatures": [], "baseline_passing": None}
+
+
+def _save_state(state: Dict[str, Any]) -> None:
+    _STATE_PATH.write_text(json.dumps(state, indent=2))
+
+
+# ── Pytest gate ──────────────────────────────────────────────────────────────
+
+
+def _run_pytest(target: str = "backend/tests/") -> Tuple[int, int, str]:
+    """Returns (passed, failed, raw_summary). Runs the test suite from
+    REPO_ROOT/backend so app.* imports resolve. Uses -q + --tb=no for speed.
+    Bounded by 90s to avoid hanging the loop on a slow test."""
+    import subprocess
+    cwd = REPO_ROOT / "backend"
+    try:
+        proc = subprocess.run(
+            ["./venv/bin/python", "-m", "pytest", "tests/", "-q", "--tb=no",
+             "--no-header", "-p", "no:cacheprovider"],
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            timeout=90,
+        )
+    except subprocess.TimeoutExpired:
+        return 0, 0, "pytest timeout"
+    out = (proc.stdout or "") + (proc.stderr or "")
+    # Pytest summary line looks like "5 failed, 67 passed in 0.27s"
+    passed = failed = 0
+    m = re.search(r"(\d+)\s+passed", out)
+    if m:
+        passed = int(m.group(1))
+    m = re.search(r"(\d+)\s+failed", out)
+    if m:
+        failed = int(m.group(1))
+    return passed, failed, out[-2000:]
+
+
+def _baseline_pass_count(state: Dict[str, Any]) -> int:
+    """Lazy-compute the baseline pass count. Stored across runs so the loop
+    doesn't re-run tests every round if nothing has changed."""
+    cached = state.get("baseline_passing")
+    if cached is not None:
+        return int(cached)
+    passed, failed, _ = _run_pytest()
+    state["baseline_passing"] = passed
+    _save_state(state)
+    return passed
+
 
 # ── Verdict helpers ──────────────────────────────────────────────────────────
 
@@ -313,6 +374,33 @@ async def _actuate_one(
     return rec
 
 
+def _snapshot_files(paths: List[str]) -> Dict[str, Optional[str]]:
+    """Capture current contents of `paths` so we can revert. None means
+    'didn't exist' (and we should delete on revert)."""
+    snap: Dict[str, Optional[str]] = {}
+    for p in paths:
+        full = REPO_ROOT / p
+        if full.exists():
+            try:
+                snap[p] = full.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                snap[p] = None
+        else:
+            snap[p] = None
+    return snap
+
+
+def _restore_snapshot(snap: Dict[str, Optional[str]]) -> None:
+    for p, original in snap.items():
+        full = REPO_ROOT / p
+        if original is None:
+            if full.exists():
+                full.unlink()
+        else:
+            full.parent.mkdir(parents=True, exist_ok=True)
+            full.write_text(original)
+
+
 def _apply_to_working_tree(
     rec: Dict[str, Any], dry_run: bool = False,
 ) -> List[str]:
@@ -323,12 +411,10 @@ def _apply_to_working_tree(
     written: List[str] = []
     for f in rec.get("_files_full", []):
         path = f["path"]
-        # Sanity: no absolute paths, no traversal
         if path.startswith("/") or ".." in path.split("/"):
             logger.warning("refusing to write suspicious path %s", path)
             continue
         full = REPO_ROOT / path
-        # Clamp to repo
         try:
             full.resolve().relative_to(REPO_ROOT.resolve())
         except ValueError:
@@ -338,7 +424,7 @@ def _apply_to_working_tree(
         if full.exists():
             try:
                 if full.read_text(encoding="utf-8", errors="replace") == new_content:
-                    continue  # idempotent — skip
+                    continue
             except Exception:
                 pass
         full.parent.mkdir(parents=True, exist_ok=True)
@@ -360,6 +446,7 @@ async def run_round(
     cooled_paths: set,
     out_path: Path,
     apply: bool,
+    state: Dict[str, Any],
 ) -> Tuple[int, int, int]:
     """Returns (good_count, bad_count, applied_count).
 
@@ -407,7 +494,34 @@ async def run_round(
     # are cooled, not forever — they get a 1-round cooloff.
     cooled_paths.clear()
 
-    good = bad = applied_count = 0
+    # Detect file-collision: two `good` patches both writing the same path.
+    # If so, keep only the first one (deterministic by kind order) so we
+    # don't rewrite a file twice in one round.
+    if apply:
+        seen_paths: set = set()
+        for rec in recs:
+            if rec.get("verdict") != "good":
+                continue
+            keep_files = []
+            dropped = []
+            for f in rec.get("_files_full", []):
+                if f["path"] in seen_paths:
+                    dropped.append(f["path"])
+                else:
+                    seen_paths.add(f["path"])
+                    keep_files.append(f)
+            if dropped:
+                print(f"  ⚠ [{rec['finding_kind']}] dropped {len(dropped)} colliding file(s): {dropped}")
+                rec["_files_full"] = keep_files
+                rec.setdefault("reasons", []).append(
+                    f"dropped colliding writes (already taken by an earlier patch this round): {dropped}"
+                )
+
+    good = bad = applied_count = reverted = 0
+    if apply:
+        baseline_passing = _baseline_pass_count(state)
+        print(f"  baseline tests: {baseline_passing} passing")
+
     for rec in recs:
         v = rec.get("verdict")
         marker = {"good": "✓", "bad": "✗", "skipped": "—", "error": "!"}.get(v, "?")
@@ -418,11 +532,36 @@ async def run_round(
         if v == "good":
             good += 1
             if apply:
-                touched = _apply_to_working_tree(rec)
-                applied_count += len(touched)
-                if touched:
-                    print(f"      → applied {len(touched)} file(s) locally: {touched}")
-                cooled_paths.update(touched)
+                # Atomic apply: snapshot, write, run tests; if regression,
+                # revert and mark `bad`. Skip the gate if Coder produced no
+                # files (collision-stripped to empty).
+                files = rec.get("_files_full") or []
+                if not files:
+                    rec.setdefault("reasons", []).append("no files left after collision-strip — skipped apply")
+                else:
+                    paths = [f["path"] for f in files]
+                    snap = _snapshot_files(paths)
+                    touched = _apply_to_working_tree(rec)
+                    passed, failed, _ = _run_pytest()
+                    if passed < baseline_passing:
+                        # Regression. Revert.
+                        _restore_snapshot(snap)
+                        good -= 1
+                        bad += 1
+                        reverted += 1
+                        rec["verdict"] = "reverted"
+                        rec.setdefault("reasons", []).append(
+                            f"REVERTED: pytest pass count dropped {baseline_passing} → {passed} (failed={failed})"
+                        )
+                        print(f"      ✗ REVERTED — tests dropped {baseline_passing} → {passed}")
+                    else:
+                        applied_count += len(touched)
+                        baseline_passing = passed  # any improvement becomes new baseline
+                        state["baseline_passing"] = passed
+                        _save_state(state)
+                        if touched:
+                            print(f"      → applied {len(touched)} file(s); tests {passed}p/{failed}f")
+                        cooled_paths.update(touched)
         elif v == "bad":
             bad += 1
 
@@ -431,6 +570,8 @@ async def run_round(
         with out_path.open("a") as fh:
             fh.write(json.dumps(rec, default=str) + "\n")
 
+    if reverted:
+        print(f"  reverted: {reverted} patch(es) due to test regression")
     return good, bad, applied_count
 
 
@@ -446,6 +587,8 @@ async def main() -> None:
     p.add_argument("--no-apply", action="store_true",
                    help="skip writing patches to local tree (verdict-only)")
     p.add_argument("--token-from", default="gh")
+    p.add_argument("--reset", action="store_true",
+                   help="wipe persistent state (seen signatures, baseline)")
     args = p.parse_args()
 
     if args.token_from == "gh":
@@ -457,19 +600,29 @@ async def main() -> None:
     out_path = Path(args.out)
     out_path.write_text("")
 
-    seen_signatures: set = set()
+    state = _load_state()
+    if getattr(args, "reset", False):
+        state = {"seen_signatures": [], "baseline_passing": None}
+        _save_state(state)
+        print("→ reset persistent state")
+    seen_signatures: set = set(state.get("seen_signatures") or [])
     cooled_paths: set = set()
     apply = not args.no_apply
     print(f"Mode: {'APPLY (will modify local working tree)' if apply else 'DRY-RUN (verdicts only)'}")
     print(f"Rounds: up to {args.rounds}")
+    if seen_signatures:
+        print(f"Loaded {len(seen_signatures)} previously-attempted finding signatures")
 
     totals = {"good": 0, "bad": 0, "applied": 0}
     for r in range(1, args.rounds + 1):
         try:
             g, b, a = await run_round(
                 r, args.base_url, args.owner, args.repo, args.branch,
-                token, seen_signatures, cooled_paths, out_path, apply,
+                token, seen_signatures, cooled_paths, out_path, apply, state,
             )
+            # Persist accumulated state across runs.
+            state["seen_signatures"] = sorted(seen_signatures)
+            _save_state(state)
         except Exception as e:
             print(f"  round {r} crashed: {e}")
             break

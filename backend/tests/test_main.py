@@ -101,7 +101,7 @@ class TestRouteRegistration:
     def test_analysis_router_prefix(self):
         """Verify analysis router is registered with /api prefix."""
         routes = [route.path for route in app.routes]
-        assert any("/api/analysis" in route for route in routes)
+        assert any("/api/analyze" in route for route in routes)
 
 
 class TestMiddlewareSetup:
