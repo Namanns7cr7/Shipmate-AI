@@ -191,6 +191,11 @@ class TestMiddlewareSetup:
         response = client.get("/", headers={"Cookie": "session=eval(1)"})
         assert response.status_code != 400
 
+    def test_sanitize_input_middleware_subprocess_in_header_returns_400(self):
+        """Verify input sanitization middleware blocks subprocess patterns in custom X- headers."""
+        response = client.get("/", headers={"X-Custom-Header": "subprocess."})
+        assert response.status_code == 400
+
     def test_input_sanitization_middleware_checks_json_body(self):
         """Verify input sanitization middleware checks JSON request body."""
         response = client.post(

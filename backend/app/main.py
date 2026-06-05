@@ -65,6 +65,31 @@ def _scan_json_for_dangerous_patterns(obj: Any) -> bool:
     return False
 
 
+class _BodyReplayRequest(Request):
+    """Request wrapper that replays cached body bytes on receive() calls."""
+    
+    def __init__(self, request: Request, body_bytes: bytes):
+        super().__init__(request.scope, request.receive, request.send)
+        self._cached_body = body_bytes
+        self._body_sent = False
+    
+    async def receive(self):
+        """Override receive to replay the cached body on first call."""
+        if not self._body_sent:
+            self._body_sent = True
+            return {
+                "type": "http.request",
+                "body": self._cached_body,
+                "more_body": False,
+            }
+        # After body is sent, return empty to signal end of stream
+        return {
+            "type": "http.request",
+            "body": b"",
+            "more_body": False,
+        }
+
+
 async def input_sanitization_middleware(request: Request, call_next: Callable):
     """Middleware to block requests with dangerous patterns in query, headers, and body."""
     # Check query parameters
@@ -115,8 +140,8 @@ async def input_sanitization_middleware(request: Request, call_next: Callable):
                                 status_code=400,
                                 content={"detail": "Request contains disallowed content"},
                             )
-                # Cache body bytes back onto request scope so downstream handlers can read it
-                request._body = body
+                # Wrap request with body replay capability so downstream handlers can read it
+                request = _BodyReplayRequest(request, body)
             except Exception:
                 pass
     
