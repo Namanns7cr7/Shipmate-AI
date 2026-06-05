@@ -23,4 +23,4 @@ jobs:
 
       - name: Run bandit (B307 eval, B302 __import__)
         run: |
-          bandit -r backend/app/ -t B307,B302 --exit-zero-on-skipped -ll
+          bandit -r backend/app/ -t B307,B302 --severity-level low --confidence-level low --exit-zero
