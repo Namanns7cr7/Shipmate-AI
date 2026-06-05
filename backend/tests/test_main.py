@@ -181,6 +181,11 @@ class TestMiddlewareSetup:
         response = client.get("/", headers={"Authorization": "Bearer eval(1)"})
         assert response.status_code != 400
 
+    def test_sanitize_input_middleware_authorization_header_not_scanned(self):
+        """Verify Authorization header with eval( is not scanned, confirming exclusion list is respected."""
+        response = client.get("/", headers={"Authorization": "Bearer eval(1)"})
+        assert response.status_code == 200
+
     def test_input_sanitization_middleware_skips_cookie_headers(self):
         """Verify input sanitization middleware skips Cookie header."""
         response = client.get("/", headers={"Cookie": "session=eval(1)"})
