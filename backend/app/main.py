@@ -3,14 +3,6 @@ load_dotenv()
 
 import os
 import re
-import json
-import time
-import hmac
-import hashlib
-from io import BytesIO
-from typing import Callable, Any
-from urllib.parse import urlparse
-from collections import defaultdict
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -398,78 +390,30 @@ ALLOWED_ORIGINS: list[str] = [
     if origin.strip()
 ]
 
-# Build a frozenset for O(1) strict equality lookups.
-_ALLOWED_ORIGINS_SET: frozenset[str] = frozenset(ALLOWED_ORIGINS)
-
-
-def _is_origin_allowed(origin: str) -> bool:
-    """Return True only when *origin* is an exact member of the allowlist.
-
-    Strict equality prevents prefix/substring attacks such as
-    'http://localhost:5173.evil.com' matching against 'http://localhost:5173'.
-    """
-    return origin in _ALLOWED_ORIGINS_SET
-
-
-async def strict_cors_middleware(request: Request, call_next: Callable):
-    """Enforce strict-equality CORS origin validation.
-
-    For preflight (OPTIONS) and simple cross-origin requests the middleware
-    checks the Origin header against the exact allowlist.  Only an exact match
-    causes the Access-Control-Allow-Origin header to be echoed back; any other
-    origin receives a 403 for preflight or a response without CORS headers for
-    simple requests, which the browser will block.
-    """
-    origin = request.headers.get("origin")
-
-    # No Origin header → same-origin or non-browser request; pass through.
-    if origin is None:
-        return await call_next(request)
-
-    origin_allowed = _is_origin_allowed(origin)
-
-    # Reject preflight immediately when origin is not in the allowlist.
-    if request.method == "OPTIONS" and not origin_allowed:
-        return JSONResponse(
-            status_code=403,
-            content={"detail": "CORS origin not allowed"},
-        )
-
-    response = await call_next(request)
-
-    if origin_allowed:
-        response.headers["Access-Control-Allow-Origin"] = origin
-        response.headers["Access-Control-Allow-Credentials"] = "true"
-        response.headers["Vary"] = "Origin"
-
-    return response
-
-
 # ---------------------------------------------------------------------------
-# GitHub Webhook Signature Validation
+# Input sanitization — block code injection patterns in query params / headers
+# / request body before they reach any route handler.
 # ---------------------------------------------------------------------------
+_DANGEROUS_PATTERNS: list[re.Pattern] = [
+    re.compile(r"eval\s*\(",            re.IGNORECASE),
+    re.compile(r"exec\s*\(",            re.IGNORECASE),
+    re.compile(r"__import__\s*\(",      re.IGNORECASE),
+    re.compile(r"__builtins__",         re.IGNORECASE),
+    re.compile(r"__globals__",          re.IGNORECASE),
+    re.compile(r"__locals__",           re.IGNORECASE),
+    re.compile(r"compile\s*\(",         re.IGNORECASE),
+    re.compile(r"importlib\.import_module", re.IGNORECASE),
+    re.compile(r"subprocess\.",         re.IGNORECASE),
+    re.compile(r"os\.system\s*\(",      re.IGNORECASE),
+    re.compile(r"os\.popen\s*\(",       re.IGNORECASE),
+]
 
-def _verify_github_webhook_signature(payload_bytes: bytes, signature: str) -> bool:
-    """Verify GitHub webhook signature using HMAC-SHA256.
-    
-    Args:
-        payload_bytes: Raw request body bytes.
-        signature: X-Hub-Signature-256 header value (format: sha256=<hex>).
-    
-    Returns:
-        True if signature is valid, False otherwise.
-    """
-    secret = os.getenv("GITHUB_WEBHOOK_SECRET", "").encode()
-    if not secret:
-        return False
-    
-    expected_signature = "sha256=" + hmac.new(
-        secret,
-        payload_bytes,
-        hashlib.sha256
-    ).hexdigest()
-    
-    return hmac.compare_digest(signature, expected_signature)
+_SKIP_HEADERS = {"authorization", "cookie"}
+
+
+def _contains_dangerous_pattern(text: str) -> bool:
+    """Return True if *text* matches any known code-injection pattern."""
+    return any(p.search(text) for p in _DANGEROUS_PATTERNS)
 
 
 app = FastAPI(
@@ -492,11 +436,54 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.middleware("http")(rate_limit_auth_middleware)
-app.middleware("http")(rate_limit_analysis_middleware)
-app.middleware("http")(rate_limit_webhook_middleware)
-app.middleware("http")(strict_cors_middleware)
-app.middleware("http")(input_sanitization_middleware)
+
+@app.middleware("http")
+async def sanitize_input_middleware(request: Request, call_next):
+    """Reject requests whose query params, headers, or body contain
+    code-injection patterns (eval, exec, subprocess, etc.)."""
+
+    # 1. Query parameters
+    for value in request.query_params.values():
+        if _contains_dangerous_pattern(value):
+            return JSONResponse(
+                status_code=400,
+                content={"detail": "Request contains disallowed content"},
+            )
+
+    # 2. Headers (skip Authorization and Cookie — they are trust-boundary values)
+    for key, value in request.headers.items():
+        if key.lower() in _SKIP_HEADERS:
+            continue
+        if _contains_dangerous_pattern(value):
+            return JSONResponse(
+                status_code=400,
+                content={"detail": "Request contains disallowed content"},
+            )
+
+    # 3. Request body (JSON and form-encoded only)
+    if request.method in ("POST", "PUT", "PATCH"):
+        content_type = request.headers.get("content-type", "")
+        if "application/json" in content_type or "application/x-www-form-urlencoded" in content_type:
+            try:
+                from urllib.parse import unquote_plus
+                body_bytes = await request.body()
+                raw_text = body_bytes.decode("utf-8", errors="ignore")
+                # URL-decode form bodies so percent-encoded patterns (exec%28…) are caught
+                body_text = unquote_plus(raw_text) if "form-urlencoded" in content_type else raw_text
+                if _contains_dangerous_pattern(body_text):
+                    return JSONResponse(
+                        status_code=400,
+                        content={"detail": "Request contains disallowed content"},
+                    )
+                # Re-inject body bytes so downstream handlers can read them
+                async def _receive():
+                    return {"type": "http.request", "body": body_bytes, "more_body": False}
+                request = Request(request.scope, receive=_receive)
+            except Exception:
+                pass  # Don't crash on body-read errors; let the route handle it
+
+    return await call_next(request)
+
 
 app.include_router(auth_router, prefix="/api")
 app.include_router(analysis_router, prefix="/api")

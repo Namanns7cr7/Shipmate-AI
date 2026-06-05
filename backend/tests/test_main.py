@@ -101,6 +101,7 @@ class TestRouteRegistration:
     def test_analysis_router_prefix(self):
         """Verify analysis router is registered with /api prefix."""
         routes = [route.path for route in app.routes]
+        # Analysis routes should be prefixed with /api
         assert any("/api/analyze" in route for route in routes)
 
 
@@ -338,7 +339,8 @@ class TestErrorHandling:
             data="{invalid json}",
             headers={"Content-Type": "application/json"},
         )
-        assert response.status_code in [400, 422, 404]
+        # Should not crash; 405 is valid (POST not accepted on /), 422/400 if body parsed
+        assert response.status_code in [400, 404, 405, 422]
 
     def test_binary_body_handling(self):
         """Verify binary body is handled gracefully."""
@@ -347,7 +349,8 @@ class TestErrorHandling:
             content=b"\x80\x81\x82\x83",
             headers={"Content-Type": "application/octet-stream"},
         )
-        assert response.status_code in [400, 404, 415]
+        # Should not crash; 405 is valid (POST not accepted on /)
+        assert response.status_code in [400, 404, 405, 415]
 
     def test_empty_query_parameters(self):
         """Verify empty query parameters are handled."""
