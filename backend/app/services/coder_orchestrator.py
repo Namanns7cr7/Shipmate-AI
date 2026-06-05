@@ -25,7 +25,7 @@ import re
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
-from app.agents.coder_agent import CoderAgent, CoderBrief, CoderOutput
+from app.agents.coder_agent import CoderAgent, CoderBrief, CoderFile, CoderOutput
 from app.schemas.api_schemas import (
     ActuateRequest, ActuateResponse, ActuatedFile, FindingPayload, RepoLensSummary,
 )
@@ -310,7 +310,7 @@ def _detect_hallucinated_imports(
 def _detect_hallucinated_named_imports(
     new_content: str,
     target_files: Dict[str, str],
-    coder_files: List["CoderFile"],
+    coder_files: List[CoderFile],
 ) -> List[str]:
     """
     Catch `from X import a, b, c` where X is a module Coder is rewriting in
