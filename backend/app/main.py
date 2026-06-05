@@ -4,9 +4,11 @@ load_dotenv()
 import os
 import re
 import json
+import time
 from io import BytesIO
 from typing import Callable, Any
 from urllib.parse import urlparse
+from collections import defaultdict
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -18,6 +20,123 @@ from app.api.routes.analysis import router as analysis_router
 from app.api.routes.actuate import router as actuate_router
 from app.api.routes.watcher import router as watcher_router
 from app.api.routes.branches import router as branches_router
+
+# ---------------------------------------------------------------------------
+# Rate Limiting: Token Bucket Implementation
+# ---------------------------------------------------------------------------
+
+class _TokenBucket:
+    """Simple token bucket for rate limiting.
+    
+    Tokens are refilled at a constant rate. When a request arrives,
+    we check if a token is available; if so, consume it and allow the request.
+    Otherwise, reject the request.
+    """
+    
+    def __init__(self, capacity: int, refill_rate: float):
+        """Initialize token bucket.
+        
+        Args:
+            capacity: Maximum number of tokens (burst size).
+            refill_rate: Tokens per second to refill.
+        """
+        self.capacity = capacity
+        self.refill_rate = refill_rate
+        self.tokens = float(capacity)
+        self.last_refill = time.time()
+    
+    def allow_request(self) -> bool:
+        """Check if a request is allowed and consume a token if so.
+        
+        Returns True if a token was available, False otherwise.
+        """
+        now = time.time()
+        elapsed = now - self.last_refill
+        
+        # Refill tokens based on elapsed time
+        self.tokens = min(
+            self.capacity,
+            self.tokens + elapsed * self.refill_rate
+        )
+        self.last_refill = now
+        
+        # Try to consume a token
+        if self.tokens >= 1.0:
+            self.tokens -= 1.0
+            return True
+        return False
+
+
+class _RateLimiter:
+    """Per-IP rate limiter using token buckets."""
+    
+    def __init__(self, capacity: int, refill_rate: float):
+        """Initialize rate limiter.
+        
+        Args:
+            capacity: Burst size (max tokens per bucket).
+            refill_rate: Tokens per second.
+        """
+        self.capacity = capacity
+        self.refill_rate = refill_rate
+        self.buckets: dict[str, _TokenBucket] = defaultdict()
+    
+    def is_allowed(self, client_ip: str) -> bool:
+        """Check if a request from client_ip is allowed.
+        
+        Returns True if allowed, False if rate limit exceeded.
+        """
+        if client_ip not in self.buckets:
+            self.buckets[client_ip] = _TokenBucket(self.capacity, self.refill_rate)
+        return self.buckets[client_ip].allow_request()
+
+
+# Rate limiters for sensitive endpoints
+# Auth callback: 10 requests per minute per IP (burst of 2)
+_auth_limiter = _RateLimiter(capacity=2, refill_rate=10.0 / 60.0)
+
+# Analysis endpoint: 30 requests per minute per IP (burst of 5)
+_analysis_limiter = _RateLimiter(capacity=5, refill_rate=30.0 / 60.0)
+
+
+def _get_client_ip(request: Request) -> str:
+    """Extract client IP from request, accounting for proxies.
+    
+    Checks X-Forwarded-For header first (for proxied requests),
+    then falls back to request.client.host.
+    """
+    forwarded_for = request.headers.get("x-forwarded-for")
+    if forwarded_for:
+        # X-Forwarded-For can contain multiple IPs; take the first (original client)
+        return forwarded_for.split(",")[0].strip()
+    if request.client:
+        return request.client.host
+    return "unknown"
+
+
+async def rate_limit_auth_middleware(request: Request, call_next: Callable):
+    """Rate limit the /auth/callback endpoint."""
+    if request.url.path == "/api/auth/github/callback":
+        client_ip = _get_client_ip(request)
+        if not _auth_limiter.is_allowed(client_ip):
+            return JSONResponse(
+                status_code=429,
+                content={"detail": "Rate limit exceeded. Too many authentication attempts."},
+            )
+    return await call_next(request)
+
+
+async def rate_limit_analysis_middleware(request: Request, call_next: Callable):
+    """Rate limit the /analysis endpoint."""
+    if request.url.path.startswith("/api/analysis"):
+        client_ip = _get_client_ip(request)
+        if not _analysis_limiter.is_allowed(client_ip):
+            return JSONResponse(
+                status_code=429,
+                content={"detail": "Rate limit exceeded. Too many analysis requests."},
+            )
+    return await call_next(request)
+
 
 # ---------------------------------------------------------------------------
 # Startup: Enforce HTTPS for all configured service endpoint URLs
@@ -329,6 +448,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.middleware("http")(rate_limit_auth_middleware)
+app.middleware("http")(rate_limit_analysis_middleware)
 app.middleware("http")(strict_cors_middleware)
 app.middleware("http")(input_sanitization_middleware)
 
@@ -361,7 +482,7 @@ async def github_callback_html():
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <title>ShipMate AI \u2013 GitHub Auth</title>
+  <title>ShipMate AI – GitHub Auth</title>
   <style>
     *{margin:0;padding:0;box-sizing:border-box}
     body{font-family:system-ui,sans-serif;background:#0f172a;display:flex;align-items:center;
@@ -380,7 +501,7 @@ async def github_callback_html():
 <body>
   <div class="box">
     <div class="spinner"></div>
-    <h1>Completing GitHub authorization\u2026</h1>
+    <h1>Completing GitHub authorization…</h1>
     <p>This window will close automatically.</p>
     <div id="err"></div>
   </div>
