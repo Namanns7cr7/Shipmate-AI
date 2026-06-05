@@ -21,7 +21,10 @@ feeding back into Coder so we stay under Sonnet's context with headroom
 
 from __future__ import annotations
 
+import io
 import logging
+import xml.etree.ElementTree as ET
+import zipfile
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -31,6 +34,13 @@ logger = logging.getLogger("shipmate.github_actions")
 _BASE = "https://api.github.com"
 _TIMEOUT = httpx.Timeout(30.0)
 _LOG_TAIL_CHARS = 30_000
+
+# The artifact name the CI test-gate uploads (see .github/workflows/ci.yml,
+# job backend-test → "Upload test reports"). The zip contains reports/junit.xml.
+_TEST_REPORT_ARTIFACT = "backend-test-reports"
+_JUNIT_MEMBER_HINT = "junit.xml"        # member filename inside the artifact zip
+_JUNIT_MAX_FAILURES = 40                # cap structured failures fed to Coder
+_JUNIT_MSG_CHARS = 600                  # truncate each failure message
 
 
 def _headers(token: str) -> Dict[str, str]:
@@ -163,17 +173,159 @@ class GitHubActionsService:
                     owner, repo, pr_number, resp.text[:200],
                 )
 
+    # ── Structured test failures (JUnit XML artifact) ───────────────────
+
+    @staticmethod
+    async def _find_workflow_run_id(
+        token: str, owner: str, repo: str, head_sha: str,
+    ) -> Optional[int]:
+        """The workflow-run id whose HEAD is *head_sha*. Artifacts hang off
+        the run, not the check-run, so we resolve the run first."""
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+            resp = await client.get(
+                f"{_BASE}/repos/{owner}/{repo}/actions/runs",
+                headers=_headers(token),
+                params={"head_sha": head_sha, "per_page": 20},
+            )
+            if resp.status_code >= 400:
+                return None
+            runs = resp.json().get("workflow_runs", [])
+            # Prefer a completed run; fall back to the most recent.
+            for r in runs:
+                if r.get("status") == "completed":
+                    return r.get("id")
+            return runs[0].get("id") if runs else None
+
+    @classmethod
+    async def fetch_junit_failures(
+        cls, token: str, owner: str, repo: str, head_sha: str,
+    ) -> Optional[str]:
+        """
+        Download the `backend-test-reports` artifact for the run at *head_sha*,
+        unzip it in memory, parse the JUnit XML, and return a compact
+        plaintext list of FAILED/ERRORED testcases:
+
+            tests/test_x.py::TestA::test_y — AssertionError: expected 200 got 422
+
+        This is structured failure data (test id + file + exception) that the
+        Coder fix pass can act on directly, instead of grepping 30k chars of
+        raw pytest stdout. Returns None when the artifact is absent (e.g. the
+        run failed before upload, or the repo predates the JUnit-emitting CI).
+        """
+        try:
+            run_id = await cls._find_workflow_run_id(token, owner, repo, head_sha)
+            if run_id is None:
+                return None
+
+            async with httpx.AsyncClient(timeout=httpx.Timeout(60.0), follow_redirects=True) as client:
+                listing = await client.get(
+                    f"{_BASE}/repos/{owner}/{repo}/actions/runs/{run_id}/artifacts",
+                    headers=_headers(token),
+                )
+                if listing.status_code >= 400:
+                    return None
+                artifacts = listing.json().get("artifacts", [])
+                target = next(
+                    (a for a in artifacts if a.get("name") == _TEST_REPORT_ARTIFACT),
+                    None,
+                )
+                if target is None or target.get("expired"):
+                    return None
+
+                dl = await client.get(
+                    f"{_BASE}/repos/{owner}/{repo}/actions/artifacts/"
+                    f"{target['id']}/zip",
+                    headers=_headers(token),
+                )
+                if dl.status_code >= 400:
+                    return None
+                zip_bytes = dl.content
+
+            return cls._parse_junit_zip(zip_bytes)
+        except Exception as e:  # never let artifact issues break the fix loop
+            logger.info("fetch_junit_failures soft-failed: %s", e)
+            return None
+
+    @classmethod
+    def _parse_junit_zip(cls, zip_bytes: bytes) -> Optional[str]:
+        """Extract junit.xml from the artifact zip and format its failures.
+        Pure/synchronous so it's unit-testable without the network."""
+        try:
+            zf = zipfile.ZipFile(io.BytesIO(zip_bytes))
+        except zipfile.BadZipFile:
+            return None
+        member = next(
+            (n for n in zf.namelist() if n.endswith(_JUNIT_MEMBER_HINT)),
+            None,
+        )
+        if member is None:
+            return None
+        xml_bytes = zf.read(member)
+        return cls._format_junit_failures(xml_bytes)
+
+    @classmethod
+    def _format_junit_failures(cls, xml_bytes: bytes) -> Optional[str]:
+        """Turn JUnit XML bytes into a compact failure list. None if it
+        doesn't parse or there are no failures/errors."""
+        try:
+            root = ET.fromstring(xml_bytes)
+        except ET.ParseError:
+            return None
+
+        lines: List[str] = []
+        # JUnit nests <testcase> under <testsuite>(s); iter() finds them at any depth.
+        for case in root.iter("testcase"):
+            problem = None
+            for tag in ("failure", "error"):
+                node = case.find(tag)
+                if node is not None:
+                    problem = (tag, node)
+                    break
+            if problem is None:
+                continue
+
+            tag, node = problem
+            classname = case.get("classname", "")
+            name = case.get("name", "?")
+            test_id = f"{classname}::{name}" if classname else name
+            # message attr is the short reason; text is the full traceback.
+            msg = (node.get("message") or (node.text or "").strip() or tag)
+            msg = " ".join(msg.split())  # collapse whitespace/newlines
+            if len(msg) > _JUNIT_MSG_CHARS:
+                msg = msg[:_JUNIT_MSG_CHARS] + " …[truncated]"
+            lines.append(f"  [{tag.upper()}] {test_id} — {msg}")
+            if len(lines) >= _JUNIT_MAX_FAILURES:
+                lines.append(f"  …[{_JUNIT_MAX_FAILURES}+ failures; list truncated]")
+                break
+
+        if not lines:
+            return None
+        return "Parsed JUnit test failures (test id — reason):\n" + "\n".join(lines)
+
     @classmethod
     async def collect_failure_context(
         cls, token: str, owner: str, repo: str, status: CheckRunStatus,
+        head_sha: Optional[str] = None,
     ) -> str:
         """
         Build a plaintext failure-context blob to feed back into Coder.
-        Pulls logs (or annotations as fallback) for every failed check-run.
+        Pulls logs (or annotations as fallback) for every failed check-run,
+        and — when *head_sha* is given — prepends the STRUCTURED JUnit test
+        failures parsed from the uploaded test-report artifact. The structured
+        list goes first because it's the highest-signal context for the fix.
+
         Caller should wrap this string in a CoderBrief.target_files entry
         keyed e.g. "ci_failure.log".
         """
         chunks: List[str] = []
+
+        if head_sha:
+            junit = await cls.fetch_junit_failures(token, owner, repo, head_sha)
+            if junit:
+                chunks.append("=== STRUCTURED TEST FAILURES (JUnit) ===")
+                chunks.append(junit)
+                chunks.append("")
+
         for run in status.failed_runs:
             check_id = run.get("id")
             job_id = run.get("id")  # for Actions, check_run id == job id

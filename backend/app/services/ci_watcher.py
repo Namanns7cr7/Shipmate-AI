@@ -416,10 +416,23 @@ class CIWatcher:
         attempt_idx = entry.attempts
         cls._touch(entry, f"attempt[{attempt_idx}] starting")
 
-        # Fetch failure logs.
+        # Fetch failure context. Resolve the current HEAD SHA so
+        # collect_failure_context can also pull the STRUCTURED JUnit test
+        # failures from the uploaded test-report artifact (highest-signal
+        # input for the fix). SHA resolution is best-effort — on failure we
+        # still get raw logs.
+        head_sha: Optional[str] = None
+        try:
+            head_sha = await GitHubActionsService.get_branch_head_sha(
+                entry.access_token, entry.owner, entry.repo, entry.branch,
+            )
+        except Exception as e:
+            logger.info("CIWatcher: head-sha resolve failed (JUnit skipped): %s", e)
+
         try:
             failure_blob = await GitHubActionsService.collect_failure_context(
                 entry.access_token, entry.owner, entry.repo, status,
+                head_sha=head_sha,
             )
         except Exception as e:
             logger.warning("CIWatcher: failure-log fetch failed: %s", e)
@@ -509,8 +522,11 @@ class CIWatcher:
         brief = CoderBrief(
             task=(
                 f"The previous patch you generated was committed and CI failed. "
-                f"Read the FAILING CI LOGS in `target_files['ci_failure.log']` and "
-                f"produce a corrective patch. The originating finding was: "
+                f"Read `target_files['ci_failure.log']`. If it begins with a "
+                f"'STRUCTURED TEST FAILURES (JUnit)' section, TRUST THAT FIRST — "
+                f"it lists each failing test id and its exception, which pinpoints "
+                f"the regression more precisely than the raw log tail below it. "
+                f"Then produce a corrective patch. The originating finding was: "
                 f"{entry.finding.title}. "
                 f"Description: {entry.finding.description}. "
                 f"Apply the SMALLEST possible fix that makes CI green. "
