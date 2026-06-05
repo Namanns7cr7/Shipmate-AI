@@ -160,6 +160,17 @@ class TestMiddlewareSetup:
         response = client.get("/?param=safe_value&other=123")
         assert response.status_code != 400
 
+    def test_sanitize_input_middleware_allows_safe_request_passes_through(self):
+        """Verify safe requests with no dangerous patterns pass through middleware."""
+        response = client.get(
+            "/?query=benign&search=test",
+            headers={"X-Custom-Header": "safe-value"},
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["service"] == "ShipMate AI"
+        assert data["status"] == "operational"
+
     def test_input_sanitization_middleware_checks_headers(self):
         """Verify input sanitization middleware checks headers."""
         response = client.get("/", headers={"X-Custom-Header": "eval(1)"})

@@ -5,6 +5,7 @@ import os
 import re
 from io import BytesIO
 from typing import Callable
+from urllib.parse import urlparse
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -93,12 +94,45 @@ async def input_sanitization_middleware(request: Request, call_next: Callable):
 # allow_credentials=True is incompatible with "*" and would expose
 # authenticated endpoints to any third-party site.
 # ---------------------------------------------------------------------------
+
+def _validate_origin(origin: str) -> str:
+    """Validate a single CORS origin string.
+
+    Rules:
+    - Must not be '*' or contain any wildcard character ('*').
+    - Must parse to a URL whose scheme is 'http' or 'https'.
+    - Must have a non-empty netloc (host).
+
+    Returns the origin unchanged if valid, raises ValueError otherwise.
+    """
+    if "*" in origin:
+        raise ValueError(
+            f"CORS origin '{origin}' contains a wildcard character, which is not "
+            "allowed when allow_credentials=True. Set ALLOWED_ORIGINS to explicit "
+            "origins only."
+        )
+    parsed = urlparse(origin)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(
+            f"CORS origin '{origin}' has an invalid scheme '{parsed.scheme}'. "
+            "Only 'http' and 'https' schemes are permitted."
+        )
+    if not parsed.netloc:
+        raise ValueError(
+            f"CORS origin '{origin}' has an empty host/netloc. "
+            "Each origin must be a fully-qualified URL such as 'https://example.com'."
+        )
+    return origin
+
+
 _raw_origins = os.getenv(
     "ALLOWED_ORIGINS",
     "http://localhost:5173,http://localhost:5174,http://localhost:3000,http://127.0.0.1:5173",
 )
 ALLOWED_ORIGINS: list[str] = [
-    origin.strip() for origin in _raw_origins.split(",") if origin.strip()
+    _validate_origin(origin.strip())
+    for origin in _raw_origins.split(",")
+    if origin.strip()
 ]
 
 app = FastAPI(
@@ -148,7 +182,7 @@ async def github_callback_html():
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <title>ShipMate AI – GitHub Auth</title>
+  <title>ShipMate AI \u2013 GitHub Auth</title>
   <style>
     *{margin:0;padding:0;box-sizing:border-box}
     body{font-family:system-ui,sans-serif;background:#0f172a;display:flex;align-items:center;
@@ -167,7 +201,7 @@ async def github_callback_html():
 <body>
   <div class="box">
     <div class="spinner"></div>
-    <h1>Completing GitHub authorization…</h1>
+    <h1>Completing GitHub authorization\u2026</h1>
     <p>This window will close automatically.</p>
     <div id="err"></div>
   </div>
