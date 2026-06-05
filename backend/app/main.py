@@ -3,8 +3,9 @@ load_dotenv()
 
 import os
 import re
+import json
 from io import BytesIO
-from typing import Callable
+from typing import Callable, Any
 from urllib.parse import urlparse
 
 from fastapi import FastAPI, Request
@@ -46,6 +47,24 @@ def _contains_dangerous_pattern(text: str) -> bool:
     return False
 
 
+def _scan_json_for_dangerous_patterns(obj: Any) -> bool:
+    """Recursively scan a JSON object (dict, list, or primitive) for dangerous patterns.
+    
+    Returns True if any string value contains a dangerous pattern, False otherwise.
+    """
+    if isinstance(obj, str):
+        return _contains_dangerous_pattern(obj)
+    elif isinstance(obj, dict):
+        for value in obj.values():
+            if _scan_json_for_dangerous_patterns(value):
+                return True
+    elif isinstance(obj, list):
+        for item in obj:
+            if _scan_json_for_dangerous_patterns(item):
+                return True
+    return False
+
+
 async def input_sanitization_middleware(request: Request, call_next: Callable):
     """Middleware to block requests with dangerous patterns in query, headers, and body."""
     # Check query parameters
@@ -73,11 +92,29 @@ async def input_sanitization_middleware(request: Request, call_next: Callable):
                 body = await request.body()
                 if body:
                     body_str = body.decode("utf-8", errors="ignore")
-                    if _contains_dangerous_pattern(body_str):
-                        return JSONResponse(
-                            status_code=400,
-                            content={"detail": "Request contains disallowed content"},
-                        )
+                    # For JSON, parse and recursively scan all string values
+                    if "application/json" in content_type:
+                        try:
+                            parsed_body = json.loads(body_str)
+                            if _scan_json_for_dangerous_patterns(parsed_body):
+                                return JSONResponse(
+                                    status_code=400,
+                                    content={"detail": "Request contains disallowed content"},
+                                )
+                        except json.JSONDecodeError:
+                            # If JSON parsing fails, fall back to string scan
+                            if _contains_dangerous_pattern(body_str):
+                                return JSONResponse(
+                                    status_code=400,
+                                    content={"detail": "Request contains disallowed content"},
+                                )
+                    else:
+                        # For form data, scan the raw string
+                        if _contains_dangerous_pattern(body_str):
+                            return JSONResponse(
+                                status_code=400,
+                                content={"detail": "Request contains disallowed content"},
+                            )
                 # Cache body bytes back onto request scope so downstream handlers can read it
                 request._body = body
             except Exception:
@@ -234,7 +271,7 @@ async def github_callback_html():
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <title>ShipMate AI \u2013 GitHub Auth</title>
+  <title>ShipMate AI – GitHub Auth</title>
   <style>
     *{margin:0;padding:0;box-sizing:border-box}
     body{font-family:system-ui,sans-serif;background:#0f172a;display:flex;align-items:center;
@@ -253,7 +290,7 @@ async def github_callback_html():
 <body>
   <div class="box">
     <div class="spinner"></div>
-    <h1>Completing GitHub authorization\u2026</h1>
+    <h1>Completing GitHub authorization…</h1>
     <p>This window will close automatically.</p>
     <div id="err"></div>
   </div>
