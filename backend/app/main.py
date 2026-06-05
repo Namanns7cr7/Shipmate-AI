@@ -135,6 +135,53 @@ ALLOWED_ORIGINS: list[str] = [
     if origin.strip()
 ]
 
+# Build a frozenset for O(1) strict equality lookups.
+_ALLOWED_ORIGINS_SET: frozenset[str] = frozenset(ALLOWED_ORIGINS)
+
+
+def _is_origin_allowed(origin: str) -> bool:
+    """Return True only when *origin* is an exact member of the allowlist.
+
+    Strict equality prevents prefix/substring attacks such as
+    'http://localhost:5173.evil.com' matching against 'http://localhost:5173'.
+    """
+    return origin in _ALLOWED_ORIGINS_SET
+
+
+async def strict_cors_middleware(request: Request, call_next: Callable):
+    """Enforce strict-equality CORS origin validation.
+
+    For preflight (OPTIONS) and simple cross-origin requests the middleware
+    checks the Origin header against the exact allowlist.  Only an exact match
+    causes the Access-Control-Allow-Origin header to be echoed back; any other
+    origin receives a 403 for preflight or a response without CORS headers for
+    simple requests, which the browser will block.
+    """
+    origin = request.headers.get("origin")
+
+    # No Origin header → same-origin or non-browser request; pass through.
+    if origin is None:
+        return await call_next(request)
+
+    origin_allowed = _is_origin_allowed(origin)
+
+    # Reject preflight immediately when origin is not in the allowlist.
+    if request.method == "OPTIONS" and not origin_allowed:
+        return JSONResponse(
+            status_code=403,
+            content={"detail": "CORS origin not allowed"},
+        )
+
+    response = await call_next(request)
+
+    if origin_allowed:
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+        response.headers["Vary"] = "Origin"
+
+    return response
+
+
 app = FastAPI(
     title="ShipMate AI",
     description="AI-native multi-agent release readiness platform",
@@ -143,6 +190,10 @@ app = FastAPI(
     redoc_url="/redoc",
 )
 
+# NOTE: CORSMiddleware is kept so that preflight Allow-Methods / Allow-Headers
+# headers are generated correctly by the framework.  Its allow_origins list is
+# set to the validated allowlist; our strict_cors_middleware (registered below)
+# provides the additional exact-match guard that prevents prefix attacks.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
@@ -151,6 +202,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.middleware("http")(strict_cors_middleware)
 app.middleware("http")(input_sanitization_middleware)
 
 app.include_router(auth_router, prefix="/api")
