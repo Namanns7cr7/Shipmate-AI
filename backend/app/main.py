@@ -3,6 +3,7 @@ load_dotenv()
 
 import os
 import re
+from io import BytesIO
 from typing import Callable
 
 from fastapi import FastAPI, Request
@@ -76,6 +77,8 @@ async def input_sanitization_middleware(request: Request, call_next: Callable):
                             status_code=400,
                             content={"detail": "Request contains disallowed content"},
                         )
+                # Cache body bytes back onto request scope so downstream handlers can read it
+                request._body = body
             except Exception:
                 pass
     
