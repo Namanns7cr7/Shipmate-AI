@@ -107,17 +107,78 @@ class BedrockProvider:
     ) -> BaseModel:
         """Synchronous version. Safe to call from inside a running event loop
         (e.g. from a FastAPI request handler). The boto3 SDK is sync; we just
-        skip the asyncio wrapping. Use this from `LLMService.enhance`."""
+        skip the asyncio wrapping. Use this from `LLMService.enhance`.
+
+        Includes a one-shot retry if Pydantic validation fails. Bedrock
+        occasionally serialises nested complex fields (`files: [...]`) as a
+        string with escape sequences that don't round-trip through json.loads
+        — when that happens we re-prompt with an explicit reminder that the
+        field must be a native JSON array, not a stringified one.
+        """
         model_id = self.smart_model if deployment_hint == "smart" else self.fast_model
         tool_name = f"emit_{schema_class.__name__}"
         schema = schema_class.model_json_schema()
         max_tokens = 8192
 
-        payload = self._call_converse(
-            model_id, tool_name, schema, system_prompt, user_prompt, max_tokens
-        )
-        coerced = _coerce_stringified_json(payload)
-        return schema_class.model_validate(coerced)
+        try:
+            payload = self._call_converse(
+                model_id, tool_name, schema, system_prompt, user_prompt, max_tokens
+            )
+            coerced = _coerce_stringified_json(payload)
+            return schema_class.model_validate(coerced)
+        except Exception as first_err:
+            from pydantic import ValidationError as _VE
+            err_str = str(first_err)
+            # Auto-recover from expired creds: rebuild the boto3 client on
+            # auth-class errors so the next call picks up freshly-refreshed
+            # ADA creds without needing a process restart. The default
+            # session caches credential providers, so simply discarding the
+            # client and rebuilding it is what triggers the refresh.
+            if any(m in err_str for m in (
+                "ExpiredToken", "ExpiredTokenException",
+                "InvalidSignatureException", "UnrecognizedClientException",
+                "Signature expired",
+            )):
+                logger.warning(
+                    "BedrockProvider: auth failure (%s) — rebuilding boto3 "
+                    "client to pick up refreshed credentials, then retrying once",
+                    type(first_err).__name__,
+                )
+                import boto3
+                from botocore.config import Config
+                self.client = boto3.client(
+                    "bedrock-runtime",
+                    region_name=os.getenv("AWS_REGION", "us-west-2"),
+                    config=Config(read_timeout=300, connect_timeout=10,
+                                  retries={"max_attempts": 1}),
+                )
+                payload = self._call_converse(
+                    model_id, tool_name, schema, system_prompt, user_prompt, max_tokens
+                )
+                coerced = _coerce_stringified_json(payload)
+                return schema_class.model_validate(coerced)
+
+            is_validation = isinstance(first_err, _VE) or "validation error" in err_str.lower()
+            if not is_validation:
+                raise
+            logger.warning(
+                "BedrockProvider: structured-output validation failed (%s); "
+                "retrying once with explicit array-not-string reminder",
+                err_str[:200],
+            )
+            retry_user = (
+                user_prompt
+                + "\n\n# RETRY NOTICE\nA prior attempt returned the `files` field "
+                "as a JSON-encoded STRING instead of a native JSON array, which "
+                "broke parsing. Return `files` as a native JSON array of "
+                "objects: `[{\"path\": ..., \"new_content\": ..., "
+                "\"rationale\": ...}, ...]`. Do not stringify the array."
+            )
+            payload = self._call_converse(
+                model_id, tool_name, schema, system_prompt, retry_user, max_tokens
+            )
+            coerced = _coerce_stringified_json(payload)
+            return schema_class.model_validate(coerced)
 
     async def invoke_structured(
         self,

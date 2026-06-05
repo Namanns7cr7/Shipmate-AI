@@ -160,10 +160,41 @@ def _resolve_target_paths(
                     paths.append(p)
 
     elif kind == "test":
-        # finding.file may carry SuggestedTest.target_file; if not set, synthesize.
-        if not paths:
+        # finding.file may already carry SuggestedTest.target_file (the
+        # production code under test). If so, KEEP it — Coder needs to see
+        # the real implementation to ground assertions. Then add a sibling
+        # test file to write into. Also include EXISTING test files for the
+        # same module — Coder must see them so it doesn't rewrite tests
+        # that are already passing (existing coverage rule #3).
+        prod_file = finding.file if finding.file in tree_set else None
+        if prod_file:
+            stem = prod_file.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+            # Find any existing test files that target this module.
+            existing = [
+                f for f in file_tree
+                if (f"test_{stem}" in f.rsplit("/", 1)[-1] or f"{stem}.test." in f.rsplit("/", 1)[-1])
+                and ("/tests/" in f or "/__tests__/" in f or "tests/" in f)
+            ][:2]
+            for ex in existing:
+                if ex not in paths:
+                    paths.append(ex)
+            # Add a target test path (creates new file if not in existing).
+            if prod_file.startswith("backend/"):
+                target_test = f"backend/tests/test_{stem}.py"
+            elif prod_file.startswith("frontend/"):
+                ext = prod_file.rsplit(".", 1)[1] if "." in prod_file else "ts"
+                target_test = f"frontend/src/__tests__/{stem}.test.{ext}"
+            else:
+                target_test = f"backend/tests/test_{stem}.py"
+            if target_test not in paths and target_test not in existing:
+                paths.append(target_test)
+        else:
             stem = _slugify(finding.id, max_len=40) or "case"
-            paths.append(f"tests/test_{stem}.py")
+            paths.append(f"backend/tests/test_{stem}.py")
+            # Also include the entry point so Coder has SOMETHING real to import.
+            for p in entry_points[:1]:
+                if p and p not in paths:
+                    paths.append(p)
 
     # 3. Fallback to top entry point.
     if not paths and entry_points:
@@ -276,6 +307,22 @@ def _detect_hallucinated_imports(
     return suspect
 
 
+_NEW_TEST_THEATER_PATTERNS = (
+    re.compile(r"status_code\s+in\s*[\(\[][^)\]]*4\d\d", re.MULTILINE),
+    re.compile(r"^\s*assert\s+True\s*$", re.MULTILINE),
+)
+
+
+def _looks_like_test_path(path: str) -> bool:
+    name = path.rsplit("/", 1)[-1]
+    return (
+        name.startswith("test_")
+        or name.endswith((".test.tsx", ".test.ts", ".spec.ts", ".spec.tsx"))
+        or "/tests/" in path
+        or "/__tests__/" in path
+    )
+
+
 def _lint_coder_output(
     coder_out: CoderOutput,
     target_files: Dict[str, str],
@@ -285,19 +332,30 @@ def _lint_coder_output(
     Returns a list of structural issues (empty list = pass). The orchestrator
     raises if any issue is fatal. Goal: catch the common Coder failure modes
     before we open a PR — hallucinated first-party imports, missing VERIFY
-    line, .gitkeep theater.
+    line, .gitkeep theater, NEW test theater patterns.
     """
     issues: List[str] = []
     for cf in coder_out.files:
-        if not cf.path.endswith(".py"):
-            continue
         original = target_files.get(cf.path, "")
-        bad = _detect_hallucinated_imports(cf.new_content, original, file_tree)
-        if bad:
-            issues.append(
-                f"{cf.path}: hallucinated first-party imports not in repo or "
-                f"original file: {bad}"
-            )
+
+        if cf.path.endswith(".py"):
+            bad = _detect_hallucinated_imports(cf.new_content, original, file_tree)
+            if bad:
+                issues.append(
+                    f"{cf.path}: hallucinated first-party imports not in repo or "
+                    f"original file: {bad}"
+                )
+
+        # NEW test theater = patterns Coder added that weren't in the original.
+        if _looks_like_test_path(cf.path):
+            for pat in _NEW_TEST_THEATER_PATTERNS:
+                if pat.search(cf.new_content) and not pat.search(original):
+                    issues.append(
+                        f"{cf.path}: introduces test theater pattern "
+                        f"`{pat.pattern[:50]}` (assertions accepting 4xx as success "
+                        f"or `assert True`)"
+                    )
+
         # Only flag .gitkeep inside dirs the codebase normally ignores —
         # bootstrapping an empty `nginx/certs/` or `data/` is legitimate.
         if re.search(
