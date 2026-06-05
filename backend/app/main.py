@@ -5,10 +5,15 @@ import os
 import re
 import json
 import time
+import hmac
+import hashlib
+import logging
 from collections import defaultdict
 from io import BytesIO
 from typing import Any, Callable
 from urllib.parse import urlparse
+
+logger = logging.getLogger("shipmate.main")
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -396,6 +401,28 @@ ALLOWED_ORIGINS: list[str] = [
     if origin.strip()
 ]
 
+
+def _is_origin_allowed(origin: str) -> bool:
+    """Exact-match check: is *origin* on the CORS allowlist? (SEC-004)
+
+    Deliberately strict — no prefix, suffix, or subdomain matching. This is
+    the guard that prevents spoofed origins a naive ``startswith``/substring
+    check would wrongly accept:
+
+    - ``http://localhost:5173.evil.com``  (prefix attack)  -> False
+    - ``http://evil.localhost:5173``      (subdomain)       -> False
+    - ``http://localhost:5173/``          (trailing slash)  -> False
+    - ``""``                              (empty)           -> False
+    - ``"*"``                             (wildcard)        -> False
+
+    A wildcard is never allowed because ``allow_credentials=True`` is
+    incompatible with ``*``. Returns True only for a byte-for-byte member of
+    ALLOWED_ORIGINS.
+    """
+    if not origin or "*" in origin:
+        return False
+    return origin in ALLOWED_ORIGINS
+
 # ---------------------------------------------------------------------------
 # Input sanitization — block code injection patterns in query params / headers
 # / request body before they reach any route handler.
@@ -436,23 +463,14 @@ async def _lifespan(app: "FastAPI"):
         from app.services import inflight_registry as _ir
         _ir.init_db()
     except Exception as e:  # pragma: no cover - startup best-effort
-        import logging
-        logging.getLogger("shipmate.main").warning(
-            "inflight_registry init failed: %s", e,
-        )
+        logger.warning("inflight_registry init failed: %s", e)
     try:
         from app.services.ci_watcher import CIWatcher
         resumed = CIWatcher.resume_from_db()
         if resumed:
-            import logging
-            logging.getLogger("shipmate.main").info(
-                "resumed %d CI watcher(s) after restart", resumed,
-            )
+            logger.info("resumed %d CI watcher(s) after restart", resumed)
     except Exception as e:  # pragma: no cover
-        import logging
-        logging.getLogger("shipmate.main").warning(
-            "CIWatcher resume failed: %s", e,
-        )
+        logger.warning("CIWatcher resume failed: %s", e)
 
     yield
     # --- shutdown --- (no-op; sqlite is durable per-commit)
@@ -503,10 +521,13 @@ async def sanitize_input_middleware(request: Request, call_next):
                 content={"detail": "Request contains disallowed content"},
             )
 
-    # 3. Request body (JSON and form-encoded only)
+    # 3. Request body — every text-based content type (JSON, form-urlencoded,
+    #    multipart/form-data, text/plain). Multipart uploads carry attacker-
+    #    controlled file bytes, so they must be scanned too; _is_text_content_type
+    #    enumerates the set.
     if request.method in ("POST", "PUT", "PATCH"):
         content_type = request.headers.get("content-type", "")
-        if "application/json" in content_type or "application/x-www-form-urlencoded" in content_type:
+        if _is_text_content_type(content_type):
             try:
                 from urllib.parse import unquote_plus
                 body_bytes = await request.body()
@@ -525,6 +546,34 @@ async def sanitize_input_middleware(request: Request, call_next):
             except Exception:
                 pass  # Don't crash on body-read errors; let the route handle it
 
+    return await call_next(request)
+
+
+@app.middleware("http")
+async def strict_cors_middleware(request: Request, call_next):
+    """Exact-match CORS guard layered on top of CORSMiddleware (SEC-004).
+
+    CORSMiddleware already declines to echo an origin that isn't on the
+    allowlist, but for a *preflight* (OPTIONS + Access-Control-Request-Method)
+    from a spoofed origin it still returns 200 with no CORS headers. That is
+    indistinguishable to a browser from a transient error and leaks no signal
+    to defenders. We make the rejection explicit: a preflight from an origin
+    that is not a byte-for-byte allowlist member gets a hard 403.
+
+    Non-preflight requests pass straight through — CORSMiddleware owns the
+    Access-Control-Allow-Origin reflection for those, and it only reflects
+    allowlisted origins, so a spoofed origin is never echoed.
+    """
+    origin = request.headers.get("origin")
+    is_preflight = (
+        request.method == "OPTIONS"
+        and request.headers.get("access-control-request-method") is not None
+    )
+    if origin and is_preflight and not _is_origin_allowed(origin):
+        return JSONResponse(
+            status_code=403,
+            content={"detail": "Origin not allowed"},
+        )
     return await call_next(request)
 
 
@@ -551,10 +600,36 @@ async def health():
     return {"status": "healthy", "agents": 4}
 
 
+def _verify_github_webhook_signature(body: bytes, signature_header: str) -> bool:
+    """Verify a GitHub webhook's X-Hub-Signature-256 header (HMAC-SHA256).
+
+    GitHub signs the raw request body with the shared secret (configured in
+    the repo's webhook settings) and sends ``sha256=<hexdigest>``. We recompute
+    the HMAC over the exact bytes we received and compare in constant time.
+
+    Returns False when:
+      - GITHUB_WEBHOOK_SECRET is unset (fail closed — never accept unsigned
+        webhooks in that case),
+      - the header is missing or malformed,
+      - the digests don't match.
+    """
+    secret = os.getenv("GITHUB_WEBHOOK_SECRET", "")
+    if not secret:
+        # Fail closed: without a configured secret we cannot authenticate the
+        # sender, so we reject rather than process attacker-controlled payloads.
+        logger.warning("GITHUB_WEBHOOK_SECRET not set — rejecting webhook")
+        return False
+    if not signature_header or not signature_header.startswith("sha256="):
+        return False
+    expected = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
+    provided = signature_header.split("=", 1)[1]
+    return hmac.compare_digest(expected, provided)
+
+
 @app.post("/webhooks/github")
 async def github_webhook(request: Request):
     """Handle GitHub webhook events for push and pull_request.
-    
+
     Validates webhook signature, extracts repository and branch info,
     and triggers automatic analysis.
     """

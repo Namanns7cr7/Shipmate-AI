@@ -1,4 +1,5 @@
 import pytest
+from fastapi import Request
 from fastapi.testclient import TestClient
 from app.main import app
 
@@ -6,17 +7,21 @@ from app.main import app
 client = TestClient(app)
 
 
+# Register the echo endpoint once at import time. The `request: Request`
+# annotation is required — without it FastAPI treats `request` as a body
+# field and rejects every call with 422 before the handler ever runs.
+@app.post("/test/echo")
+async def echo_handler(request: Request):
+    body = await request.json()
+    return {"received": body}
+
+
 class TestInputSanitizationMiddleware:
     """Integration tests for input sanitization middleware."""
 
     def test_valid_json_body_passes_through(self):
         """POST with valid JSON body should be received intact by the route handler."""
-        # Create a test endpoint that echoes back the received JSON
-        @app.post("/test/echo")
-        async def echo_handler(request):
-            body = await request.json()
-            return {"received": body}
-        
+
         payload = {"name": "test", "value": 42}
         response = client.post("/test/echo", json=payload)
         
