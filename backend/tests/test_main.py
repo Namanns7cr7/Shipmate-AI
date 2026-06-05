@@ -1,13 +1,12 @@
 import pytest
 from fastapi.testclient import TestClient
-from unittest.mock import patch, MagicMock
-import os
+import re
 
 from app.main import (
     app,
     _contains_dangerous_pattern,
-    ALLOWED_ORIGINS,
     _DANGEROUS_PATTERNS,
+    ALLOWED_ORIGINS,
 )
 
 
@@ -96,14 +95,11 @@ class TestRouteRegistration:
 
     def test_auth_router_prefix(self):
         """Verify auth router is registered with /api prefix."""
-        # Check that routes are registered (they should exist in the app)
         routes = [route.path for route in app.routes]
-        # Auth routes should be prefixed with /api
         assert any("/api/auth" in route for route in routes)
 
     def test_analysis_router_prefix(self):
         """Verify analysis router is registered with /api prefix."""
-        # Check that routes are registered (they should exist in the app)
         routes = [route.path for route in app.routes]
         # Analysis routes should be prefixed with /api
         assert any("/api/analyze" in route for route in routes)
@@ -121,15 +117,12 @@ class TestMiddlewareSetup:
         """Verify ALLOWED_ORIGINS is properly configured."""
         assert isinstance(ALLOWED_ORIGINS, list)
         assert len(ALLOWED_ORIGINS) > 0
-        # Default origins should include localhost variants
         assert any("localhost" in origin for origin in ALLOWED_ORIGINS)
 
     def test_cors_headers_on_request(self):
         """Verify CORS headers are present in response."""
         response = client.get("/", headers={"Origin": ALLOWED_ORIGINS[0]})
         assert response.status_code == 200
-        # CORS headers should be present
-        assert "access-control-allow-origin" in response.headers or response.status_code == 200
 
     def test_input_sanitization_middleware_blocks_eval(self):
         """Verify input sanitization middleware blocks eval patterns."""
@@ -166,8 +159,18 @@ class TestMiddlewareSetup:
     def test_input_sanitization_middleware_allows_safe_query(self):
         """Verify input sanitization middleware allows safe query parameters."""
         response = client.get("/?param=safe_value&other=123")
-        # Should not be blocked by sanitization (may 404 if route doesn't exist, but not 400)
         assert response.status_code != 400
+
+    def test_sanitize_input_middleware_allows_safe_request_passes_through(self):
+        """Verify safe requests with no dangerous patterns pass through middleware."""
+        response = client.get(
+            "/?query=benign&search=test",
+            headers={"X-Custom-Header": "safe-value"},
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["service"] == "ShipMate AI"
+        assert data["status"] == "operational"
 
     def test_input_sanitization_middleware_checks_headers(self):
         """Verify input sanitization middleware checks headers."""
@@ -176,17 +179,28 @@ class TestMiddlewareSetup:
 
     def test_input_sanitization_middleware_skips_auth_headers(self):
         """Verify input sanitization middleware skips Authorization header."""
-        # Authorization header should not be checked for dangerous patterns
         response = client.get("/", headers={"Authorization": "Bearer eval(1)"})
-        # Should not be blocked by sanitization (may fail auth, but not 400 from sanitization)
         assert response.status_code != 400
+
+    def test_sanitize_input_middleware_authorization_header_not_scanned(self):
+        """Verify Authorization header with eval( is not scanned, confirming exclusion list is respected."""
+        response = client.get("/", headers={"Authorization": "Bearer eval(1)"})
+        assert response.status_code == 200
+
+    def test_sanitize_input_middleware_authorization_header_with_dangerous_pattern_passes(self):
+        """Verify Authorization header containing dangerous pattern is not blocked, validating intentional exclusion."""
+        response = client.get("/", headers={"Authorization": "Bearer eval(x)"})
+        assert response.status_code == 200
 
     def test_input_sanitization_middleware_skips_cookie_headers(self):
         """Verify input sanitization middleware skips Cookie header."""
-        # Cookie header should not be checked for dangerous patterns
         response = client.get("/", headers={"Cookie": "session=eval(1)"})
-        # Should not be blocked by sanitization
         assert response.status_code != 400
+
+    def test_sanitize_input_middleware_subprocess_in_header_returns_400(self):
+        """Verify input sanitization middleware blocks subprocess patterns in custom X- headers."""
+        response = client.get("/", headers={"X-Custom-Header": "subprocess."})
+        assert response.status_code == 400
 
     def test_input_sanitization_middleware_checks_json_body(self):
         """Verify input sanitization middleware checks JSON request body."""
@@ -194,7 +208,6 @@ class TestMiddlewareSetup:
             "/api/auth/login",
             json={"username": "user", "password": "eval(1)"},
         )
-        # Should be blocked by sanitization (400) not by auth logic
         assert response.status_code == 400
 
     def test_input_sanitization_middleware_checks_form_body(self):
@@ -280,9 +293,19 @@ class TestDangerousPatternDetection:
 
     def test_dangerous_patterns_are_compiled_regex(self):
         """Verify dangerous patterns are compiled regex objects."""
-        import re
         for pattern in _DANGEROUS_PATTERNS:
             assert isinstance(pattern, re.Pattern)
+
+    def test_contains_dangerous_pattern_case_insensitive_exec_returns_true(self):
+        """Verify all patterns use re.IGNORECASE flag by testing mixed-case variants."""
+        # Test mixed-case variants of exec to ensure re.IGNORECASE is applied
+        assert _contains_dangerous_pattern("EXEC(") is True
+        assert _contains_dangerous_pattern("Exec(") is True
+        assert _contains_dangerous_pattern("eXeC(") is True
+        # Test mixed-case variants of eval
+        assert _contains_dangerous_pattern("EVAL(") is True
+        assert _contains_dangerous_pattern("Eval(") is True
+        assert _contains_dangerous_pattern("eVaL(") is True
 
 
 class TestCORSConfiguration:
@@ -290,13 +313,11 @@ class TestCORSConfiguration:
 
     def test_allowed_origins_from_env(self):
         """Verify ALLOWED_ORIGINS respects environment variable."""
-        # This test verifies the default configuration
         assert isinstance(ALLOWED_ORIGINS, list)
         assert len(ALLOWED_ORIGINS) > 0
 
     def test_allowed_origins_parsing(self):
         """Verify ALLOWED_ORIGINS are properly parsed and stripped."""
-        # All origins should be strings without leading/trailing whitespace
         for origin in ALLOWED_ORIGINS:
             assert isinstance(origin, str)
             assert origin == origin.strip()
@@ -304,8 +325,6 @@ class TestCORSConfiguration:
 
     def test_cors_credentials_enabled(self):
         """Verify CORS credentials are enabled."""
-        # This is configured in the middleware setup
-        # We verify by checking that the middleware exists
         middleware_names = [m.cls.__name__ for m in app.user_middleware]
         assert "CORSMiddleware" in middleware_names
 
@@ -336,7 +355,6 @@ class TestErrorHandling:
     def test_empty_query_parameters(self):
         """Verify empty query parameters are handled."""
         response = client.get("/?param=")
-        # Should not be blocked by sanitization
         assert response.status_code != 400
 
     def test_multiple_dangerous_patterns_in_query(self):
@@ -368,13 +386,11 @@ class TestIntegration:
     def test_docs_endpoint_exists(self):
         """Verify OpenAPI docs endpoint is accessible."""
         response = client.get("/docs")
-        # Should return HTML or redirect
         assert response.status_code in [200, 307, 308]
 
     def test_redoc_endpoint_exists(self):
         """Verify ReDoc endpoint is accessible."""
         response = client.get("/redoc")
-        # Should return HTML or redirect
         assert response.status_code in [200, 307, 308]
 
     def test_openapi_schema_available(self):

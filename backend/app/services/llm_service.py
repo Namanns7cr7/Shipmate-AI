@@ -1,40 +1,915 @@
 """
-LLM Service — Optional enhancement layer.
+LLM enhancement layer.
 
-In the MVP, agents use deterministic rule-based analysis.
-This service provides an integration point for adding LLM reasoning
-(Azure OpenAI, Anthropic, etc.) when available.
+The 4 agents (RepoLens, PlanForge, GuardRail, TestPilot) compute deterministic
+heuristic outputs first — file counts, has_tests flags, score formulas. After
+that they hand the result to `LLMService.enhance(...)`, which optionally calls
+an LLM to **rewrite the prose fields** (milestone descriptions, blocker
+resolutions, security recommendations, suggested-test prose) so they read as
+specific to *this* repo instead of generic templates.
 
-To enable: set AZURE_OPENAI_ENDPOINT + AZURE_OPENAI_API_KEY in .env
+What's enhanced (per agent):
+  - PlanForge:  milestones[].description, blockers[].resolution,
+                next_best_action, dependencies (order/clarity).
+  - GuardRail:  findings[].description, findings[].recommendation.
+  - TestPilot:  suggested_tests[].description, missing_coverage_areas.
+  - RepoLens:   (skipped — every field is heuristic, no template prose).
+
+What's NEVER touched:
+  - Numeric scores (repo_score, delivery_score, security_score, test_score).
+  - Booleans (has_tests, has_ci_cd, has_dockerfile).
+  - Counts (file_count, test count, finding count).
+  - Field shapes — we only update existing fields, never add/remove.
+
+If the LLM provider is unavailable, the call fails, or the response can't be
+parsed, `enhance(...)` returns `base_output` unchanged. The deterministic
+score and verdict are always present even with no Bedrock access.
 """
 
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
 import os
-from typing import Optional
+from typing import Any, Dict, List, Optional, Type, TypeVar
+
+from pydantic import BaseModel, Field
+
+from app.schemas.agent_schemas import (
+    Blocker, GuardRailOutput, Milestone, PlanForgeOutput,
+    SecurityFinding, Severity, SuggestedTest, TestPilotOutput,
+)
+
+logger = logging.getLogger("shipmate.llm_service")
+
+# ── Provider singleton ──────────────────────────────────────────────────────
+# Lazily created on first use; cached for the process lifetime. The provider
+# itself logs init failures (e.g. expired ADA creds) and falls back to None
+# so subsequent enhance() calls cheaply short-circuit.
+_provider: Optional[Any] = None
+_provider_init_attempted = False
+
+
+def _get_provider():
+    """Return a Bedrock provider singleton, or None if unavailable."""
+    global _provider, _provider_init_attempted
+    if _provider_init_attempted:
+        return _provider
+    _provider_init_attempted = True
+
+    kind = os.getenv("LLM_PROVIDER", "").lower()
+    if kind != "bedrock":
+        logger.info("LLMService: LLM_PROVIDER=%r → enhancements disabled", kind or "(unset)")
+        return None
+
+    try:
+        from app.services.bedrock_provider import BedrockProvider
+        _provider = BedrockProvider()
+        logger.info("LLMService: BedrockProvider ready")
+    except Exception as e:
+        logger.warning("LLMService: BedrockProvider init failed (%s); enhancements disabled", e)
+        _provider = None
+    return _provider
+
+
+# Markers in error strings that mean "AWS creds rolled over mid-process".
+# When we see one, reset the provider singleton so the NEXT call rebuilds
+# the boto3 client and picks up freshly-refreshed ADA creds at
+# ~/.aws/credentials — no backend restart needed.
+_TRANSIENT_AUTH_MARKERS = (
+    "ExpiredToken",
+    "ExpiredTokenException",
+    "InvalidSignatureException",
+    "UnrecognizedClientException",
+    "Signature expired",
+)
+
+
+def _maybe_invalidate_provider(err: BaseException) -> None:
+    """Reset the cached provider on auth-class errors so the next request retries fresh."""
+    global _provider, _provider_init_attempted
+    msg = str(err)
+    if any(m in msg for m in _TRANSIENT_AUTH_MARKERS):
+        logger.warning(
+            "LLMService: detected transient auth failure (%s) — invalidating "
+            "provider cache. Next request will rebuild boto3 with fresh "
+            "credentials. If you just ran `ada credentials update`, the next "
+            "analyze call should succeed.",
+            type(err).__name__,
+        )
+        _provider = None
+        _provider_init_attempted = False
+
+
+# ── Per-agent enhancement schemas ────────────────────────────────────────────
+# These are *partial* projections of the agent output schemas. Bedrock fills
+# only these prose-y fields; we then merge them back into the heuristic
+# base_output via Pydantic `model_copy(update=...)`.
+
+class _MilestoneEnhancement(BaseModel):
+    title: str = Field(..., description="Same milestone title from the input plan, repeated verbatim.")
+    description: str = Field(..., description="2-sentence repo-specific description of what to do and why it matters here.")
+
+
+class _BlockerEnhancement(BaseModel):
+    id: str = Field(..., description="Blocker id from input, verbatim.")
+    resolution: str = Field(..., description="One-paragraph concrete resolution tailored to this repo's tech stack and current state.")
+
+
+class PlanForgeEnhancement(BaseModel):
+    """Prose-only fields PlanForge can have rewritten."""
+    milestones: List[_MilestoneEnhancement] = Field(..., description="Same length as input milestones; same titles in same order.")
+    blockers: List[_BlockerEnhancement] = Field(..., description="Same length as input blockers; same ids in same order.")
+    next_best_action: str = Field(..., description="One actionable sentence — what to do RIGHT NOW given the repo state.")
+
+
+class _FindingEnhancement(BaseModel):
+    id: str = Field(..., description="Finding id from input, verbatim.")
+    description: str = Field(..., description="2-3 sentences explaining the actual risk in this repo.")
+    recommendation: str = Field(..., description="2-3 concrete steps the team should take to fix it.")
+
+
+class GuardRailEnhancement(BaseModel):
+    """Prose-only fields GuardRail can have rewritten."""
+    findings: List[_FindingEnhancement] = Field(..., description="Same length as input findings; same ids in same order.")
+
+
+class _SuggestedTestEnhancement(BaseModel):
+    name: str = Field(..., description="Test name from input, verbatim.")
+    description: str = Field(..., description="2 sentences: what this test should cover and why, given the repo's stack.")
+
+
+class TestPilotEnhancement(BaseModel):
+    """Prose-only fields TestPilot can have rewritten."""
+    suggested_tests: List[_SuggestedTestEnhancement] = Field(..., description="Same length and order as input.")
+    missing_coverage_areas: List[str] = Field(..., description="Same length and order as input; rephrase each item to be specific to this repo.")
+
+
+# ── Prompt builders ─────────────────────────────────────────────────────────
+
+def _repo_summary(context: Dict[str, Any]) -> str:
+    """A compact text blob describing the repo for the system prompt."""
+    info = context.get("repo_info") or {}
+    repo_lens = context.get("repo_lens")
+
+    parts = [
+        f"Repo: {info.get('full_name', '?')}",
+        f"Default branch: {context.get('branch', 'main')}",
+    ]
+    if info.get("description"):
+        parts.append(f"Description: {info['description']}")
+    if repo_lens is not None:
+        # repo_lens is a Pydantic model
+        parts.append(f"Tech stack: {', '.join(repo_lens.tech_stack) or '(unknown)'}")
+        parts.append(f"Primary language: {repo_lens.primary_language}")
+        parts.append(f"Architecture pattern: {repo_lens.architecture_pattern}")
+        parts.append(f"Has CI/CD: {repo_lens.has_ci_cd} · Dockerfile: {repo_lens.has_dockerfile} · Tests: {repo_lens.has_tests}")
+        parts.append(f"File count: {repo_lens.file_count}")
+        if repo_lens.key_modules:
+            parts.append(f"Key modules: {', '.join(repo_lens.key_modules[:8])}")
+        if repo_lens.entry_points:
+            parts.append(f"Entry points: {', '.join(repo_lens.entry_points[:5])}")
+        if repo_lens.architecture_risks:
+            risks = "; ".join(r.risk for r in repo_lens.architecture_risks[:5])
+            parts.append(f"Architecture risks: {risks}")
+    feature_ctx = context.get("feature_context")
+    if feature_ctx:
+        parts.append(f"Feature in scope: {feature_ctx[:300]}")
+    return "\n".join(parts)
+
+
+_AGENT_SYSTEM_PROMPTS: Dict[str, str] = {
+    "plan_forge": (
+        "You are a senior staff engineer reviewing a repo's release readiness. "
+        "Given a deterministic delivery plan (milestones + blockers + a next-best-action), "
+        "rewrite the PROSE so each item is concrete and specific to *this* repo's tech "
+        "stack, file layout, and current state. Preserve every milestone title and blocker "
+        "id verbatim. Do not invent new milestones or blockers."
+    ),
+    "guardrail": (
+        "You are an application-security engineer reviewing findings from a static analysis pass. "
+        "For each finding, rewrite the description so it explains the actual risk in *this* repo, "
+        "and rewrite the recommendation as 2-3 concrete remediation steps. Preserve every finding "
+        "id verbatim. Do not invent new findings or change severities."
+    ),
+    "testpilot": (
+        "You are a QA lead. Given suggested tests and a list of coverage gaps, rewrite the prose "
+        "so each test description and gap is specific to this repo's stack and entry points. "
+        "Preserve every test name verbatim. Do not invent new tests; do not remove items."
+    ),
+}
+
+
+def _user_prompt(agent_name: str, context: Dict[str, Any], base_output_dict: Dict[str, Any]) -> str:
+    return (
+        f"# Repo summary\n{_repo_summary(context)}\n\n"
+        f"# Current {agent_name} output (rewrite the PROSE fields only):\n"
+        f"{json.dumps(base_output_dict, indent=2)[:6000]}\n\n"
+        f"Return ONLY the requested enhancement schema. Match item ids/titles exactly."
+    )
+
+
+# ── Core enhance() — sync wrapper around the async provider call ────────────
+
+T = TypeVar("T", bound=BaseModel)
+
+_AGENT_TO_SCHEMA: Dict[str, Type[BaseModel]] = {
+    "plan_forge": PlanForgeEnhancement,
+    "guardrail":  GuardRailEnhancement,
+    "testpilot":  TestPilotEnhancement,
+}
+
+
+def _merge_plan_forge(base: PlanForgeOutput, enh: PlanForgeEnhancement) -> PlanForgeOutput:
+    # Match enriched milestones/blockers back by title/id, preserving order + length.
+    milestone_map = {m.title: m.description for m in enh.milestones}
+    blocker_map = {b.id: b.resolution for b in enh.blockers}
+    new_milestones = [m.model_copy(update={"description": milestone_map.get(m.title, m.description)})
+                       for m in base.milestones]
+    new_blockers = [b.model_copy(update={"resolution": blocker_map.get(b.id, b.resolution)})
+                     for b in base.blockers]
+    return base.model_copy(update={
+        "milestones": new_milestones,
+        "blockers": new_blockers,
+        "next_best_action": enh.next_best_action or base.next_best_action,
+    })
+
+
+def _merge_guardrail(base: GuardRailOutput, enh: GuardRailEnhancement) -> GuardRailOutput:
+    finding_map = {f.id: (f.description, f.recommendation) for f in enh.findings}
+    new_findings = []
+    for f in base.findings:
+        upd = finding_map.get(f.id)
+        if upd:
+            new_findings.append(f.model_copy(update={"description": upd[0], "recommendation": upd[1]}))
+        else:
+            new_findings.append(f)
+    return base.model_copy(update={"findings": new_findings})
+
+
+def _merge_testpilot(base: TestPilotOutput, enh: TestPilotEnhancement) -> TestPilotOutput:
+    desc_map = {t.name: t.description for t in enh.suggested_tests}
+    new_tests = [t.model_copy(update={"description": desc_map.get(t.name, t.description)})
+                 for t in base.suggested_tests]
+    new_gaps = list(enh.missing_coverage_areas) if enh.missing_coverage_areas else base.missing_coverage_areas
+    return base.model_copy(update={
+        "suggested_tests": new_tests,
+        "missing_coverage_areas": new_gaps,
+    })
+
+
+_MERGERS = {
+    "plan_forge": _merge_plan_forge,
+    "guardrail":  _merge_guardrail,
+    "testpilot":  _merge_testpilot,
+}
 
 
 class LLMService:
+    """Static helpers that 3 agents call after their heuristic compute."""
+
     _enabled: Optional[bool] = None
 
     @classmethod
     def is_available(cls) -> bool:
         if cls._enabled is None:
-            cls._enabled = bool(
-                os.getenv("AZURE_OPENAI_ENDPOINT") and os.getenv("AZURE_OPENAI_API_KEY")
-            ) or bool(os.getenv("OPENAI_API_KEY")) or bool(os.getenv("ANTHROPIC_API_KEY"))
+            cls._enabled = _get_provider() is not None
         return cls._enabled
 
     @classmethod
-    async def enhance_analysis(cls, agent_name: str, context: dict, base_output: dict) -> dict:
+    def enhance(cls, agent_name: str, context: Dict[str, Any], base_output: T) -> T:
         """
-        Optionally enhance a rule-based agent output with LLM reasoning.
-        Falls back gracefully to base_output if LLM is unavailable.
+        Optionally rewrite prose fields on `base_output` using the configured
+        LLM provider. Synchronous — agents are sync. On any failure, returns
+        `base_output` unchanged.
         """
-        if not cls.is_available():
+        provider = _get_provider()
+        if provider is None:
             return base_output
 
-        # Future: call Azure OpenAI / Anthropic here
-        # prompt = build_prompt(agent_name, context, base_output)
-        # response = await call_llm(prompt)
-        # return merge(base_output, parse(response))
+        schema = _AGENT_TO_SCHEMA.get(agent_name)
+        merger = _MERGERS.get(agent_name)
+        if schema is None or merger is None:
+            return base_output
 
+        system = _AGENT_SYSTEM_PROMPTS[agent_name]
+        user = _user_prompt(agent_name, context, base_output.model_dump())
+
+        try:
+            enhancement = provider.invoke_structured_sync(
+                system_prompt=system,
+                user_prompt=user,
+                schema_class=schema,
+                deployment_hint="smart" if agent_name == "guardrail" else "fast",
+            )
+        except Exception as e:
+            logger.warning("LLM enhance failed for %s: %s; using base output", agent_name, e)
+            _maybe_invalidate_provider(e)
+            return base_output
+
+        try:
+            return merger(base_output, enhancement)
+        except Exception as e:
+            logger.warning("LLM enhance merge failed for %s: %s; using base output", agent_name, e)
+            return base_output
+
+    # Kept for backward compatibility with the old async stub signature, in
+    # case something starts importing it later.
+    @classmethod
+    async def enhance_analysis(cls, agent_name: str, context: dict, base_output: dict) -> dict:
         return base_output
+
+    # ── Discovery (Bedrock invents NEW items grounded in real code) ─────────
+
+    @classmethod
+    def discover_plan_forge(
+        cls, context: Dict[str, Any], base: PlanForgeOutput,
+    ) -> PlanForgeOutput:
+        """
+        Ask Bedrock to invent up to 5 new milestones AND up to 3 new blockers
+        that aren't covered by the heuristic base. Each must cite which files
+        in the repo motivated it (rationale field). Output is merged onto base.
+
+        On any failure: returns `base` unchanged. Numeric scores untouched.
+        """
+        provider = _get_provider()
+        if provider is None:
+            logger.warning(
+                "PlanForge discovery skipped: LLM provider unavailable "
+                "(LLM_PROVIDER=%r, AWS creds may be expired). "
+                "Refresh ADA + restart the backend to enable AI discovery.",
+                os.getenv("LLM_PROVIDER", "(unset)"),
+            )
+            return base
+
+        try:
+            code_blob = _repo_code_blob(context, max_files=5, max_chars_per_file=3500)
+            user = _user_prompt_plan_discovery(context, base, code_blob)
+            discovery = provider.invoke_structured_sync(
+                system_prompt=_DISCOVERY_PLAN_SYSTEM,
+                user_prompt=user,
+                schema_class=PlanForgeDiscovery,
+                deployment_hint="smart",  # discovery is the slow + smart pass
+            )
+            return _merge_plan_discovery(base, discovery)
+        except Exception as e:
+            logger.warning("PlanForge discovery failed (%s); using base output", e)
+            _maybe_invalidate_provider(e)
+            return base
+
+    @classmethod
+    def discover_guardrail(
+        cls, context: Dict[str, Any], base: GuardRailOutput,
+    ) -> GuardRailOutput:
+        """
+        Ask Bedrock to read the auth/CORS/secrets-handling code and invent
+        security findings that the regex ruleset misses. Each finding cites
+        the file + reasoning. Merged onto base.
+        """
+        provider = _get_provider()
+        if provider is None:
+            logger.warning(
+                "GuardRail discovery skipped: LLM provider unavailable "
+                "(LLM_PROVIDER=%r, AWS creds may be expired). "
+                "Refresh ADA + restart the backend to enable AI discovery.",
+                os.getenv("LLM_PROVIDER", "(unset)"),
+            )
+            return base
+
+        try:
+            code_blob = _repo_code_blob(
+                context, max_files=6, max_chars_per_file=3500,
+                prefer=("auth", "cors", "main", "security", ".env", "config", "routes"),
+            )
+            user = _user_prompt_guardrail_discovery(context, base, code_blob)
+            discovery = provider.invoke_structured_sync(
+                system_prompt=_DISCOVERY_GUARDRAIL_SYSTEM,
+                user_prompt=user,
+                schema_class=GuardRailDiscovery,
+                deployment_hint="smart",
+            )
+            return _merge_guardrail_discovery(base, discovery)
+        except Exception as e:
+            logger.warning("GuardRail discovery failed (%s); using base output", e)
+            _maybe_invalidate_provider(e)
+            return base
+
+    @classmethod
+    def discover_testpilot(
+        cls, context: Dict[str, Any], base: TestPilotOutput,
+    ) -> TestPilotOutput:
+        """
+        Read the actual entry-point and route code, invent test cases that
+        target REAL functions/endpoints/edge cases instead of generic
+        templates (test_auth_flows, test_e2e_happy_path, etc.). Each
+        suggested test cites the file/function it targets. Merged onto base.
+        """
+        provider = _get_provider()
+        if provider is None:
+            logger.warning(
+                "TestPilot discovery skipped: LLM provider unavailable "
+                "(LLM_PROVIDER=%r). Tests will be the static template list.",
+                os.getenv("LLM_PROVIDER", "(unset)"),
+            )
+            return base
+
+        try:
+            code_blob = _repo_code_blob(
+                context, max_files=6, max_chars_per_file=3500,
+                prefer=("routes", "main", "api", "service", "agent", "handler"),
+            )
+            user = _user_prompt_testpilot_discovery(context, base, code_blob)
+            discovery = provider.invoke_structured_sync(
+                system_prompt=_DISCOVERY_TESTPILOT_SYSTEM,
+                user_prompt=user,
+                schema_class=TestPilotDiscovery,
+                deployment_hint="smart",
+            )
+            return _merge_testpilot_discovery(base, discovery)
+        except Exception as e:
+            logger.warning("TestPilot discovery failed (%s); using base output", e)
+            _maybe_invalidate_provider(e)
+            return base
+
+
+# ─── Discovery — schemas ─────────────────────────────────────────────────────
+# These are what Bedrock fills in. They're separate from PlanForgeOutput etc.
+# because we don't want the LLM to redefine fields it shouldn't (scores,
+# heuristic milestones, blocker counts).
+
+class _DiscoveredMilestone(BaseModel):
+    title: str = Field(..., description="Concise milestone title — 4-8 words.")
+    description: str = Field(..., description="2-3 sentence description specific to this repo.")
+    estimated_days: int = Field(..., ge=1, le=21, description="Realistic effort estimate in working days.")
+    priority: str = Field(..., description="One of: critical, high, medium, low.")
+    category: str = Field(..., description="One of: feature, testing, security, ci_cd, infra, docs.")
+    rationale: str = Field(..., description="WHY this matters — cite at least one file path or code construct from the repo.")
+
+
+class _DiscoveredBlocker(BaseModel):
+    title: str = Field(..., description="Concrete blocker title.")
+    description: str = Field(..., description="2-3 sentences on what's broken/missing in this repo.")
+    severity: str = Field(..., description="One of: critical, high, medium.")
+    resolution: str = Field(..., description="2-3 concrete steps to unblock.")
+    category: str = Field(..., description="e.g. ci_cd, testing, security, docs, structure, deps, config.")
+    rationale: str = Field(..., description="Cite specific files/constructs that prove this blocker exists.")
+
+
+class PlanForgeDiscovery(BaseModel):
+    """LLM-discovered improvements for THIS repo, grounded in actual code."""
+    milestones: List[_DiscoveredMilestone] = Field(
+        default_factory=list,
+        description="Up to 5 NEW milestones. Each must be specific to this repo's code, not generic.",
+    )
+    blockers: List[_DiscoveredBlocker] = Field(
+        default_factory=list,
+        description="Up to 3 NEW blockers. Skip anything already in the heuristic base.",
+    )
+
+
+class _DiscoveredFinding(BaseModel):
+    title: str = Field(..., description="Concise finding title — 4-8 words.")
+    severity: str = Field(..., description="One of: critical, high, medium, low, info.")
+    category: str = Field(..., description="One of: secrets, auth, cors, injection, deps, exposure, config.")
+    description: str = Field(..., description="2-3 sentences explaining the actual risk in this repo.")
+    recommendation: str = Field(..., description="2-3 concrete remediation steps.")
+    file: Optional[str] = Field(None, description="Specific file path where the risk lives, if known.")
+    rationale: str = Field(..., description="Cite the code pattern or construct that motivated this finding.")
+
+
+class GuardRailDiscovery(BaseModel):
+    """LLM-discovered security findings beyond the regex ruleset."""
+    findings: List[_DiscoveredFinding] = Field(
+        default_factory=list,
+        description="Up to 5 NEW findings. Skip anything already detected by the heuristic ruleset.",
+    )
+
+
+class _DiscoveredTest(BaseModel):
+    name: str = Field(..., description="snake_case test function name targeting a SPECIFIC function/endpoint in this repo (e.g. 'test_analyze_endpoint_handles_invalid_token').")
+    type: str = Field(..., description="One of: unit, integration, e2e, security, performance.")
+    priority: str = Field(..., description="One of: critical, high, medium, low.")
+    description: str = Field(..., description="2 sentences: what this test exercises and why it catches a real failure mode in THIS code.")
+    target_file: Optional[str] = Field(None, description="File path being tested (or where the test should live).")
+    rationale: str = Field(..., description="Cite the exact function/endpoint/branch this test covers, and why heuristic-template tests would miss it.")
+
+
+class TestPilotDiscovery(BaseModel):
+    """LLM-discovered test cases grounded in this repo's actual code paths."""
+    suggested_tests: List[_DiscoveredTest] = Field(
+        default_factory=list,
+        description="Up to 5 NEW tests. Each must target a real function/endpoint/edge-case in this repo, NOT a generic template (test_auth_flows, test_e2e_happy_path, etc).",
+    )
+    missing_coverage_areas: List[str] = Field(
+        default_factory=list,
+        description="Up to 3 specific code regions (file path + function/concern) currently uncovered. e.g. 'backend/app/orchestrator/shipmate_orchestrator.py — RepoLens enrichment merge logic'.",
+    )
+
+
+# ─── Discovery — code-blob builder ───────────────────────────────────────────
+
+def _repo_code_blob(
+    context: Dict[str, Any],
+    max_files: int = 5,
+    max_chars_per_file: int = 3500,
+    prefer: tuple = (),
+) -> str:
+    """
+    Build a compact text blob containing the file tree + the top-N most
+    relevant file contents for the LLM to reason about.
+
+    `prefer`: substrings that boost a file's relevance score. e.g. ("auth",
+    "cors") for the GuardRail discovery pass. RepoLens entry_points are
+    always given top priority.
+    """
+    file_tree: List[str] = context.get("file_tree") or []
+    key_files: Dict[str, str] = context.get("key_files") or {}
+    repo_lens = context.get("repo_lens")
+    entry_points = list(repo_lens.entry_points) if repo_lens else []
+
+    # Score every key_file path by how relevant it looks.
+    def _score(path: str) -> int:
+        s = 0
+        if path in entry_points:
+            s += 100
+        lp = path.lower()
+        for token in prefer:
+            if token in lp:
+                s += 30
+        # Penalize very common boilerplate.
+        if any(skip in lp for skip in ("__pycache__", "node_modules", ".min.", "lock")):
+            s -= 50
+        # Slight boost to short-ish source files.
+        if any(lp.endswith(ext) for ext in (".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".rs")):
+            s += 10
+        return s
+
+    # Filter to entries with content (key_files store both filename and full
+    # path keys; prefer the path-keyed entries to avoid duplicates).
+    candidates = [
+        (path, content)
+        for path, content in key_files.items()
+        if content and "/" in path
+    ]
+    if not candidates:
+        # Fallback to filename-keyed entries
+        candidates = [(p, c) for p, c in key_files.items() if c]
+
+    candidates.sort(key=lambda pc: _score(pc[0]), reverse=True)
+    selected = candidates[:max_files]
+
+    lines: List[str] = []
+    if file_tree:
+        # Top of the tree — first 60 paths is plenty of structural context.
+        lines.append("## File tree (first 60 entries)")
+        lines.extend(f"- {p}" for p in file_tree[:60])
+        lines.append("")
+
+    if selected:
+        lines.append(f"## Top {len(selected)} files (truncated to {max_chars_per_file} chars each)")
+        for path, content in selected:
+            snippet = content[:max_chars_per_file]
+            lines.append(f"\n### `{path}`")
+            lines.append("```")
+            lines.append(snippet)
+            if len(content) > max_chars_per_file:
+                lines.append(f"... [truncated; {len(content) - max_chars_per_file} more chars]")
+            lines.append("```")
+
+    return "\n".join(lines) if lines else "(no repo content available)"
+
+
+# ─── Discovery — system prompts ──────────────────────────────────────────────
+
+_DISCOVERY_PLAN_SYSTEM = (
+    "You are a senior staff engineer reviewing a repo for shipping readiness. "
+    "You have already been told what generic milestones a heuristic detector "
+    "produced. Your job: read the ACTUAL CODE provided and INVENT concrete, "
+    "repo-specific improvements the heuristic could not have found.\n\n"
+    "AIM FOR A BALANCED MIX across these four buckets — do NOT only emit "
+    "bugs. The heuristic already covers tests/CI/Docker/docs, so spend your "
+    "5 slots on things heuristics cannot see:\n"
+    "  • NEW FEATURES — capabilities the product is missing (new endpoints, "
+    "    new pages, new agent passes, integrations, batch flows, etc.).\n"
+    "  • EXISTING-FEATURE IMPROVEMENTS — UX/perf/quality tweaks to features "
+    "    that already exist (streaming where it batches, persistence where "
+    "    it's in-memory, caching, smarter defaults, retry/timeout policies).\n"
+    "  • CODE-QUALITY TWEAKS — refactors that reduce duplication or risk "
+    "    (extract a shared client, type-narrow returns, replace magic strings).\n"
+    "  • BUGS — concrete defects in the actual code paths.\n\n"
+    "Examples of GOOD discoveries (one per bucket — aim for this ratio):\n"
+    "  [FEATURE]      'no /api/repos/{repo}/history endpoint — store past "
+    "                  reports so the dashboard can show readiness over time'\n"
+    "  [IMPROVEMENT]  'analyze flow batches all 4 agents into one HTTP "
+    "                  response — stream per-agent results via SSE so the "
+    "                  AnalysisPage progress bar reflects real backend state'\n"
+    "  [TWEAK]        'api.ts duplicates the Authorization header in every "
+    "                  method — extract an axios client with default headers'\n"
+    "  [BUG]          'analyzer.py uses asyncio.gather without a timeout, "
+    "                  one slow agent can hang the whole request'\n"
+    "  [FEATURE]      'OAuth state is stored in-memory; persist to SQLite or "
+    "                  Redis so users don\\'t lose their session on uvicorn reload'\n\n"
+    "Examples of BAD discoveries (DO NOT EMIT):\n"
+    "  - 'add tests' / 'set up CI/CD' / 'write docs' / 'containerize' — already in heuristic base\n"
+    "  - vague advice not tied to specific code\n"
+    "  - duplicates of milestones already listed\n"
+    "  - hypothetical future architecture not justified by current code\n\n"
+    "Every milestone MUST cite at least one file path or code construct in "
+    "its rationale. Prefer category='feature' for new capabilities, "
+    "'infra' for product-improvement tweaks, 'docs' only for genuine "
+    "developer-facing gaps. Emit blockers ONLY for issues that genuinely "
+    "BLOCK shipping (broken paths, severe gaps); features and tweaks should "
+    "be milestones, not blockers. Quality over quantity — fewer balanced "
+    "items beats five bug-only ones."
+)
+
+_DISCOVERY_GUARDRAIL_SYSTEM = (
+    "You are a senior application-security engineer auditing a repo. A regex-"
+    "based ruleset has already flagged obvious issues (hardcoded secrets, .env "
+    "in git, wildcard CORS). Your job: read the auth, CORS, secrets-handling, "
+    "and request-routing code and find risks the regex pass cannot see.\n\n"
+    "Examples of GOOD discoveries:\n"
+    "  - 'access_token is accepted as a query param; ends up in server logs and Referer headers'\n"
+    "  - 'POST /api/analyze does not validate access_token before calling GitHub API'\n"
+    "  - 'OAuth state is stored in-memory and lost on uvicorn --reload, weakening CSRF protection'\n"
+    "  - 'PR creation endpoint trusts client-supplied owner/repo without authorization check'\n"
+    "  - 'asyncio.to_thread call to BedrockProvider has no timeout; long requests pin a worker thread'\n\n"
+    "Examples of BAD discoveries (DO NOT EMIT):\n"
+    "  - duplicates of existing findings (compare against the base list before emitting)\n"
+    "  - generic OWASP advice not grounded in this repo's code\n"
+    "  - false positives — only emit if you can point to a specific construct\n\n"
+    "Every finding MUST cite the file/function/line in its rationale. "
+    "If the heuristic base already covers the area, skip it."
+)
+
+_DISCOVERY_TESTPILOT_SYSTEM = (
+    "You are a senior QA engineer reviewing a repo for test coverage. The "
+    "heuristic agent has already produced a generic template list "
+    "(test_auth_flows, test_error_handling, test_e2e_happy_path) — those "
+    "are USELESS for this repo because they don't cite any real function. "
+    "Your job: read the ACTUAL CODE provided and propose tests that target "
+    "specific functions, endpoints, edge cases, or branches.\n\n"
+    "Examples of GOOD discoveries:\n"
+    "  - name='test_analyze_with_invalid_repo_name_returns_400', "
+    "    target_file='backend/app/api/routes/analysis.py', "
+    "    rationale='analyze() asserts request.owner+repo but the 400 path "
+    "    is not exercised; covers branches at routes/analysis.py:25-26'\n"
+    "  - name='test_repo_analysis_service_skips_binary_files', "
+    "    target_file='backend/app/services/repo_analysis_service.py', "
+    "    rationale='_fetch_files swallows binary fetch failures silently; "
+    "    needs a test that confirms binary content does not poison key_files'\n"
+    "  - name='test_actuate_returns_502_on_github_pr_failure', "
+    "    target_file='backend/app/api/routes/actuate.py', "
+    "    rationale='actuate route maps httpx.HTTPStatusError to 502 — verify "
+    "    the mapping and that the GitHub error body is preserved'\n"
+    "  - name='test_planforge_dedup_by_normalized_title', "
+    "    target_file='backend/app/services/llm_service.py', "
+    "    rationale='_merge_plan_discovery dedups by _norm_title — verify "
+    "    \"Set Up CI/CD\" and \"Set up CI CD\" map to same key'\n\n"
+    "Examples of BAD discoveries (DO NOT EMIT):\n"
+    "  - 'test_auth_flows' / 'test_error_handling' / 'test_e2e_happy_path' / "
+    "    'test_smoke_all_routes' (already in heuristic template — these are "
+    "    BANNED)\n"
+    "  - 'test the API works' (vague, no target)\n"
+    "  - tests for code that doesn't exist in this repo\n\n"
+    "Every test MUST have a specific target_file + rationale citing a "
+    "concrete function/branch. The test name MUST encode the case under "
+    "test (test_<thing>_<condition>_<expected>). Skip generic happy-path "
+    "tests entirely — those are heuristic territory."
+)
+
+
+# ─── Discovery — user prompt builders ────────────────────────────────────────
+
+def _user_prompt_plan_discovery(
+    context: Dict[str, Any], base: PlanForgeOutput, code_blob: str,
+) -> str:
+    base_titles = [m.title for m in base.milestones]
+    base_blocker_titles = [b.title for b in base.blockers]
+    return (
+        f"# Repo summary\n{_repo_summary(context)}\n\n"
+        f"# Heuristic milestones already covered (DO NOT duplicate)\n"
+        + ("\n".join(f"- {t}" for t in base_titles) or "(none)")
+        + f"\n\n# Heuristic blockers already covered (DO NOT duplicate)\n"
+        + ("\n".join(f"- {t}" for t in base_blocker_titles) or "(none)")
+        + f"\n\n# Repo code\n{code_blob[:18000]}\n\n"
+        "Now emit up to 5 NEW milestones and up to 3 NEW blockers that the "
+        "heuristic missed. Each item MUST cite a specific file path or code "
+        "construct in its rationale. Skip anything generic. Return ONLY the "
+        "PlanForgeDiscovery schema."
+    )
+
+
+def _user_prompt_guardrail_discovery(
+    context: Dict[str, Any], base: GuardRailOutput, code_blob: str,
+) -> str:
+    base_titles = [f.title for f in base.findings]
+    return (
+        f"# Repo summary\n{_repo_summary(context)}\n\n"
+        f"# Heuristic findings already covered (DO NOT duplicate)\n"
+        + ("\n".join(f"- {t}" for t in base_titles) or "(none)")
+        + f"\n\n# Repo code\n{code_blob[:18000]}\n\n"
+        "Read the code carefully. Emit up to 5 NEW findings the regex pass "
+        "missed. Cite the file + specific construct in each rationale. "
+        "Return ONLY the GuardRailDiscovery schema."
+    )
+
+
+def _user_prompt_testpilot_discovery(
+    context: Dict[str, Any], base: TestPilotOutput, code_blob: str,
+) -> str:
+    template_names = [t.name for t in base.suggested_tests]
+    return (
+        f"# Repo summary\n{_repo_summary(context)}\n\n"
+        f"# Static template tests already emitted (DO NOT duplicate, DO NOT mention these names)\n"
+        + ("\n".join(f"- {n}" for n in template_names) or "(none)")
+        + f"\n\n# Generic missing-coverage areas already noted\n"
+        + ("\n".join(f"- {a}" for a in base.missing_coverage_areas) or "(none)")
+        + f"\n\n# Repo code\n{code_blob[:18000]}\n\n"
+        "Now emit up to 5 NEW tests that target SPECIFIC functions, branches, "
+        "or endpoints in the code above. Each test name MUST encode the case "
+        "under test (e.g. test_<func>_<condition>_<expected>). Each MUST have "
+        "a target_file and rationale citing a real construct in this repo. "
+        "Also emit up to 3 missing_coverage_areas naming concrete code regions. "
+        "Return ONLY the TestPilotDiscovery schema."
+    )
+
+
+# ─── Discovery — merge / dedup ───────────────────────────────────────────────
+
+def _norm_title(s: str) -> str:
+    """Lowercase + strip non-alphanum for fuzzy dedupe."""
+    return "".join(c for c in s.lower() if c.isalnum())
+
+
+def _merge_plan_discovery(
+    base: PlanForgeOutput, disc: PlanForgeDiscovery,
+) -> PlanForgeOutput:
+    base_titles = {_norm_title(m.title) for m in base.milestones}
+    base_block_titles = {_norm_title(b.title) for b in base.blockers}
+
+    new_milestones: List[Milestone] = []
+    for d in disc.milestones[:5]:
+        if _norm_title(d.title) in base_titles:
+            continue  # dedup against heuristic
+        try:
+            new_milestones.append(Milestone(
+                title=d.title.strip()[:120],
+                description=d.description.strip(),
+                estimated_days=max(1, min(21, d.estimated_days)),
+                priority=d.priority.lower() if d.priority.lower() in
+                    {"critical", "high", "medium", "low"} else "medium",
+                category=d.category.lower() if d.category.lower() in
+                    {"feature", "testing", "security", "ci_cd", "infra", "docs"} else "feature",
+                source="discovery",
+                rationale=d.rationale.strip()[:600],
+            ))
+        except Exception as e:
+            logger.warning("Skipping malformed discovered milestone (%s)", e)
+
+    next_bid = len(base.blockers) + 1
+    new_blockers: List[Blocker] = []
+    for d in disc.blockers[:3]:
+        if _norm_title(d.title) in base_block_titles:
+            continue
+        try:
+            new_blockers.append(Blocker(
+                id=f"BLK-{next_bid:03d}",
+                title=d.title.strip()[:120],
+                description=d.description.strip(),
+                severity=d.severity.lower() if d.severity.lower() in
+                    {"critical", "high", "medium"} else "medium",
+                resolution=d.resolution.strip(),
+                category=d.category.strip().lower() or "structure",
+                source="discovery",
+                rationale=d.rationale.strip()[:600],
+            ))
+            next_bid += 1
+        except Exception as e:
+            logger.warning("Skipping malformed discovered blocker (%s)", e)
+
+    if not new_milestones and not new_blockers:
+        return base
+    return base.model_copy(update={
+        "milestones": list(base.milestones) + new_milestones,
+        "blockers": list(base.blockers) + new_blockers,
+    })
+
+
+_VALID_SEVERITY = {"critical", "high", "medium", "low", "info"}
+_VALID_GR_CATEGORY = {"secrets", "auth", "cors", "injection", "deps", "exposure", "config"}
+
+
+def _merge_guardrail_discovery(
+    base: GuardRailOutput, disc: GuardRailDiscovery,
+) -> GuardRailOutput:
+    base_keys = {(_norm_title(f.title), f.file or "") for f in base.findings}
+
+    next_id = 1
+    # Find next sec id by parsing existing ones
+    for f in base.findings:
+        if f.id.startswith("SEC-"):
+            try:
+                num = int(f.id.split("-")[1])
+                next_id = max(next_id, num + 1)
+            except (ValueError, IndexError):
+                pass
+
+    new_findings: List[SecurityFinding] = []
+    for d in disc.findings[:5]:
+        key = (_norm_title(d.title), d.file or "")
+        if key in base_keys:
+            continue
+        sev_str = d.severity.lower()
+        if sev_str not in _VALID_SEVERITY:
+            sev_str = "medium"
+        cat = d.category.lower()
+        if cat not in _VALID_GR_CATEGORY:
+            cat = "config"
+        try:
+            new_findings.append(SecurityFinding(
+                id=f"SEC-{next_id:03d}",
+                title=d.title.strip()[:120],
+                severity=Severity(sev_str),
+                category=cat,
+                description=d.description.strip(),
+                recommendation=d.recommendation.strip(),
+                file=d.file,
+                source="discovery",
+                rationale=d.rationale.strip()[:600],
+            ))
+            next_id += 1
+        except Exception as e:
+            logger.warning("Skipping malformed discovered finding (%s)", e)
+
+    if not new_findings:
+        return base
+
+    # Re-sort the combined list by severity so discovery findings interleave
+    # naturally with heuristic ones.
+    SEV_ORDER = {Severity.CRITICAL: 0, Severity.HIGH: 1, Severity.MEDIUM: 2,
+                 Severity.LOW: 3, Severity.INFO: 4}
+    combined = list(base.findings) + new_findings
+    combined.sort(key=lambda f: SEV_ORDER.get(f.severity, 99))
+    return base.model_copy(update={"findings": combined})
+
+
+_VALID_TEST_TYPE = {"unit", "integration", "e2e", "security", "performance"}
+_VALID_PRIORITY = {"critical", "high", "medium", "low"}
+
+# Heuristic template names — block these from being re-emitted by the LLM
+# even if our prompt warning fails. Substring match against discovery names.
+_TEMPLATE_TEST_NAMES = {
+    "test_smoke_all_routes",
+    "test_auth_flows",
+    "test_error_handling",
+    "test_e2e_happy_path",
+}
+
+
+def _merge_testpilot_discovery(
+    base: TestPilotOutput, disc: TestPilotDiscovery,
+) -> TestPilotOutput:
+    base_names = {_norm_title(t.name) for t in base.suggested_tests}
+
+    new_tests: List[SuggestedTest] = []
+    for d in disc.suggested_tests[:5]:
+        norm = _norm_title(d.name)
+        if norm in base_names:
+            continue
+        # Block obvious template-name leakage even though the prompt forbids it.
+        if any(_norm_title(tpl) == norm for tpl in _TEMPLATE_TEST_NAMES):
+            logger.info("TestPilot discovery: dropped template-shaped name %r", d.name)
+            continue
+        ttype = d.type.lower()
+        if ttype not in _VALID_TEST_TYPE:
+            ttype = "unit"
+        prio = d.priority.lower()
+        if prio not in _VALID_PRIORITY:
+            prio = "medium"
+        try:
+            new_tests.append(SuggestedTest(
+                name=d.name.strip()[:120],
+                type=ttype,
+                priority=prio,
+                description=d.description.strip(),
+                target_file=d.target_file,
+                source="discovery",
+                rationale=d.rationale.strip()[:600],
+            ))
+        except Exception as e:
+            logger.warning("Skipping malformed discovered test (%s)", e)
+
+    new_gaps: List[str] = []
+    for area in (disc.missing_coverage_areas or [])[:3]:
+        a = area.strip()
+        if a and a not in base.missing_coverage_areas and a not in new_gaps:
+            new_gaps.append(a[:200])
+
+    if not new_tests and not new_gaps:
+        return base
+    return base.model_copy(update={
+        "suggested_tests": list(base.suggested_tests) + new_tests,
+        "missing_coverage_areas": list(base.missing_coverage_areas) + new_gaps,
+    })

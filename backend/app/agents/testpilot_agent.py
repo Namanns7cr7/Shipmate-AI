@@ -5,6 +5,7 @@ from .base_agent import BaseAgent
 from ..schemas.agent_schemas import (
     TestPilotOutput, ExistingTests, SuggestedTest, RepoLensOutput
 )
+from ..services.llm_service import LLMService
 
 _TEST_FRAMEWORKS_PY = {"pytest", "unittest", "nose", "hypothesis", "behave"}
 _TEST_FRAMEWORKS_JS = {"jest", "vitest", "mocha", "jasmine", "cypress", "playwright", "@testing-library"}
@@ -53,7 +54,7 @@ class TestPilotAgent(BaseAgent):
         qa_readiness = "ready" if coverage_est >= 60 else ("partial" if test_files else "not_ready")
         score = self._score(test_files, coverage_est, missing)
 
-        return TestPilotOutput(
+        base = TestPilotOutput(
             existing_tests=ExistingTests(
                 count=len(test_files),
                 coverage_estimate=coverage_est,
@@ -65,6 +66,11 @@ class TestPilotAgent(BaseAgent):
             qa_readiness=qa_readiness,
             test_score=score,
         )
+        # Step 1: rewrite prose on heuristic suggestions.
+        enhanced = LLMService.enhance(self.name, context, base)
+        # Step 2: append code-grounded LLM-discovered tests targeting real
+        # functions/endpoints, replacing the static template feel.
+        return LLMService.discover_testpilot(context, enhanced)
 
     def _detect_frameworks(self, kf: Dict[str, str], tree: List[str]) -> List[str]:
         found = []
@@ -125,6 +131,12 @@ class TestPilotAgent(BaseAgent):
 
     def _suggest_tests(self, repo_lens, test_files, feature_ctx, missing) -> List[SuggestedTest]:
         suggestions: List[SuggestedTest] = []
+        # Lower-cased existing test paths for theme-detection so we don't
+        # re-suggest test_auth_flows when test_auth_*.py is already there.
+        existing_lower = " ".join(test_files).lower()
+
+        def _theme_already_covered(*needles: str) -> bool:
+            return any(n in existing_lower for n in needles)
 
         if not test_files:
             suggestions.append(SuggestedTest(
@@ -160,26 +172,29 @@ class TestPilotAgent(BaseAgent):
                     target_file=entry,
                 ))
 
-        suggestions.append(SuggestedTest(
-            name="test_auth_flows",
-            type="security",
-            priority="critical",
-            description="Verify authentication: valid tokens pass, expired/invalid tokens are rejected, "
-                        "privilege escalation is prevented.",
-        ))
-        suggestions.append(SuggestedTest(
-            name="test_error_handling",
-            type="unit",
-            priority="medium",
-            description="Test that error conditions return appropriate status codes and messages, "
-                        "without leaking internal stack traces.",
-        ))
-        suggestions.append(SuggestedTest(
-            name="test_e2e_happy_path",
-            type="e2e",
-            priority="high",
-            description="End-to-end test of the primary user journey from login to core feature usage.",
-        ))
+        if not _theme_already_covered("auth", "login", "oauth"):
+            suggestions.append(SuggestedTest(
+                name="test_auth_flows",
+                type="security",
+                priority="critical",
+                description="Verify authentication: valid tokens pass, expired/invalid tokens are rejected, "
+                            "privilege escalation is prevented.",
+            ))
+        if not _theme_already_covered("error", "exception", "fail"):
+            suggestions.append(SuggestedTest(
+                name="test_error_handling",
+                type="unit",
+                priority="medium",
+                description="Test that error conditions return appropriate status codes and messages, "
+                            "without leaking internal stack traces.",
+            ))
+        if not _theme_already_covered("e2e", "happy_path", "integration"):
+            suggestions.append(SuggestedTest(
+                name="test_e2e_happy_path",
+                type="e2e",
+                priority="high",
+                description="End-to-end test of the primary user journey from login to core feature usage.",
+            ))
 
         return suggestions[:10]
 

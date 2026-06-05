@@ -65,7 +65,7 @@ export function LiveAgentPreview() {
                     </div>
                   </div>
                 </div>
-                {st === 'running'  ? <Spinner size={13} color={a.hex} dark={false} />
+                {st === 'running'  ? <span style={{ color: a.hex, display: 'inline-flex' }}><Spinner size={13} /></span>
                  : st === 'complete' ? <CheckCircle2 size={16} style={{ color: a.hex }} />
                  : <span className="dot" style={{ background: 'var(--ink-4)' }} />}
               </div>

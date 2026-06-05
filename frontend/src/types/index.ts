@@ -83,6 +83,8 @@ export interface Milestone {
   estimated_days: number;
   priority: string;
   category: string;
+  source?: 'heuristic' | 'discovery';
+  rationale?: string | null;
 }
 
 export interface Blocker {
@@ -92,6 +94,8 @@ export interface Blocker {
   severity: string;
   resolution: string;
   category: string;
+  source?: 'heuristic' | 'discovery';
+  rationale?: string | null;
 }
 
 export interface PlanForgeOutput {
@@ -112,6 +116,8 @@ export interface SecurityFinding {
   recommendation: string;
   file?: string;
   cve?: string;
+  source?: 'heuristic' | 'discovery';
+  rationale?: string | null;
 }
 
 export interface GuardRailOutput {
@@ -136,6 +142,8 @@ export interface SuggestedTest {
   priority: string;
   description: string;
   target_file?: string;
+  source?: 'heuristic' | 'discovery';
+  rationale?: string | null;
 }
 
 export interface TestPilotOutput {
@@ -188,6 +196,43 @@ export interface ShipMateReport {
 export interface AnalyzeResponse {
   status: string;
   report: ShipMateReport;
+}
+
+// ── Actuate (Coder agent) ─────────────────────────────────────────────────────
+
+export type FindingKind = 'guardrail' | 'milestone' | 'blocker' | 'test' | 'next_action';
+
+export interface FindingPayload {
+  kind: FindingKind;
+  id: string;
+  title: string;
+  description: string;
+  recommendation?: string;
+  file?: string;
+  severity?: string;
+  category?: string;
+}
+
+export interface RepoLensSummary {
+  primary_language?: string;
+  tech_stack?: string[];
+  entry_points?: string[];
+  has_ci_cd?: boolean;
+  has_tests?: boolean;
+}
+
+export interface ActuatedFile {
+  path: string;
+  rationale: string;
+}
+
+export interface ActuateResponse {
+  status: string;
+  pr_url?: string | null;
+  branch_name: string;
+  files_changed: ActuatedFile[];
+  skipped: string[];
+  summary: string;
 }
 
 // ── App state ─────────────────────────────────────────────────────────────────

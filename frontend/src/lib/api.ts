@@ -1,5 +1,8 @@
 import axios from 'axios';
-import type { AnalyzeResponse, GitHubRepo, GitHubBranch, GitHubPR } from '../types';
+import type {
+  AnalyzeResponse, GitHubRepo, GitHubBranch, GitHubPR,
+  ActuateResponse, FindingPayload, RepoLensSummary,
+} from '../types';
 
 const BASE = '/api';
 
@@ -63,6 +66,26 @@ export const api = {
     feature_context?: string;
   }): Promise<AnalyzeResponse> {
     const { data } = await gh.post<AnalyzeResponse>('/analyze', params);
+    return data;
+  },
+
+  // ── Actuate (Coder → branch + PR) ───────────────────────────────────────
+
+  async actuate(params: {
+    owner: string;
+    repo: string;
+    branch: string;
+    access_token: string;
+    finding: FindingPayload;
+    context?: RepoLensSummary;
+    open_pr?: boolean;
+  }): Promise<ActuateResponse> {
+    // Coder + GitHub PR creation can take ~15-25s; bump the timeout above
+    // axios's default 0 (which would actually never time out) only to add
+    // an explicit upper bound that surfaces a clean error.
+    const { data } = await gh.post<ActuateResponse>('/actuate', params, {
+      timeout: 120_000,
+    });
     return data;
   },
 };

@@ -152,7 +152,23 @@ class RepoLensAgent(BaseAgent):
             "server.ts", "server.js", "main.ts", "main.js",
             "app.ts", "app.js", "main.go",
         }
-        return [f for f in tree if Path(f).name in ENTRIES][:8]
+        EXCLUDE_DIR_TOKENS = ("/types/", "/__tests__/", "/tests/", "/mocks/",
+                              "/mock/", "/fixtures/", "/stubs/", "/__mocks__/",
+                              "/.storybook/", "/dist/", "/build/")
+        out: List[str] = []
+        for f in tree:
+            if Path(f).name not in ENTRIES:
+                continue
+            # `index.ts/js` re-export files in /types/, /__tests__/ etc are
+            # NOT real app entry points — they're definitions or mocks. Only
+            # accept the entry filename when it's at a meaningful location.
+            normalized = "/" + f
+            if any(tok in normalized for tok in EXCLUDE_DIR_TOKENS):
+                continue
+            out.append(f)
+            if len(out) >= 8:
+                break
+        return out
 
     def _config_files(self, tree: List[str]) -> List[str]:
         CONFIGS = {

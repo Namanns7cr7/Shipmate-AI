@@ -4,6 +4,7 @@ from .base_agent import BaseAgent
 from ..schemas.agent_schemas import (
     PlanForgeOutput, Milestone, Blocker, RepoLensOutput
 )
+from ..services.llm_service import LLMService
 
 
 class PlanForgeAgent(BaseAgent):
@@ -14,15 +15,16 @@ class PlanForgeAgent(BaseAgent):
         repo_lens: RepoLensOutput = context.get("repo_lens")
         feature_ctx = self._feature_context(context)
         info = self._repo_info(context)
+        tree = self._file_tree(context)
 
-        milestones = self._build_milestones(repo_lens, feature_ctx)
+        milestones = self._build_milestones(repo_lens, feature_ctx, tree)
         blockers = self._build_blockers(repo_lens)
         deps = self._infer_dependencies(repo_lens)
         next_action = self._next_best_action(blockers, repo_lens)
         effort = self._estimate_effort(milestones)
         score = self._score(blockers, milestones)
 
-        return PlanForgeOutput(
+        base = PlanForgeOutput(
             milestones=milestones,
             blockers=blockers,
             dependencies=deps,
@@ -30,9 +32,19 @@ class PlanForgeAgent(BaseAgent):
             estimated_effort=effort,
             delivery_score=score,
         )
+        # Step 1: rewrite prose on heuristic items.
+        enhanced = LLMService.enhance(self.name, context, base)
+        # Step 2: append LLM-discovered milestones/blockers grounded in real code.
+        return LLMService.discover_plan_forge(context, enhanced)
 
-    def _build_milestones(self, rl: RepoLensOutput, feature_ctx: str) -> List[Milestone]:
+    def _build_milestones(
+        self, rl: RepoLensOutput, feature_ctx: str, tree: List[str],
+    ) -> List[Milestone]:
         ms: List[Milestone] = []
+        has_readme = any(
+            f.lower().split("/")[-1] in {"readme.md", "readme", "readme.rst", "readme.txt"}
+            for f in tree
+        )
 
         if feature_ctx:
             ms.append(Milestone(
@@ -52,13 +64,23 @@ class PlanForgeAgent(BaseAgent):
                 category="testing",
             ))
         else:
-            ms.append(Milestone(
-                title="Expand Test Coverage",
-                description="Add tests for uncovered paths, edge cases, and any new feature code.",
-                estimated_days=2,
-                priority="high",
-                category="testing",
+            # Only suggest "Expand Test Coverage" when the test ratio is
+            # actually thin. Heuristic: count test files vs source files in the
+            # tree. Fire only when tests < 20% of source. Above that, leave
+            # coverage discoveries to the LLM (which can cite specific gaps).
+            test_files = sum(1 for f in tree if any(
+                t in f.lower() for t in ("test_", "_test.", ".test.", ".spec.", "/tests/", "/test/", "/spec/")
             ))
+            src_files = sum(1 for f in tree if f.endswith((".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".rs")))
+            thin_coverage = src_files > 10 and test_files * 5 < src_files
+            if thin_coverage:
+                ms.append(Milestone(
+                    title="Expand Test Coverage",
+                    description="Add tests for uncovered paths, edge cases, and any new feature code.",
+                    estimated_days=2,
+                    priority="high",
+                    category="testing",
+                ))
 
         if not rl.has_ci_cd:
             ms.append(Milestone(
@@ -89,8 +111,7 @@ class PlanForgeAgent(BaseAgent):
                 category="infra",
             ))
 
-        # Always add docs milestone if no readme
-        if not any("readme" in f.lower() for f in rl.config_files):
+        if not has_readme:
             ms.append(Milestone(
                 title="Write Project Documentation",
                 description="Create README, API docs, and deployment guide for the team.",
@@ -99,13 +120,17 @@ class PlanForgeAgent(BaseAgent):
                 category="docs",
             ))
 
-        ms.append(Milestone(
-            title="Production Readiness Review",
-            description="Final review: load testing, monitoring setup, rollback plan, and stakeholder sign-off.",
-            estimated_days=2,
-            priority="high",
-            category="infra",
-        ))
+        # Production-readiness milestone: ONLY if real shipping risks exist
+        # (no CI, no tests, no Docker, or critical security findings). For a
+        # repo that already has CI + tests + Docker, this is just noise.
+        if (not rl.has_ci_cd) or (not rl.has_tests) or (not rl.has_dockerfile) or sec_risks:
+            ms.append(Milestone(
+                title="Production Readiness Review",
+                description="Final review: load testing, monitoring setup, rollback plan, and stakeholder sign-off.",
+                estimated_days=2,
+                priority="high",
+                category="infra",
+            ))
 
         return ms
 
