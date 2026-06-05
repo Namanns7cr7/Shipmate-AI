@@ -1,5 +1,5 @@
 import { useState, useCallback, useEffect, useRef } from 'react';
-import { Zap, Bell, GitBranch, BookOpen, Clock } from 'lucide-react';
+import { Zap, Bell, BookOpen, Clock } from 'lucide-react';
 import { useGithubAuth } from './hooks/useGithubAuth';
 import { api } from './lib/api';
 import { LandingPage } from './components/landing/LandingPage';
@@ -9,6 +9,7 @@ import { RepositoriesPage } from './pages/RepositoriesPage';
 import { AnalysisPage } from './pages/AnalysisPage';
 import { ReportsPage } from './pages/ReportsPage';
 import { Spinner } from './components/ui/GitHubConnectButton';
+import { BranchPicker } from './components/ui/BranchPicker';
 import type { Page } from './components/app/AppSidebar';
 import type { AgentProgress, GitHubRepo, GitHubPR, ShipMateReport } from './types';
 
@@ -155,14 +156,11 @@ export default function App() {
 
   const handleSelectRepo = useCallback(async (repo: GitHubRepo) => {
     setSelectedRepo(repo);
+    // Pick the default branch on repo switch. The BranchPicker dropdown
+    // lets the user override before analyze fires; once the user picks
+    // a non-default branch it stays sticky until they switch repos.
     setSelectedBranch(repo.default_branch || 'main');
-    if (!auth.accessToken) return;
-    const [owner, repoName] = repo.full_name.split('/');
-    try {
-      const branches = await api.getBranches(owner, repoName, auth.accessToken);
-      setSelectedBranch(repo.default_branch || branches[0]?.name || 'main');
-    } catch (e) { console.error('Failed to load repo data', e); }
-  }, [auth.accessToken]);
+  }, []);
 
   const handleAnalyze = useCallback(async (repo?: GitHubRepo) => {
     const target = repo ?? selectedRepo;
@@ -235,7 +233,14 @@ export default function App() {
               {selectedRepo && (
                 <>
                   <span className="mono chip tone-slate"><BookOpen size={12} /> {selectedRepo.name}</span>
-                  <span className="mono chip tone-slate"><GitBranch size={12} /> {selectedBranch}</span>
+                  <BranchPicker
+                    repoFullName={selectedRepo.full_name}
+                    defaultBranch={selectedRepo.default_branch}
+                    selected={selectedBranch}
+                    onChange={setSelectedBranch}
+                    accessToken={auth.accessToken}
+                    disabled={analyzing}
+                  />
                 </>
               )}
               <span className="chip tone-slate">
