@@ -87,7 +87,7 @@ jobs:
         run: PYTHONPATH=. pytest --tb=short --ignore=tests/integration -q
 
   # ──────────────────────────────────────────────
-  # Docker — build image to catch integration issues
+  # Docker — build both images to catch integration issues
   # ──────────────────────────────────────────────
   docker:
     name: Docker Build
@@ -101,11 +101,22 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build Docker image
+      - name: Build backend Docker image
         uses: docker/build-push-action@v5
         with:
           context: .
+          file: backend/Dockerfile
           push: false
-          tags: shipmate-ai:ci
+          tags: shipmate-backend:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build frontend Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: frontend/Dockerfile
+          push: false
+          tags: shipmate-frontend:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
