@@ -422,12 +422,49 @@ def _contains_dangerous_pattern(text: str) -> bool:
     return any(p.search(text) for p in _DANGEROUS_PATTERNS)
 
 
+from contextlib import asynccontextmanager
+
+
+@asynccontextmanager
+async def _lifespan(app: "FastAPI"):
+    """Startup: initialize the inflight-registry sqlite (creates tables) and
+    re-spawn CIWatcher supervisors for any PR still being watched when the
+    backend last stopped (uvicorn --reload restarts on every code change).
+    Shutdown: nothing to flush — sqlite commits are synchronous per write."""
+    # --- startup ---
+    try:
+        from app.services import inflight_registry as _ir
+        _ir.init_db()
+    except Exception as e:  # pragma: no cover - startup best-effort
+        import logging
+        logging.getLogger("shipmate.main").warning(
+            "inflight_registry init failed: %s", e,
+        )
+    try:
+        from app.services.ci_watcher import CIWatcher
+        resumed = CIWatcher.resume_from_db()
+        if resumed:
+            import logging
+            logging.getLogger("shipmate.main").info(
+                "resumed %d CI watcher(s) after restart", resumed,
+            )
+    except Exception as e:  # pragma: no cover
+        import logging
+        logging.getLogger("shipmate.main").warning(
+            "CIWatcher resume failed: %s", e,
+        )
+
+    yield
+    # --- shutdown --- (no-op; sqlite is durable per-commit)
+
+
 app = FastAPI(
     title="ShipMate AI",
     description="AI-native multi-agent release readiness platform",
     version="2.0.0",
     docs_url="/docs",
     redoc_url="/redoc",
+    lifespan=_lifespan,
 )
 
 # NOTE: CORSMiddleware is kept so that preflight Allow-Methods / Allow-Headers

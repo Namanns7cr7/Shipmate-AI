@@ -13,8 +13,13 @@ Flow per registered PR:
      identical-patch hash (Coder is hallucinating in a loop).
   5. On cap exhaustion → post a PR comment escalating to a human.
 
-In-memory registry only — fine for hackathon. Production: persist to
-SQLite (Guardian pulls that in next).
+State-of-record is sqlite (InflightRegistry.ci_watch_state) so an open PR's
+watch survives a backend restart — uvicorn --reload fires on every code
+change in dev, and without persistence each reload abandoned in-flight PRs.
+The asyncio.Task handles still live in the in-process `_tasks` dict (you
+can't pickle a coroutine), but the durable facts (status, attempts, finding,
+token) round-trip through sqlite. On startup, `resume_from_db()` re-spawns
+supervisors for any row still in a non-terminal state.
 
 Supervisor runs as an asyncio.Task, so /api/actuate latency is unchanged
 (the orchestrator returns immediately after register()).
@@ -31,6 +36,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from app.agents.coder_agent import CoderAgent, CoderBrief, CoderOutput
 from app.schemas.api_schemas import FindingPayload, RepoLensSummary
+from app.services import inflight_registry as ir
 from app.services.github_actions_service import (
     CheckRunStatus, GitHubActionsService,
 )
@@ -126,6 +132,7 @@ class CIWatcher:
         if key in cls._tasks:
             cls._tasks[key].cancel()
         cls._registry[key] = entry
+        cls._persist(entry)  # durable state-of-record before the task starts
         # Bind the asyncio task so it stays alive even after register() returns.
         cls._tasks[key] = asyncio.create_task(
             cls._supervise(entry), name=f"ci-watch-{owner}-{repo}-{pr_number}",
@@ -137,22 +144,141 @@ class CIWatcher:
 
     @classmethod
     def list_active(cls) -> List[Dict[str, Any]]:
-        return [e.to_dict() for e in cls._registry.values()]
+        """Live in-process entries first; fall back to sqlite for rows whose
+        supervisor task isn't running in THIS process (e.g. right after a
+        restart before resume_from_db, or watches started by the CLI loop)."""
+        live = {e.key(): e.to_dict() for e in cls._registry.values()}
+        try:
+            for row in ir.list_ci_watches():
+                key = (row["owner"], row["repo"], row["pr_number"])
+                if key not in live:
+                    live[key] = cls._row_to_dict(row)
+        except Exception as e:
+            logger.debug("list_active: sqlite read failed: %s", e)
+        return list(live.values())
 
     @classmethod
     def get(cls, owner: str, repo: str, pr_number: int) -> Optional[Dict[str, Any]]:
         e = cls._registry.get((owner, repo, pr_number))
-        return e.to_dict() if e else None
+        if e:
+            return e.to_dict()
+        try:
+            row = ir.get_ci_watch(owner, repo, pr_number)
+            return cls._row_to_dict(row) if row else None
+        except Exception:
+            return None
 
     @classmethod
     def stop(cls, owner: str, repo: str, pr_number: int) -> bool:
         key = (owner, repo, pr_number)
         task = cls._tasks.pop(key, None)
         cls._registry.pop(key, None)
+        try:
+            ir.delete_ci_watch(owner, repo, pr_number)
+        except Exception as e:
+            logger.debug("stop: sqlite delete failed: %s", e)
         if task and not task.done():
             task.cancel()
             return True
         return False
+
+    # ── Persistence ─────────────────────────────────────────────────────
+
+    @classmethod
+    def _persist(cls, entry: WatchEntry) -> None:
+        """Mirror the entry's durable facts to sqlite. Best-effort — a
+        persistence failure must never break the watch loop itself."""
+        try:
+            ir.upsert_ci_watch(
+                entry.owner, entry.repo, entry.pr_number,
+                pr_url=entry.pr_url,
+                branch=entry.branch,
+                base_branch=entry.base_branch,
+                finding=entry.finding,
+                repo_lens=entry.repo_lens,
+                access_token=entry.access_token,
+                status=entry.status,
+                attempts=entry.attempts,
+                last_patch_hash=entry.last_patch_hash,
+                last_error=entry.last_error,
+            )
+        except Exception as e:
+            logger.debug("_persist failed for %s: %s", entry.key(), e)
+
+    @staticmethod
+    def _row_to_dict(row: Dict[str, Any]) -> Dict[str, Any]:
+        """Shape a sqlite ci_watch_state row like WatchEntry.to_dict() so the
+        /api/watcher consumers don't care whether it came from memory or disk."""
+        finding = row.get("finding") or {}
+        return {
+            "owner": row["owner"],
+            "repo": row["repo"],
+            "pr_number": row["pr_number"],
+            "pr_url": row.get("pr_url"),
+            "branch": row.get("branch"),
+            "status": row.get("status"),
+            "attempts": row.get("attempts", 0),
+            "max_attempts": MAX_ATTEMPTS,
+            "history": [],  # history is in ci_watch_log, fetched separately
+            "last_error": row.get("last_error"),
+            "started_ago_s": None,  # monotonic clock doesn't survive restart
+            "last_event_ago_s": None,
+            "finding_id": finding.get("id"),
+            "finding_title": finding.get("title"),
+            "persisted": True,
+        }
+
+    @classmethod
+    def resume_from_db(cls) -> int:
+        """Re-spawn supervisor tasks for rows still in a non-terminal state.
+        Called from the FastAPI lifespan startup hook. Returns the number of
+        watchers resumed. Rows missing an access_token can't be polled, so
+        they're marked crashed instead of silently abandoned."""
+        resumed = 0
+        try:
+            rows = ir.list_ci_watches(status_in=["watching", "fixing"])
+        except Exception as e:
+            logger.warning("resume_from_db: sqlite read failed: %s", e)
+            return 0
+
+        for row in rows:
+            key = (row["owner"], row["repo"], row["pr_number"])
+            if key in cls._tasks:
+                continue  # already running in this process
+            token = row.get("access_token")
+            if not token:
+                ir.upsert_ci_watch(
+                    row["owner"], row["repo"], row["pr_number"],
+                    status="crashed", last_error="no token to resume after restart",
+                )
+                continue
+            try:
+                finding = FindingPayload(**(row["finding"] or {}))
+                repo_lens = (
+                    RepoLensSummary(**row["repo_lens"]) if row.get("repo_lens") else None
+                )
+            except Exception as e:
+                logger.warning("resume_from_db: bad row %s: %s", key, e)
+                continue
+            entry = WatchEntry(
+                owner=row["owner"], repo=row["repo"], pr_number=row["pr_number"],
+                branch=row["branch"], base_branch=row["base_branch"],
+                access_token=token, finding=finding, repo_lens=repo_lens,
+                pr_url=row.get("pr_url"), attempts=row.get("attempts", 0),
+                last_patch_hash=row.get("last_patch_hash"),
+                status=row.get("status", "watching"),
+            )
+            cls._registry[key] = entry
+            cls._tasks[key] = asyncio.create_task(
+                cls._supervise(entry),
+                name=f"ci-watch-resume-{key[0]}-{key[1]}-{key[2]}",
+            )
+            ir.append_log(key[0], key[1], key[2], "info",
+                          "resumed watcher after backend restart")
+            resumed += 1
+        if resumed:
+            logger.info("CIWatcher.resume_from_db: resumed %d watcher(s)", resumed)
+        return resumed
 
     # ── Supervisor loop ─────────────────────────────────────────────────
 
@@ -415,13 +541,20 @@ class CIWatcher:
             h.update(b"\0")
         return h.hexdigest()
 
-    @staticmethod
-    def _touch(entry: WatchEntry, msg: str) -> None:
+    @classmethod
+    def _touch(cls, entry: WatchEntry, msg: str, level: str = "info") -> None:
         entry.last_event_at = time.monotonic()
         logger.info(
             "CIWatcher[%s/%s#%s]: %s",
             entry.owner, entry.repo, entry.pr_number, msg,
         )
+        # Append to the durable log (UI streams this) and re-persist the
+        # entry so the status/attempts on disk track the live entry.
+        try:
+            ir.append_log(entry.owner, entry.repo, entry.pr_number, level, msg)
+            cls._persist(entry)
+        except Exception as e:
+            logger.debug("_touch persistence failed: %s", e)
 
     @staticmethod
     async def _escalate(entry: WatchEntry, reason: str) -> None:

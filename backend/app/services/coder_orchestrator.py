@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
@@ -29,10 +30,26 @@ from app.agents.coder_agent import CoderAgent, CoderBrief, CoderOutput
 from app.schemas.api_schemas import (
     ActuateRequest, ActuateResponse, ActuatedFile, FindingPayload, RepoLensSummary,
 )
+from app.services import ast_lint
+from app.services import inflight_registry as ir
+from app.services import validation_gate as vg
 from app.services.github_api_service import GitHubAPIService
 from app.services.github_pr_service import GitHubPRService
 
 logger = logging.getLogger("shipmate.coder_orchestrator")
+
+# Whether the pytest gate runs inside the actuate flow. The gate writes to
+# the LOCAL working tree (snapshot+restore) — only meaningful when the
+# backend runs from a checkout of the repo being actuated (the dogfood
+# case). For arbitrary external repos there's nothing local to test against,
+# so the gate is a no-op there. Controlled by env so CI / hosted deploys
+# can disable it.
+_PYTEST_GATE_ENABLED = os.getenv("SHIPMATE_PYTEST_GATE", "1") == "1"
+
+# The repo this backend checkout corresponds to. The pytest gate only fires
+# when the actuate target matches — otherwise we'd be running ShipMate's own
+# tests against a patch meant for someone else's repo.
+_SELF_REPO = os.getenv("SHIPMATE_SELF_REPO", "WalkingDevFlag/Shipmate-AI")
 
 # How aggressive the smart vs fast model routing is.
 # Security and CI/CD changes warrant Sonnet; tests/docs are fine on Haiku.
@@ -43,6 +60,15 @@ _SMART_CATEGORIES = {"secrets", "auth", "cors", "injection", "config", "ci_cd"}
 def _slugify(text: str, max_len: int = 32) -> str:
     s = re.sub(r"[^a-zA-Z0-9]+", "-", text.lower()).strip("-")
     return s[:max_len] or "actuate"
+
+
+def _finding_signature(finding: FindingPayload) -> str:
+    """Stable cross-context identifier. MUST match coder_loop._finding_signature
+    so the CLI loop and the UI orchestrator agree on which finding is which
+    (shared finding_journal + inflight claims). Format: kind::title::file."""
+    title = (finding.title or "").strip().lower()[:80]
+    file_hint = (finding.file or "").lower()
+    return f"{finding.kind}::{title}::{file_hint}"
 
 
 def _branch_name(finding: FindingPayload) -> str:
@@ -258,131 +284,6 @@ def _deployment_hint(finding: FindingPayload) -> str:
 
 # ── Post-Coder safety lint ──────────────────────────────────────────────────
 
-_PY_FIRST_PARTY_PREFIXES = ("app.", "backend.")
-_PY_STDLIB_OK = {
-    "re", "os", "sys", "json", "asyncio", "logging", "typing", "datetime",
-    "secrets", "hashlib", "hmac", "pathlib", "dataclasses", "functools",
-    "itertools", "collections", "contextlib", "warnings", "uuid", "base64",
-    "string", "abc", "enum", "math", "time", "io", "subprocess", "tempfile",
-    "shutil", "copy", "inspect", "traceback", "concurrent", "threading",
-    "multiprocessing", "queue", "socket", "urllib", "http", "ssl", "email",
-    "csv", "argparse", "pickle", "struct", "zipfile", "gzip", "tarfile",
-}
-
-
-def _python_imports(content: str) -> List[str]:
-    """Pull `from X.Y import …` and `import X.Y as Z` top-level modules."""
-    out: List[str] = []
-    for m in re.finditer(
-        r"^\s*(?:from\s+([\w\.]+)\s+import|import\s+([\w\.]+))",
-        content, re.MULTILINE,
-    ):
-        out.append(m.group(1) or m.group(2))
-    return out
-
-
-def _detect_hallucinated_imports(
-    new_content: str, original_content: str, file_tree: List[str],
-) -> List[str]:
-    """
-    For .py files: any first-party (app./backend.) import in `new_content`
-    that does NOT exist in the original imports AND does NOT correspond to
-    a real path in `file_tree` is flagged.
-    """
-    if not new_content.strip().startswith(("from ", "import ", '"""', "#",
-                                            "from __future__")) and \
-       "import " not in new_content[:2000]:
-        return []
-    new_imps = set(_python_imports(new_content))
-    orig_imps = set(_python_imports(original_content)) if original_content else set()
-    suspect: List[str] = []
-    tree_set = set(file_tree)
-    for imp in new_imps:
-        if imp in orig_imps:
-            continue  # pre-existing — fine
-        if not any(imp.startswith(pref) for pref in _PY_FIRST_PARTY_PREFIXES):
-            continue  # 3rd-party / stdlib — out of scope here
-        # Map app.x.y -> backend/app/x/y(.py|/__init__.py)
-        if imp.startswith("app."):
-            base = "backend/" + imp.replace(".", "/")
-        else:
-            base = imp.replace(".", "/")
-        candidates = (base + ".py", base + "/__init__.py")
-        if not any(c in tree_set for c in candidates):
-            suspect.append(imp)
-    return suspect
-
-
-def _detect_hallucinated_named_imports(
-    new_content: str,
-    target_files: Dict[str, str],
-    coder_files: List["CoderFile"],
-) -> List[str]:
-    """
-    Catch `from X import a, b, c` where X is a module Coder is rewriting in
-    THIS patch (or already exists in target_files), but a/b/c are names that
-    don't appear in the version of X that's actually being shipped.
-
-    This is the test-imports-stale-symbol failure mode (e.g. a test file
-    imports `_contains_dangerous_pattern` from `app.main` but the rewritten
-    main.py never defines that symbol).
-    """
-    suspect: List[str] = []
-    # Build a map module-path -> source content (final state in this patch).
-    final_content: Dict[str, str] = dict(target_files)
-    for cf in coder_files:
-        final_content[cf.path] = cf.new_content
-    # Index by python module path: backend/app/main.py -> "app.main"
-    by_module: Dict[str, str] = {}
-    for path, src in final_content.items():
-        if not path.endswith(".py"):
-            continue
-        if path.startswith("backend/app/"):
-            mod = path[len("backend/"):].replace("/", ".").rsplit(".", 1)[0]
-        elif path.startswith("backend/"):
-            mod = path.replace("/", ".").rsplit(".", 1)[0]
-        else:
-            continue
-        by_module[mod] = src
-
-    # Walk `from X import a, b, c` lines in new_content. Handle both flat
-    # form (`from X import a, b`) and parenthesized multi-line form
-    # (`from X import (\n    a,\n    b,\n)`).
-    flat = re.finditer(
-        r"^\s*from\s+([\w\.]+)\s+import\s+([^\n#(]+)$",
-        new_content, re.MULTILINE,
-    )
-    paren = re.finditer(
-        r"^\s*from\s+([\w\.]+)\s+import\s+\(([^)]+)\)",
-        new_content, re.MULTILINE | re.DOTALL,
-    )
-    for m in list(flat) + list(paren):
-        module = m.group(1)
-        names_blob = m.group(2)
-        # Drop trailing `as alias` clauses; we just want the imported names.
-        names = []
-        for n in names_blob.split(","):
-            tok = n.strip().split(" as ")[0].strip()
-            if tok and tok != "*" and re.match(r"^[A-Za-z_]\w*$", tok):
-                names.append(tok)
-
-        target_src = by_module.get(module)
-        if target_src is None:
-            continue  # not a module we have visibility into — skip
-        for name in names:
-            # Match `def name(`, `class name`, `name =`, `async def name(`,
-            # or top-level `name: type = ...` (Python type-annotated assignment).
-            patterns = [
-                rf"^\s*def\s+{re.escape(name)}\s*\(",
-                rf"^\s*async\s+def\s+{re.escape(name)}\s*\(",
-                rf"^\s*class\s+{re.escape(name)}\s*[\(:]",
-                rf"^\s*{re.escape(name)}\s*[:=]",
-            ]
-            if not any(re.search(p, target_src, re.MULTILINE) for p in patterns):
-                suspect.append(f"{name} from {module}")
-    return suspect
-
-
 _NEW_TEST_THEATER_PATTERNS = (
     re.compile(r"status_code\s+in\s*[\(\[][^)\]]*4\d\d", re.MULTILINE),
     re.compile(r"^\s*assert\s+True\s*$", re.MULTILINE),
@@ -406,22 +307,32 @@ def _lint_coder_output(
 ) -> List[str]:
     """
     Returns a list of structural issues (empty list = pass). The orchestrator
-    raises if any issue is fatal. Goal: catch the common Coder failure modes
-    before we open a PR — hallucinated first-party imports, missing VERIFY
-    line, .gitkeep theater, NEW test theater patterns.
+    rejects the patch (no branch/PR) if this returns anything non-empty.
+
+    Import / symbol checks are delegated to `ast_lint` (real AST parsing) —
+    that module replaced the brittle regex detectors that false-positived on
+    aliased / TYPE_CHECKING / try-ImportError imports. Test-theater and
+    .gitkeep-theater checks stay here (they're cheap regex on text and don't
+    benefit from AST).
     """
     issues: List[str] = []
     for cf in coder_out.files:
         original = target_files.get(cf.path, "")
 
         if cf.path.endswith(".py"):
-            bad = _detect_hallucinated_imports(cf.new_content, original, file_tree)
+            # Fatal: unparseable Python. No point shipping a file that won't import.
+            syntax_err = ast_lint.syntax_error_of(cf.new_content, cf.path)
+            if syntax_err:
+                issues.append(syntax_err)
+                continue  # skip further checks — they'd just re-report the parse failure
+
+            bad = ast_lint.detect_bad_imports(cf.new_content, original, file_tree)
             if bad:
                 issues.append(
                     f"{cf.path}: hallucinated first-party imports not in repo or "
                     f"original file: {bad}"
                 )
-            stale_named = _detect_hallucinated_named_imports(
+            stale_named = ast_lint.detect_stale_named_imports(
                 cf.new_content, target_files, coder_out.files,
             )
             if stale_named:
@@ -450,12 +361,6 @@ def _lint_coder_output(
                 f"{cf.path}: .gitkeep inside an ignored/build directory "
                 "(theater pattern — preserves a dir the patch claims to remove)"
             )
-    # Note: we used to hard-fail when the summary lacked a `VERIFY:` line,
-    # but that drove false rejections on otherwise-clean patches because the
-    # model dropped the trailing token on long generations. Our structural
-    # checks above (hallucinated imports, stale named imports, theater
-    # patterns, .gitkeep theater) cover what VERIFY was *attesting* to —
-    # so we trust the structure, not the self-attestation.
     return issues
 
 
@@ -556,84 +461,170 @@ class CoderOrchestrator:
                 ),
             )
 
-        # 4. Create the branch.
-        base_sha = await GitHubPRService.get_branch_sha(
-            req.access_token, req.owner, req.repo, req.branch,
-        )
-        await GitHubPRService.create_branch(
-            req.access_token, req.owner, req.repo, branch_name, base_sha,
-        )
+        # 3c. Path claim — atomic cross-process lock so a UI click and the
+        # CLI loop (or two UI clicks) can't both rewrite the same file. If
+        # any path is already claimed, bail with `path_busy` immediately
+        # (user-facing retry — see ActuateButton). Always released in `finally`.
+        repo_full = f"{req.owner}/{req.repo}"
+        claimed_paths: List[str] = []
+        claimer = f"actuate:{req.finding.kind}:{req.finding.id}"
+        sig = _finding_signature(req.finding)
+        try:
+            for cf in coder_out.files:
+                if not ir.claim_path(repo_full, req.branch, cf.path, sig, claimer):
+                    holder = ir.get_path_claim(repo_full, req.branch, cf.path)
+                    held_by = (holder or {}).get("claimed_by", "another actuate")
+                    logger.info("path_busy: %s held by %s", cf.path, held_by)
+                    return ActuateResponse(
+                        status="path_busy",
+                        pr_url=None,
+                        branch_name=branch_name,
+                        files_changed=[],
+                        skipped=[cf.path for cf in coder_out.files],
+                        summary=(
+                            f"Another actuate is currently editing `{cf.path}` "
+                            f"(held by {held_by}). Retry once it finishes."
+                        ),
+                    )
+                claimed_paths.append(cf.path)
 
-        # 5. Commit each file (sequential — Contents API requires fresh sha per write).
-        committed: List[ActuatedFile] = []
-        for cf in coder_out.files:
-            existing_sha = await GitHubPRService.get_file_sha(
-                req.access_token, req.owner, req.repo, cf.path, branch_name,
+            # 3d. Local pytest gate — only when actuating THIS repo on a local
+            # checkout (the dogfood case). For external repos there's no local
+            # tree to test against, so we skip. Snapshot → apply → smoke import
+            # → pytest → restore-on-regression. If the patch drops the pass
+            # count, reject with `pytest_rejected` and DON'T open a PR.
+            gate_ran = False
+            if _PYTEST_GATE_ENABLED and repo_full == _SELF_REPO:
+                gate_ran = True
+                serialized = [
+                    {"path": cf.path, "new_content": cf.new_content}
+                    for cf in coder_out.files
+                ]
+                result, snap = await asyncio.to_thread(vg.gate_patch, serialized)
+                if not result.passed:
+                    await asyncio.to_thread(vg.restore_snapshot, snap)
+                    logger.warning(
+                        "pytest gate rejected %s/%s: %s",
+                        req.finding.kind, req.finding.id, result.reason,
+                    )
+                    return ActuateResponse(
+                        status="pytest_rejected",
+                        pr_url=None,
+                        branch_name=branch_name,
+                        files_changed=[],
+                        skipped=[cf.path for cf in coder_out.files],
+                        summary=(
+                            f"Patch passed lint but failed the local pytest gate: "
+                            f"{result.reason}. The working tree was restored and no "
+                            f"PR was created. Coder summary: {coder_out.summary[:200]}"
+                        ),
+                    )
+                # Gate passed — restore the tree (GitHub commit is the source of
+                # truth; we don't want the local checkout to drift). Bump the
+                # baseline so a later actuate can't pass by re-clearing these.
+                await asyncio.to_thread(vg.restore_snapshot, snap)
+                vg.update_baseline(result.after)
+                logger.info(
+                    "pytest gate passed for %s/%s (%dp → %dp)",
+                    req.finding.kind, req.finding.id, result.before, result.after,
+                )
+
+            # 4. Create the branch.
+            base_sha = await GitHubPRService.get_branch_sha(
+                req.access_token, req.owner, req.repo, req.branch,
             )
-            try:
-                await GitHubPRService.put_file(
+            await GitHubPRService.create_branch(
+                req.access_token, req.owner, req.repo, branch_name, base_sha,
+            )
+
+            # 5. Commit each file (sequential — Contents API needs fresh sha per write).
+            committed: List[ActuatedFile] = []
+            for cf in coder_out.files:
+                existing_sha = await GitHubPRService.get_file_sha(
+                    req.access_token, req.owner, req.repo, cf.path, branch_name,
+                )
+                try:
+                    await GitHubPRService.put_file(
+                        req.access_token,
+                        req.owner,
+                        req.repo,
+                        cf.path,
+                        cf.new_content,
+                        _commit_message(req.finding, cf.path),
+                        branch_name,
+                        sha=existing_sha,
+                    )
+                except Exception as e:
+                    # GitHub returns 404 (not 403!) when the OAuth token lacks the
+                    # `workflow` scope and the file lives under .github/workflows/.
+                    # Surface a clean, actionable error instead of a bare 404.
+                    if cf.path.startswith(".github/workflows/") and "404" in str(e):
+                        raise RuntimeError(
+                            f"Cannot write {cf.path}: your GitHub OAuth token is missing "
+                            "the `workflow` scope. Sign out and reconnect GitHub from the "
+                            "sidebar to re-grant scopes, then retry."
+                        ) from e
+                    raise
+                committed.append(ActuatedFile(path=cf.path, rationale=cf.rationale))
+
+            # 6. Open PR (optional).
+            pr_url: Optional[str] = None
+            pr_number: Optional[int] = None
+            if req.open_pr:
+                pr_url, pr_number = await GitHubPRService.create_pull_request(
                     req.access_token,
                     req.owner,
                     req.repo,
-                    cf.path,
-                    cf.new_content,
-                    _commit_message(req.finding, cf.path),
-                    branch_name,
-                    sha=existing_sha,
+                    _pr_title(req.finding),
+                    _pr_body(req, coder_out),
+                    head=branch_name,
+                    base=req.branch,
                 )
-            except Exception as e:
-                # GitHub returns 404 (not 403!) when the OAuth token lacks the
-                # `workflow` scope and the file lives under .github/workflows/.
-                # Surface a clean, actionable error instead of a bare 404.
-                if cf.path.startswith(".github/workflows/") and "404" in str(e):
-                    raise RuntimeError(
-                        f"Cannot write {cf.path}: your GitHub OAuth token is missing "
-                        "the `workflow` scope. Sign out and reconnect GitHub from the "
-                        "sidebar to re-grant scopes, then retry."
-                    ) from e
-                raise
-            committed.append(ActuatedFile(path=cf.path, rationale=cf.rationale))
 
-        # 6. Open PR (optional).
-        pr_url: Optional[str] = None
-        pr_number: Optional[int] = None
-        if req.open_pr:
-            pr_url, pr_number = await GitHubPRService.create_pull_request(
-                req.access_token,
-                req.owner,
-                req.repo,
-                _pr_title(req.finding),
-                _pr_body(req, coder_out),
-                head=branch_name,
-                base=req.branch,
+                # 7. Register the PR with CIWatcher so we can self-heal CI failures.
+                #    Lazy import keeps the orchestrator import-light and avoids
+                #    a cycle (ci_watcher imports coder_agent).
+                try:
+                    from app.services.ci_watcher import CIWatcher
+                    CIWatcher.register(
+                        owner=req.owner,
+                        repo=req.repo,
+                        pr_number=pr_number,
+                        pr_url=pr_url,
+                        branch=branch_name,
+                        base_branch=req.branch,
+                        access_token=req.access_token,
+                        finding=req.finding,
+                        repo_lens=ctx,
+                    )
+                except Exception as e:
+                    # Watcher registration is best-effort — don't fail the actuate
+                    # call if the watcher couldn't start.
+                    logger.warning("CIWatcher.register failed: %s — PR opened without auto-fix", e)
+
+                # Journal: this finding now has an open PR in flight.
+                try:
+                    ir.journal_set_state(
+                        sig, repo_full, "in_progress",
+                        pr_url=pr_url, bump_attempt=True,
+                    )
+                except Exception as e:
+                    logger.debug("journal_set_state failed (non-fatal): %s", e)
+
+            return ActuateResponse(
+                status="complete",
+                pr_url=pr_url,
+                branch_name=branch_name,
+                files_changed=committed,
+                skipped=coder_out.skipped,
+                summary=coder_out.summary,
             )
-
-            # 7. Register the PR with CIWatcher so we can self-heal CI failures.
-            #    Lazy import keeps the orchestrator import-light and avoids
-            #    a cycle (ci_watcher imports coder_agent).
-            try:
-                from app.services.ci_watcher import CIWatcher
-                CIWatcher.register(
-                    owner=req.owner,
-                    repo=req.repo,
-                    pr_number=pr_number,
-                    pr_url=pr_url,
-                    branch=branch_name,
-                    base_branch=req.branch,
-                    access_token=req.access_token,
-                    finding=req.finding,
-                    repo_lens=ctx,
-                )
-            except Exception as e:
-                # Watcher registration is best-effort — don't fail the actuate
-                # call if the watcher couldn't start.
-                logger.warning("CIWatcher.register failed: %s — PR opened without auto-fix", e)
-
-        return ActuateResponse(
-            status="complete",
-            pr_url=pr_url,
-            branch_name=branch_name,
-            files_changed=committed,
-            skipped=coder_out.skipped,
-            summary=coder_out.summary,
-        )
+        finally:
+            # Always release path claims — whether we succeeded, returned a
+            # rejection mid-try, or raised. A leaked claim would block the
+            # path until its 10-min TTL lapses.
+            for p in claimed_paths:
+                try:
+                    ir.release_path(repo_full, req.branch, p, claimer)
+                except Exception as e:
+                    logger.debug("release_path failed for %s: %s", p, e)
