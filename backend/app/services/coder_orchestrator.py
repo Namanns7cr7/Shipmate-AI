@@ -187,17 +187,22 @@ def _resolve_target_paths(
 
 async def _fetch_current_contents(
     token: str, owner: str, repo: str, paths: List[str],
+    ref: Optional[str] = None,
 ) -> Dict[str, str]:
     """
     Best-effort parallel fetch. Missing files → empty string (Coder treats those
-    as new-file creations).
+    as new-file creations). `ref` should be the analysis target branch — without
+    it, GitHub serves the repo's default branch which is almost never what we
+    want when analyzing a feature branch.
     """
     sem = asyncio.Semaphore(5)
 
     async def fetch(path: str) -> Tuple[str, str]:
         async with sem:
             try:
-                content = await GitHubAPIService.get_file_content(token, owner, repo, path)
+                content = await GitHubAPIService.get_file_content(
+                    token, owner, repo, path, ref=ref,
+                )
                 return path, (content or "")
             except Exception as e:
                 logger.warning("Could not fetch %s: %s — treating as new file", path, e)
@@ -212,6 +217,100 @@ def _deployment_hint(finding: FindingPayload) -> str:
     if finding.kind in _SMART_KINDS or cat in _SMART_CATEGORIES:
         return "smart"
     return "fast"
+
+
+# ── Post-Coder safety lint ──────────────────────────────────────────────────
+
+_PY_FIRST_PARTY_PREFIXES = ("app.", "backend.")
+_PY_STDLIB_OK = {
+    "re", "os", "sys", "json", "asyncio", "logging", "typing", "datetime",
+    "secrets", "hashlib", "hmac", "pathlib", "dataclasses", "functools",
+    "itertools", "collections", "contextlib", "warnings", "uuid", "base64",
+    "string", "abc", "enum", "math", "time", "io", "subprocess", "tempfile",
+    "shutil", "copy", "inspect", "traceback", "concurrent", "threading",
+    "multiprocessing", "queue", "socket", "urllib", "http", "ssl", "email",
+    "csv", "argparse", "pickle", "struct", "zipfile", "gzip", "tarfile",
+}
+
+
+def _python_imports(content: str) -> List[str]:
+    """Pull `from X.Y import …` and `import X.Y as Z` top-level modules."""
+    out: List[str] = []
+    for m in re.finditer(
+        r"^\s*(?:from\s+([\w\.]+)\s+import|import\s+([\w\.]+))",
+        content, re.MULTILINE,
+    ):
+        out.append(m.group(1) or m.group(2))
+    return out
+
+
+def _detect_hallucinated_imports(
+    new_content: str, original_content: str, file_tree: List[str],
+) -> List[str]:
+    """
+    For .py files: any first-party (app./backend.) import in `new_content`
+    that does NOT exist in the original imports AND does NOT correspond to
+    a real path in `file_tree` is flagged.
+    """
+    if not new_content.strip().startswith(("from ", "import ", '"""', "#",
+                                            "from __future__")) and \
+       "import " not in new_content[:2000]:
+        return []
+    new_imps = set(_python_imports(new_content))
+    orig_imps = set(_python_imports(original_content)) if original_content else set()
+    suspect: List[str] = []
+    tree_set = set(file_tree)
+    for imp in new_imps:
+        if imp in orig_imps:
+            continue  # pre-existing — fine
+        if not any(imp.startswith(pref) for pref in _PY_FIRST_PARTY_PREFIXES):
+            continue  # 3rd-party / stdlib — out of scope here
+        # Map app.x.y -> backend/app/x/y(.py|/__init__.py)
+        if imp.startswith("app."):
+            base = "backend/" + imp.replace(".", "/")
+        else:
+            base = imp.replace(".", "/")
+        candidates = (base + ".py", base + "/__init__.py")
+        if not any(c in tree_set for c in candidates):
+            suspect.append(imp)
+    return suspect
+
+
+def _lint_coder_output(
+    coder_out: CoderOutput,
+    target_files: Dict[str, str],
+    file_tree: List[str],
+) -> List[str]:
+    """
+    Returns a list of structural issues (empty list = pass). The orchestrator
+    raises if any issue is fatal. Goal: catch the common Coder failure modes
+    before we open a PR — hallucinated first-party imports, missing VERIFY
+    line, .gitkeep theater.
+    """
+    issues: List[str] = []
+    for cf in coder_out.files:
+        if not cf.path.endswith(".py"):
+            continue
+        original = target_files.get(cf.path, "")
+        bad = _detect_hallucinated_imports(cf.new_content, original, file_tree)
+        if bad:
+            issues.append(
+                f"{cf.path}: hallucinated first-party imports not in repo or "
+                f"original file: {bad}"
+            )
+        # Only flag .gitkeep inside dirs the codebase normally ignores —
+        # bootstrapping an empty `nginx/certs/` or `data/` is legitimate.
+        if re.search(
+            r"(__pycache__|/build|/dist|/\.venv|/node_modules)/[^/]*\.gitkeep$",
+            cf.path,
+        ):
+            issues.append(
+                f"{cf.path}: .gitkeep inside an ignored/build directory "
+                "(theater pattern — preserves a dir the patch claims to remove)"
+            )
+    if "VERIFY:" not in (coder_out.summary or ""):
+        issues.append("summary missing required 'VERIFY:' self-check line")
+    return issues
 
 
 def _build_task(finding: FindingPayload) -> str:
@@ -250,9 +349,13 @@ class CoderOrchestrator:
         logger.info("Resolved %d target paths for %s/%s: %s",
                     len(target_paths), req.finding.kind, req.finding.id, target_paths)
 
-        # 2. Fetch current contents.
+        # 2. Fetch current contents — pinned to the same `req.branch` we
+        # resolved file_tree against. Without this, GitHub serves the
+        # default branch and Coder is given a stale picture, leading to
+        # patches that re-introduce imports/symbols already removed.
         target_files = await _fetch_current_contents(
             req.access_token, req.owner, req.repo, target_paths,
+            ref=req.branch,
         )
 
         # 3. Run Coder (sync, on a worker thread).
@@ -281,6 +384,30 @@ class CoderOrchestrator:
                 files_changed=[],
                 skipped=coder_out.skipped or target_paths,
                 summary=coder_out.summary or "Coder determined no patch was needed.",
+            )
+
+        # 3b. Quality lint — reject hallucinations BEFORE branching/committing.
+        # This is the second line of defense after the system prompt — if Coder
+        # invents imports despite rule #1, we catch it here and return a clean
+        # error instead of opening a bogus PR.
+        lint_issues = _lint_coder_output(coder_out, target_files, file_tree)
+        if lint_issues:
+            logger.warning(
+                "Coder output rejected by post-lint for %s/%s: %s",
+                req.finding.kind, req.finding.id, lint_issues,
+            )
+            return ActuateResponse(
+                status="lint_rejected",
+                pr_url=None,
+                branch_name=branch_name,
+                files_changed=[],
+                skipped=[cf.path for cf in coder_out.files],
+                summary=(
+                    f"Coder produced output but post-lint rejected it: "
+                    f"{'; '.join(lint_issues)}. The patch was discarded "
+                    f"and no branch/PR was created. Original Coder summary: "
+                    f"{coder_out.summary[:300]}"
+                ),
             )
 
         # 4. Create the branch.
