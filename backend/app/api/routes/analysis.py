@@ -1,69 +1,62 @@
 from fastapi import APIRouter, HTTPException, Query
-from datetime import datetime, timedelta
-from sqlalchemy.orm import Session
-from app.db.database import get_db
-from app.db.models import AnalysisRun
-from app.services.persistence_service import PersistenceService
+from app.schemas.agent_schemas import AgentName
+from app.orchestrator.shipmate_orchestrator import ShipMateOrchestrator
 
-router = APIRouter()
-persistence_service = PersistenceService()
+router = APIRouter(prefix="/analysis", tags=["analysis"])
+orchestrator = ShipMateOrchestrator()
 
 
-@router.get("/repos/{repo}/history")
-def get_analysis_history(
-    repo: str,
-    limit: int = Query(50, ge=1, le=500),
-    days: int = Query(90, ge=1, le=3650),
+@router.post("/analyze")
+async def analyze(
+    repo_url: str = Query(..., description="GitHub repository URL"),
+    branch: str = Query(default="main", description="Branch to analyze"),
 ):
-    """
-    Retrieve historical analysis runs for a given repository.
-    
-    Args:
-        repo: Repository identifier (e.g., 'owner/name')
-        limit: Maximum number of records to return (default 50, max 500)
-        days: Look back window in days (default 90, max 3650)
-    
-    Returns:
-        List of analysis records with timestamps and scores, ordered by date descending.
-    """
-    db = next(get_db())
+    """Analyze a repository using all agents."""
     try:
-        cutoff_date = datetime.utcnow() - timedelta(days=days)
-        
-        records = (
-            db.query(AnalysisRun)
-            .filter(
-                AnalysisRun.repo_identifier == repo,
-                AnalysisRun.created_at >= cutoff_date,
-            )
-            .order_by(AnalysisRun.created_at.desc())
-            .limit(limit)
-            .all()
-        )
-        
-        if not records:
-            return {
-                "repo": repo,
-                "history": [],
-                "total_count": 0,
-            }
-        
-        history = [
-            {
-                "id": record.id,
-                "repo": record.repo_identifier,
-                "readiness_score": record.readiness_score,
-                "ship_recommendation": record.ship_recommendation,
-                "score_breakdown": record.score_breakdown,
-                "created_at": record.created_at.isoformat() if record.created_at else None,
-            }
-            for record in records
-        ]
-        
+        results = await orchestrator.execute_all(repo_url, branch)
         return {
-            "repo": repo,
-            "history": history,
-            "total_count": len(history),
+            "status": "success",
+            "repo_url": repo_url,
+            "branch": branch,
+            "agents": results,
         }
-    finally:
-        db.close()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/analyze/{agent_name}")
+async def analyze_with_agent(
+    agent_name: str,
+    repo_url: str = Query(..., description="GitHub repository URL"),
+    branch: str = Query(default="main", description="Branch to analyze"),
+):
+    """Analyze a repository using a specific agent."""
+    try:
+        # Validate agent name against enum
+        valid_agents = [a.value for a in AgentName]
+        if agent_name not in valid_agents:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid agent: {agent_name}. Valid agents: {', '.join(valid_agents)}",
+            )
+        result = await orchestrator.execute_agent(agent_name, repo_url, branch)
+        return {
+            "status": "success",
+            "agent": agent_name,
+            "repo_url": repo_url,
+            "branch": branch,
+            "result": result,
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/agents")
+async def list_agents():
+    """List all available agents."""
+    return {
+        "agents": [a.value for a in AgentName],
+        "count": len(AgentName),
+    }
