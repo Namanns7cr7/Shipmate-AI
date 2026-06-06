@@ -20,12 +20,14 @@ on:
   push:
     branches:
       - main
+      - Naman
       - feat/bedrock-on-v2
       - feat/**
       - fix/**
   pull_request:
     branches:
       - main
+      - Naman
       - feat/bedrock-on-v2
       - feat/**
       - fix/**
@@ -242,6 +244,16 @@ jobs:
           push: false
           load: true                 # keep image in the local daemon for `docker run`
           tags: shipmate-backend:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build frontend Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: frontend/Dockerfile
+          push: false
+          tags: shipmate-frontend:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
 

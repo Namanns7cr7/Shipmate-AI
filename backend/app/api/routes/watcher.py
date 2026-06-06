@@ -1,8 +1,8 @@
 """
-GET    /api/watcher                                   — list active CI watchers
-GET    /api/watcher/{owner}/{repo}/{pr_number}        — single watcher state
+GET    /api/watcher                                   — list active CI watchers (read-only, public)
+GET    /api/watcher/{owner}/{repo}/{pr_number}        — single watcher state (read-only, public)
 GET    /api/watcher/{owner}/{repo}/{pr_number}/log    — tail the watcher log
-DELETE /api/watcher/{owner}/{repo}/{pr_number}        — stop watching
+DELETE /api/watcher/{owner}/{repo}/{pr_number}        — stop watching (requires Authorization header)
 
 The frontend polls /api/watcher/{...} every ~10-15s to render a live
 "PRs under auto-fix" panel (ActuateButton's expanded CIWatchPanel). The
@@ -14,9 +14,9 @@ back (get_log_tail / list_active project token-less columns).
 """
 
 import logging
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Header, Query
 
 from app.services import inflight_registry as ir
 from app.services.ci_watcher import CIWatcher
@@ -53,5 +53,12 @@ async def get_watcher_log(
 
 
 @router.delete("/watcher/{owner}/{repo}/{pr_number}")
-async def stop_watcher(owner: str, repo: str, pr_number: int) -> Dict[str, bool]:
+async def stop_watcher(
+    owner: str,
+    repo: str,
+    pr_number: int,
+    authorization: Optional[str] = Header(None),
+) -> Dict[str, bool]:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
     return {"stopped": CIWatcher.stop(owner, repo, pr_number)}

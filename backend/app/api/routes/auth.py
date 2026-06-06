@@ -1,10 +1,21 @@
 import os
-from fastapi import APIRouter, HTTPException, Query
+import logging
+from typing import Optional
+
+from fastapi import APIRouter, HTTPException, Header
 from app.services.github_auth_service import GitHubAuthService
 from app.services.github_api_service import GitHubAPIService
 from app.schemas.api_schemas import RepoSummary
 
 router = APIRouter(prefix="/auth/github", tags=["github-auth"])
+logger = logging.getLogger("shipmate.auth")
+
+
+def _extract_token(authorization: Optional[str]) -> str:
+    """Extract Bearer token from Authorization header."""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
+    return authorization[len("Bearer "):]
 
 
 @router.get("/login")
@@ -19,7 +30,7 @@ async def github_login():
 
 
 @router.get("/callback")
-async def github_callback(code: str = Query(...), state: str = Query(...)):
+async def github_callback(code: str, state: str):
     """Exchange OAuth code for access token and return user profile."""
     try:
         token_data = await GitHubAuthService.exchange_code_for_token(code, state)
@@ -34,29 +45,32 @@ async def github_callback(code: str = Query(...), state: str = Query(...)):
             "scope": token_data.get("scope"),
             "user": user_profile,
         }
+    except HTTPException:
+        raise
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        import traceback
-        raise HTTPException(status_code=500, detail=f"Callback failed: {str(e)}\n{traceback.format_exc()}")
+    except Exception:
+        logger.exception("GitHub OAuth callback failed")
+        raise HTTPException(status_code=500, detail="Authentication failed. Please try again.")
 
 
 @router.get("/me")
-async def get_me(access_token: str = Query(...)):
+async def get_me(authorization: Optional[str] = Header(None)):
     """Return the authenticated user's GitHub profile."""
+    token = _extract_token(authorization)
     try:
-        user = await GitHubAuthService.get_user_profile(access_token)
+        user = await GitHubAuthService.get_user_profile(token)
         return {"authenticated": True, "user": user}
     except ValueError as e:
         raise HTTPException(status_code=401, detail=str(e))
 
 
 @router.get("/repos")
-async def get_repos(access_token: str = Query(...)):
+async def get_repos(authorization: Optional[str] = Header(None)):
     """Return the authenticated user's repositories."""
+    token = _extract_token(authorization)
     try:
-        repos = await GitHubAPIService.get_user_repos(access_token)
-        # Return only the fields the frontend needs
+        repos = await GitHubAPIService.get_user_repos(token)
         result = []
         for r in repos:
             result.append({
@@ -77,15 +91,18 @@ async def get_repos(access_token: str = Query(...)):
                 },
             })
         return {"repos": result, "count": len(result)}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/repos/{owner}/{repo_name}/branches")
-async def get_branches(owner: str, repo_name: str, access_token: str = Query(...)):
+async def get_branches(owner: str, repo_name: str, authorization: Optional[str] = Header(None)):
     """Return branches for a repository."""
+    token = _extract_token(authorization)
     try:
-        branches = await GitHubAPIService.get_branches(access_token, owner, repo_name)
+        branches = await GitHubAPIService.get_branches(token, owner, repo_name)
         formatted = [
             {
                 "name": b.get("name"),
@@ -95,15 +112,18 @@ async def get_branches(owner: str, repo_name: str, access_token: str = Query(...
             for b in branches
         ]
         return {"branches": formatted, "count": len(formatted)}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/repos/{owner}/{repo_name}/pulls")
-async def get_pulls(owner: str, repo_name: str, access_token: str = Query(...)):
+async def get_pulls(owner: str, repo_name: str, authorization: Optional[str] = Header(None)):
     """Return open pull requests for a repository."""
+    token = _extract_token(authorization)
     try:
-        pulls = await GitHubAPIService.get_open_pulls(access_token, owner, repo_name)
+        pulls = await GitHubAPIService.get_open_pulls(token, owner, repo_name)
         formatted = [
             {
                 "number": p.get("number"),
@@ -116,14 +136,19 @@ async def get_pulls(owner: str, repo_name: str, access_token: str = Query(...)):
             for p in pulls
         ]
         return {"pulls": formatted, "count": len(formatted)}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.post("/logout")
-async def logout(access_token: str = Query(...)):
+async def logout(authorization: Optional[str] = Header(None)):
     try:
-        GitHubAuthService.clear_token(access_token)
-        return {"success": True, "message": "Logged out"}
+        token = _extract_token(authorization)
+        GitHubAuthService.clear_token(token)
+    except HTTPException:
+        pass  # Accept logout even without a valid token
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    return {"success": True, "message": "Logged out"}

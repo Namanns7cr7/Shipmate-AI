@@ -26,7 +26,7 @@ import re
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
-from app.agents.coder_agent import CoderAgent, CoderBrief, CoderOutput
+from app.agents.coder_agent import CoderAgent, CoderBrief, CoderFile, CoderOutput
 from app.schemas.api_schemas import (
     ActuateRequest, ActuateResponse, ActuatedFile, FindingPayload, RepoLensSummary,
 )
@@ -283,6 +283,131 @@ def _deployment_hint(finding: FindingPayload) -> str:
 
 
 # ── Post-Coder safety lint ──────────────────────────────────────────────────
+
+_PY_FIRST_PARTY_PREFIXES = ("app.", "backend.")
+_PY_STDLIB_OK = {
+    "re", "os", "sys", "json", "asyncio", "logging", "typing", "datetime",
+    "secrets", "hashlib", "hmac", "pathlib", "dataclasses", "functools",
+    "itertools", "collections", "contextlib", "warnings", "uuid", "base64",
+    "string", "abc", "enum", "math", "time", "io", "subprocess", "tempfile",
+    "shutil", "copy", "inspect", "traceback", "concurrent", "threading",
+    "multiprocessing", "queue", "socket", "urllib", "http", "ssl", "email",
+    "csv", "argparse", "pickle", "struct", "zipfile", "gzip", "tarfile",
+}
+
+
+def _python_imports(content: str) -> List[str]:
+    """Pull `from X.Y import …` and `import X.Y as Z` top-level modules."""
+    out: List[str] = []
+    for m in re.finditer(
+        r"^\s*(?:from\s+([\w\.]+)\s+import|import\s+([\w\.]+))",
+        content, re.MULTILINE,
+    ):
+        out.append(m.group(1) or m.group(2))
+    return out
+
+
+def _detect_hallucinated_imports(
+    new_content: str, original_content: str, file_tree: List[str],
+) -> List[str]:
+    """
+    For .py files: any first-party (app./backend.) import in `new_content`
+    that does NOT exist in the original imports AND does NOT correspond to
+    a real path in `file_tree` is flagged.
+    """
+    if not new_content.strip().startswith(("from ", "import ", '"""', "#",
+                                            "from __future__")) and \
+       "import " not in new_content[:2000]:
+        return []
+    new_imps = set(_python_imports(new_content))
+    orig_imps = set(_python_imports(original_content)) if original_content else set()
+    suspect: List[str] = []
+    tree_set = set(file_tree)
+    for imp in new_imps:
+        if imp in orig_imps:
+            continue  # pre-existing — fine
+        if not any(imp.startswith(pref) for pref in _PY_FIRST_PARTY_PREFIXES):
+            continue  # 3rd-party / stdlib — out of scope here
+        # Map app.x.y -> backend/app/x/y(.py|/__init__.py)
+        if imp.startswith("app."):
+            base = "backend/" + imp.replace(".", "/")
+        else:
+            base = imp.replace(".", "/")
+        candidates = (base + ".py", base + "/__init__.py")
+        if not any(c in tree_set for c in candidates):
+            suspect.append(imp)
+    return suspect
+
+
+def _detect_hallucinated_named_imports(
+    new_content: str,
+    target_files: Dict[str, str],
+    coder_files: List[CoderFile],
+) -> List[str]:
+    """
+    Catch `from X import a, b, c` where X is a module Coder is rewriting in
+    THIS patch (or already exists in target_files), but a/b/c are names that
+    don't appear in the version of X that's actually being shipped.
+
+    This is the test-imports-stale-symbol failure mode (e.g. a test file
+    imports `_contains_dangerous_pattern` from `app.main` but the rewritten
+    main.py never defines that symbol).
+    """
+    suspect: List[str] = []
+    # Build a map module-path -> source content (final state in this patch).
+    final_content: Dict[str, str] = dict(target_files)
+    for cf in coder_files:
+        final_content[cf.path] = cf.new_content
+    # Index by python module path: backend/app/main.py -> "app.main"
+    by_module: Dict[str, str] = {}
+    for path, src in final_content.items():
+        if not path.endswith(".py"):
+            continue
+        if path.startswith("backend/app/"):
+            mod = path[len("backend/"):].replace("/", ".").rsplit(".", 1)[0]
+        elif path.startswith("backend/"):
+            mod = path.replace("/", ".").rsplit(".", 1)[0]
+        else:
+            continue
+        by_module[mod] = src
+
+    # Walk `from X import a, b, c` lines in new_content. Handle both flat
+    # form (`from X import a, b`) and parenthesized multi-line form
+    # (`from X import (\n    a,\n    b,\n)`).
+    flat = re.finditer(
+        r"^\s*from\s+([\w\.]+)\s+import\s+([^\n#(]+)$",
+        new_content, re.MULTILINE,
+    )
+    paren = re.finditer(
+        r"^\s*from\s+([\w\.]+)\s+import\s+\(([^)]+)\)",
+        new_content, re.MULTILINE | re.DOTALL,
+    )
+    for m in list(flat) + list(paren):
+        module = m.group(1)
+        names_blob = m.group(2)
+        # Drop trailing `as alias` clauses; we just want the imported names.
+        names = []
+        for n in names_blob.split(","):
+            tok = n.strip().split(" as ")[0].strip()
+            if tok and tok != "*" and re.match(r"^[A-Za-z_]\w*$", tok):
+                names.append(tok)
+
+        target_src = by_module.get(module)
+        if target_src is None:
+            continue  # not a module we have visibility into — skip
+        for name in names:
+            # Match `def name(`, `class name`, `name =`, `async def name(`,
+            # or top-level `name: type = ...` (Python type-annotated assignment).
+            patterns = [
+                rf"^\s*def\s+{re.escape(name)}\s*\(",
+                rf"^\s*async\s+def\s+{re.escape(name)}\s*\(",
+                rf"^\s*class\s+{re.escape(name)}\s*[\(:]",
+                rf"^\s*{re.escape(name)}\s*[:=]",
+            ]
+            if not any(re.search(p, target_src, re.MULTILINE) for p in patterns):
+                suspect.append(f"{name} from {module}")
+    return suspect
+
 
 _NEW_TEST_THEATER_PATTERNS = (
     re.compile(r"status_code\s+in\s*[\(\[][^)\]]*4\d\d", re.MULTILINE),

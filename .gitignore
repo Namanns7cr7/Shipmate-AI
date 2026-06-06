@@ -145,3 +145,13 @@ build/
 # Environment
 .env.local
 .env.*.local
+
+# Binary archives / bundled tarballs
+*.tgz
+*.tar.gz
+
+# Design handoff artifacts (not part of the codebase)
+design_handoff_shipmate_ui/
+
+# Ephemeral task/planning files
+tasks/
