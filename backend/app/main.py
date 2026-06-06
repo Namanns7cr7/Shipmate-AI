@@ -207,75 +207,16 @@ def _validate_endpoint_urls() -> None:
 _validate_endpoint_urls()
 
 # ---------------------------------------------------------------------------
-# Input Sanitization: Dangerous Pattern Detection
+# Input Sanitization
+#
+# The dangerous-pattern set, _contains_dangerous_pattern(), and the live
+# middleware all live further down (search "_DANGEROUS_PATTERNS: list").
+# An earlier duplicate set + an unregistered middleware variant
+# (input_sanitization_middleware / _BodyReplayRequest / the recursive JSON
+# scanner) used to sit here and silently SHADOWED those real definitions —
+# editing them had no effect. Removed; only the content-type helper below is
+# shared with the live middleware.
 # ---------------------------------------------------------------------------
-_DANGEROUS_PATTERNS = [
-    re.compile(r'\beval\s*\(', re.IGNORECASE),
-    re.compile(r'\bexec\s*\(', re.IGNORECASE),
-    re.compile(r'\b__import__\b', re.IGNORECASE),
-    re.compile(r'\b__builtins__\b', re.IGNORECASE),
-    re.compile(r'\b__globals__\b', re.IGNORECASE),
-    re.compile(r'\b__locals__\b', re.IGNORECASE),
-    re.compile(r'\bcompile\s*\(', re.IGNORECASE),
-    re.compile(r'\bimportlib\.import_module\b', re.IGNORECASE),
-    re.compile(r'\bsubprocess\b', re.IGNORECASE),
-    re.compile(r'\bos\.system\b', re.IGNORECASE),
-    re.compile(r'\bos\.popen\b', re.IGNORECASE),
-]
-
-
-def _contains_dangerous_pattern(text: str) -> bool:
-    """Check if text contains any dangerous patterns."""
-    if not isinstance(text, str):
-        return False
-    for pattern in _DANGEROUS_PATTERNS:
-        if pattern.search(text):
-            return True
-    return False
-
-
-def _scan_json_for_dangerous_patterns(obj: Any) -> bool:
-    """Recursively scan a JSON object (dict, list, or primitive) for dangerous patterns.
-    
-    Returns True if any string value contains a dangerous pattern, False otherwise.
-    """
-    if isinstance(obj, str):
-        return _contains_dangerous_pattern(obj)
-    elif isinstance(obj, dict):
-        for value in obj.values():
-            if _scan_json_for_dangerous_patterns(value):
-                return True
-    elif isinstance(obj, list):
-        for item in obj:
-            if _scan_json_for_dangerous_patterns(item):
-                return True
-    return False
-
-
-class _BodyReplayRequest(Request):
-    """Request wrapper that replays cached body bytes on receive() calls."""
-    
-    def __init__(self, request: Request, body_bytes: bytes):
-        super().__init__(request.scope, request.receive, request.send)
-        self._cached_body = body_bytes
-        self._body_sent = False
-    
-    async def receive(self):
-        """Override receive to replay the cached body on first call."""
-        if not self._body_sent:
-            self._body_sent = True
-            return {
-                "type": "http.request",
-                "body": self._cached_body,
-                "more_body": False,
-            }
-        # After body is sent, return empty to signal end of stream
-        return {
-            "type": "http.request",
-            "body": b"",
-            "more_body": False,
-        }
-
 
 # Content-type prefixes that carry text payloads and must be scanned.
 _TEXT_CONTENT_TYPES = (
@@ -291,65 +232,6 @@ def _is_text_content_type(content_type: str) -> bool:
     """Return True when the content-type indicates a text-based body."""
     ct_lower = content_type.lower()
     return any(ct_lower.startswith(prefix) or prefix in ct_lower for prefix in _TEXT_CONTENT_TYPES)
-
-
-async def input_sanitization_middleware(request: Request, call_next: Callable):
-    """Middleware to block requests with dangerous patterns in query, headers, and body."""
-    # Check query parameters
-    for key, value in request.query_params.items():
-        if _contains_dangerous_pattern(value):
-            return JSONResponse(
-                status_code=400,
-                content={"detail": "Request contains disallowed content"},
-            )
-    
-    # Check headers (skip Authorization and Cookie)
-    skip_headers = {"authorization", "cookie"}
-    for key, value in request.headers.items():
-        if key.lower() not in skip_headers and _contains_dangerous_pattern(value):
-            return JSONResponse(
-                status_code=400,
-                content={"detail": "Request contains disallowed content"},
-            )
-    
-    # Check body for all text-based content types
-    if request.method in ["POST", "PUT", "PATCH"]:
-        content_type = request.headers.get("content-type", "")
-        if _is_text_content_type(content_type):
-            try:
-                body = await request.body()
-                if body:
-                    body_str = body.decode("utf-8", errors="ignore")
-                    # For JSON, parse and recursively scan all string values
-                    if "application/json" in content_type:
-                        try:
-                            parsed_body = json.loads(body_str)
-                            if _scan_json_for_dangerous_patterns(parsed_body):
-                                return JSONResponse(
-                                    status_code=400,
-                                    content={"detail": "Request contains disallowed content"},
-                                )
-                        except json.JSONDecodeError:
-                            # If JSON parsing fails, fall back to string scan
-                            if _contains_dangerous_pattern(body_str):
-                                return JSONResponse(
-                                    status_code=400,
-                                    content={"detail": "Request contains disallowed content"},
-                                )
-                    else:
-                        # For form data, multipart, plain text, and other text types,
-                        # scan the raw decoded string.
-                        if _contains_dangerous_pattern(body_str):
-                            return JSONResponse(
-                                status_code=400,
-                                content={"detail": "Request contains disallowed content"},
-                            )
-                # Wrap request with body replay capability so downstream handlers can read it
-                request = _BodyReplayRequest(request, body)
-            except Exception:
-                pass
-    
-    return await call_next(request)
 
 
 # ---------------------------------------------------------------------------
