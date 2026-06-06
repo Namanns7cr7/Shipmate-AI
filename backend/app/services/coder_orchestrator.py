@@ -32,6 +32,7 @@ from app.schemas.api_schemas import (
 )
 from app.services import ast_lint
 from app.services import inflight_registry as ir
+from app.services import scope_guard as sg
 from app.services import validation_gate as vg
 from app.services.github_api_service import GitHubAPIService
 from app.services.github_pr_service import GitHubPRService
@@ -507,6 +508,36 @@ class CoderOrchestrator:
                     )
                 claimed_paths.append(cf.path)
 
+            # 3c.5. Scope-discipline guard. Pure text analysis (no local tree
+            # needed) so it runs for ALL repos, not just the dogfood case.
+            # Catches whole-file rewrites that silently drop pre-existing
+            # top-level defs (the untested-_lifespan-hook miss) or delete lines
+            # from protected config files (the .gitignore miss) — drift the
+            # pass-count gate can't see. Reject before touching GitHub.
+            serialized = [
+                {"path": cf.path, "new_content": cf.new_content,
+                 "rationale": cf.rationale}
+                for cf in coder_out.files
+            ]
+            scope_issues = sg.check_patch(serialized, target_files, coder_out.summary)
+            if scope_issues:
+                logger.warning(
+                    "scope guard rejected %s/%s: %s",
+                    req.finding.kind, req.finding.id, "; ".join(scope_issues),
+                )
+                return ActuateResponse(
+                    status="scope_rejected",
+                    pr_url=None,
+                    branch_name=branch_name,
+                    files_changed=[],
+                    skipped=[cf.path for cf in coder_out.files],
+                    summary=(
+                        f"Patch passed lint but failed the scope-discipline guard: "
+                        f"{' | '.join(scope_issues)} No branch/PR was created. "
+                        f"Coder summary: {coder_out.summary[:200]}"
+                    ),
+                )
+
             # 3d. Local pytest gate — only when actuating THIS repo on a local
             # checkout (the dogfood case). For external repos there's no local
             # tree to test against, so we skip. Snapshot → apply → smoke import
@@ -515,10 +546,6 @@ class CoderOrchestrator:
             gate_ran = False
             if _PYTEST_GATE_ENABLED and repo_full == _SELF_REPO:
                 gate_ran = True
-                serialized = [
-                    {"path": cf.path, "new_content": cf.new_content}
-                    for cf in coder_out.files
-                ]
                 result, snap = await asyncio.to_thread(vg.gate_patch, serialized)
                 if not result.passed:
                     await asyncio.to_thread(vg.restore_snapshot, snap)

@@ -42,6 +42,7 @@ from app.agents.coder_agent import CoderAgent, CoderBrief, CoderOutput, CoderFil
 from app.schemas.api_schemas import FindingPayload, RepoLensSummary
 from app.services import inflight_registry as ir
 from app.services import validation_gate as vg
+from app.services import scope_guard as sg
 from app.services.coder_orchestrator import (
     _resolve_target_paths,
     _fetch_current_contents,
@@ -159,6 +160,15 @@ def _verdict_for(
         return "skipped", ["coder produced 0 files"]
 
     issues = list(_lint_coder_output(coder_out, target_files, file_tree))
+
+    # Scope-discipline guard: catch whole-file rewrites that drop pre-existing
+    # top-level defs (untested-infra miss) or delete protected config lines.
+    # Same drift the orchestrator rejects with `scope_rejected`.
+    _serialized = [
+        {"path": cf.path, "new_content": cf.new_content, "rationale": cf.rationale}
+        for cf in coder_out.files
+    ]
+    issues.extend(sg.check_patch(_serialized, target_files, coder_out.summary))
 
     # Per-file extra: empty content (except __init__.py), gitkeep theater,
     # NEW test theater, mismatched first-party imports for tests.
