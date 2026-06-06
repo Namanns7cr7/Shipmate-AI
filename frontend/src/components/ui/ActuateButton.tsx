@@ -1,9 +1,17 @@
 import { useState } from 'react';
 import { Wand2, Loader2, ExternalLink, AlertCircle, Check, ChevronDown, ChevronUp, Copy } from 'lucide-react';
 import { api } from '../../lib/api';
+import { CIWatchPanel } from './CIWatchPanel';
 import type {
   FindingPayload, RepoLensSummary, ActuateResponse,
 } from '../../types';
+
+/** Extract the PR number from a GitHub PR url, e.g. .../pull/42 -> 42. */
+function prNumberFromUrl(url: string | null | undefined): number | null {
+  if (!url) return null;
+  const m = url.match(/\/pull\/(\d+)/);
+  return m ? Number(m[1]) : null;
+}
 
 type Status = 'idle' | 'running' | 'done' | 'error' | 'no_change' | 'lint_rejected';
 
@@ -86,24 +94,30 @@ export function ActuateButton({
     }
   }
 
-  // ── DONE — green pill, links to the PR ─────────────────────────────────
+  // ── DONE — green pill links to the PR + live CI watcher panel below ────
   if (status === 'done' && response?.pr_url) {
+    const prNum = prNumberFromUrl(response.pr_url);
     return (
-      <a
-        href={response.pr_url}
-        target="_blank"
-        rel="noopener noreferrer"
-        style={{
-          ...PILL_BASE,
-          padding, fontSize: font,
-          color: '#0b1220',
-          background: 'linear-gradient(135deg,#34d399,#10b981)',
-          border: '1px solid #10b981',
-          boxShadow: '0 4px 14px rgba(16,185,129,0.25)',
-        }}
-      >
-        <Check size={font} /> View PR <ExternalLink size={font - 2} />
-      </a>
+      <span style={{ display: 'inline-flex', flexDirection: 'column', alignItems: 'flex-end', gap: 6, maxWidth: '100%' }}>
+        <a
+          href={response.pr_url}
+          target="_blank"
+          rel="noopener noreferrer"
+          style={{
+            ...PILL_BASE,
+            padding, fontSize: font,
+            color: '#0b1220',
+            background: 'linear-gradient(135deg,#34d399,#10b981)',
+            border: '1px solid #10b981',
+            boxShadow: '0 4px 14px rgba(16,185,129,0.25)',
+          }}
+        >
+          <Check size={font} /> View PR <ExternalLink size={font - 2} />
+        </a>
+        {prNum !== null && (
+          <CIWatchPanel owner={owner} repo={repo} prNumber={prNum} />
+        )}
+      </span>
     );
   }
 

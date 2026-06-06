@@ -30,8 +30,17 @@ export function BranchPicker({
   const [error, setError] = useState<string | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
 
-  // Reset cached branches when the repo changes — otherwise stale list shows.
-  useEffect(() => { setBranches(null); setError(null); setOpen(false); }, [repoFullName]);
+  // Reset cached branches when the repo changes — otherwise a stale list shows.
+  // React's "adjust state during render" pattern (storing the previous prop in
+  // STATE, not a ref) — allowed during render and lint-clean, and avoids the
+  // cascading renders of a synchronous setState-in-effect.
+  const [prevRepo, setPrevRepo] = useState(repoFullName);
+  if (prevRepo !== repoFullName) {
+    setPrevRepo(repoFullName);
+    setBranches(null);
+    setError(null);
+    setOpen(false);
+  }
 
   // Click-outside to close.
   useEffect(() => {

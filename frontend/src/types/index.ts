@@ -235,6 +235,76 @@ export interface ActuateResponse {
   summary: string;
 }
 
+// ── CI watcher (closed-loop CI feedback on a Coder-opened PR) ───────────────────
+
+export interface WatcherState {
+  owner: string;
+  repo: string;
+  pr_number: number;
+  pr_url?: string | null;
+  branch: string;
+  status: 'watching' | 'fixing' | 'passed' | 'gave_up' | 'crashed';
+  attempts: number;
+  max_attempts: number;
+  history: Array<{ attempt: number; files_changed: string[]; summary: string; patch_hash: string }>;
+  last_error?: string | null;
+  started_ago_s: number;
+  last_event_ago_s: number;
+  finding_id: string;
+  finding_title: string;
+}
+
+export interface WatcherLogLine {
+  id: number;
+  ts: number;
+  level: 'info' | 'warn' | 'error';
+  msg: string;
+}
+
+// ── Finding journal ─────────────────────────────────────────────────────────────
+
+export type JournalState = 'in_progress' | 'shipped' | 'dismissed' | 'parked';
+
+export interface JournalRow {
+  finding_sig: string;
+  repo_full_name: string;
+  state: JournalState;
+  last_attempt_at: number;
+  attempt_count: number;
+  pr_url?: string | null;
+  notes?: string | null;
+}
+
+export interface JournalResponse {
+  repo: string;
+  rows: JournalRow[];
+  state_map: Record<string, JournalState>;
+}
+
+// ── Auto-fix SSE events ─────────────────────────────────────────────────────────
+
+export interface AutoFixEvent {
+  event:
+    | 'loop.start' | 'analyze.start' | 'analyze.done' | 'finding.picked'
+    | 'actuate.start' | 'actuate.done' | 'round.done' | 'loop.done'
+    | 'error' | 'heartbeat';
+  round?: number;
+  rounds?: number;
+  score?: number | null;
+  picked?: number;
+  kind?: string;
+  title?: string;
+  signature?: string;
+  status?: string;
+  pr_url?: string | null;
+  files_changed?: (string | null)[];
+  good?: number;
+  skipped?: number;
+  actuated?: number;
+  note?: string;
+  message?: string;
+}
+
 // ── App state ─────────────────────────────────────────────────────────────────
 
 export type AppState =

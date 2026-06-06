@@ -1,5 +1,5 @@
 import { useState, useCallback, useEffect, useRef } from 'react';
-import { Zap, Bell, BookOpen, Clock } from 'lucide-react';
+import { Zap, Bell, BookOpen, Clock, Sparkles } from 'lucide-react';
 import { useGithubAuth } from './hooks/useGithubAuth';
 import { api } from './lib/api';
 import { LandingPage } from './components/landing/LandingPage';
@@ -10,6 +10,7 @@ import { AnalysisPage } from './pages/AnalysisPage';
 import { ReportsPage } from './pages/ReportsPage';
 import { Spinner } from './components/ui/GitHubConnectButton';
 import { BranchPicker } from './components/ui/BranchPicker';
+import { AutoFixDrawer } from './components/ui/AutoFixDrawer';
 import type { Page } from './components/app/AppSidebar';
 import type { AgentProgress, GitHubRepo, GitHubPR, ShipMateReport } from './types';
 
@@ -140,6 +141,7 @@ export default function App() {
   const [selectedPull]                      = useState<GitHubPR | null>(null);
   const [report, setReport]                 = useState<ShipMateReport | null>(null);
   const [analyzing, setAnalyzing]           = useState(false);
+  const [autoFixOpen, setAutoFixOpen]       = useState(false);
 
   const { agents, progressByAgent, overallPct, markAllComplete, markAllError } = useAgentSimulation(analyzing);
 
@@ -258,6 +260,14 @@ export default function App() {
             >
               {analyzing ? <><Spinner size={13} /> Running…</> : <><Zap size={14} /> Run Analysis</>}
             </button>
+            <button
+              className="btn btn-secondary btn-sm"
+              onClick={() => setAutoFixOpen(true)}
+              disabled={analyzing || !selectedRepo}
+              title="Run the autonomous fix loop: analyze → fix → pytest gate → PR → watch CI"
+            >
+              <Sparkles size={14} /> Auto-fix
+            </button>
             <button style={{ padding: 8, borderRadius: 8, background: 'none', border: 'none', color: 'var(--ink-3)', cursor: 'pointer' }}>
               <Bell size={16} />
             </button>
@@ -318,6 +328,17 @@ export default function App() {
           </div>
         )}
       </main>
+
+      {selectedRepo && (
+        <AutoFixDrawer
+          open={autoFixOpen}
+          onClose={() => setAutoFixOpen(false)}
+          owner={selectedRepo.full_name.split('/')[0]}
+          repo={selectedRepo.name}
+          branch={selectedBranch}
+          accessToken={auth.accessToken}
+        />
+      )}
     </div>
   );
 }
