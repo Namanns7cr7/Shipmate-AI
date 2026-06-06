@@ -126,7 +126,9 @@ function useActivityLog(running: boolean): LogLine[] {
       idxRef.current++;
     };
     tick();
-    const id = setInterval(tick, 760);
+    // Spread the 16-line script across ~28s of analysis (avg ~1.75s/line) so
+    // the log scroll roughly tracks the real LLM-driven pipeline.
+    const id = setInterval(tick, 1750);
     return () => clearInterval(id);
   }, [running]);
 
@@ -146,10 +148,14 @@ interface Props {
   selectedBranch: string;
   selectedPull: GitHubPR | null;
   agents: AgentProgress[];
+  /** 0..100 per agent id — matches the time-driven simulation in App.tsx. */
+  progressByAgent?: Record<AgentProgress['id'], number>;
+  /** 0..100 overall, capped at 95 until API resolves. */
+  overallPct?: number;
   onCancel: () => void;
 }
 
-export function AnalysisPage({ selectedRepo, selectedBranch, agents, onCancel }: Props) {
+export function AnalysisPage({ selectedRepo, selectedBranch, agents, progressByAgent, overallPct, onCancel }: Props) {
   const logs = useActivityLog(true);
 
   const statuses = AGENTS.map((_, i) => {
@@ -157,8 +163,11 @@ export function AnalysisPage({ selectedRepo, selectedBranch, agents, onCancel }:
     return match ? (STATUS_MAP[match.status] ?? 'pending') : 'pending';
   });
 
-  const completeCount = agents.filter(a => a.status === 'complete').length;
-  const overall = Math.round((completeCount / agents.length) * 100);
+  // Use the real elapsed-time-driven overall if available; fall back to the
+  // old completeCount-based calc for safety.
+  const overall = overallPct ?? Math.round(
+    (agents.filter(a => a.status === 'complete').length / agents.length) * 100
+  );
   const activeAgent = AGENTS.find((_, i) => statuses[i] === 'running');
 
   return (
@@ -221,7 +230,11 @@ export function AnalysisPage({ selectedRepo, selectedBranch, agents, onCancel }:
         <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
           {AGENTS.map((agent, i) => {
             const st = statuses[i] as 'pending' | 'running' | 'complete' | 'error';
-            const progress = st === 'complete' ? 100 : st === 'running' ? 55 : 0;
+            const agentMatch = agents.find(a => ID_TO_INDEX[a.id] === i);
+            const realPct = agentMatch && progressByAgent ? progressByAgent[agentMatch.id] : undefined;
+            const progress = st === 'complete' ? 100
+              : st === 'error' ? 100
+              : (realPct !== undefined ? realPct : (st === 'running' ? 55 : 0));
             const stats = st === 'complete' ? [
               { k: agent.key === 'repolens' ? 'deps' : agent.key === 'guardrail' ? 'findings' : agent.key === 'testpilot' ? 'tests' : 'steps', v: agent.key === 'repolens' ? '1.1k' : agent.key === 'guardrail' ? '6' : agent.key === 'testpilot' ? '4' : '4' },
               { k: 'score', v: '—', color: agent.hex },

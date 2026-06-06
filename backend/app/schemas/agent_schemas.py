@@ -51,6 +51,8 @@ class Milestone(BaseModel):
     estimated_days: int
     priority: str   # "critical" | "high" | "medium" | "low"
     category: str   # "feature" | "testing" | "security" | "ci_cd" | "infra" | "docs"
+    source: str = "heuristic"        # "heuristic" | "discovery"
+    rationale: Optional[str] = None  # Discovery-only: why this matters for THIS repo
 
 
 class Blocker(BaseModel):
@@ -60,6 +62,8 @@ class Blocker(BaseModel):
     severity: str   # "critical" | "high" | "medium"
     resolution: str
     category: str
+    source: str = "heuristic"
+    rationale: Optional[str] = None
 
 
 class PlanForgeOutput(BaseModel):
@@ -82,6 +86,8 @@ class SecurityFinding(BaseModel):
     recommendation: str
     file: Optional[str] = None
     cve: Optional[str] = None
+    source: str = "heuristic"        # "heuristic" | "discovery"
+    rationale: Optional[str] = None  # Discovery-only: code-grounded explanation
 
 
 class GuardRailOutput(BaseModel):
@@ -108,6 +114,8 @@ class SuggestedTest(BaseModel):
     priority: str   # "critical" | "high" | "medium" | "low"
     description: str
     target_file: Optional[str] = None
+    source: str = "heuristic"        # "heuristic" | "discovery"
+    rationale: Optional[str] = None  # Discovery-only: code-grounded explanation
 
 
 class TestPilotOutput(BaseModel):

@@ -77,12 +77,21 @@ class GitHubAPIService:
             return [item["path"] for item in data.get("tree", []) if item.get("type") == "blob"]
 
     @staticmethod
-    async def get_file_content(token: str, owner: str, repo: str, path: str) -> Optional[str]:
-        """Fetch and decode a single file's content. Returns None on 404 / binary files."""
+    async def get_file_content(
+        token: str, owner: str, repo: str, path: str,
+        ref: Optional[str] = None,
+    ) -> Optional[str]:
+        """Fetch and decode a single file's content from `ref` (branch/sha/tag).
+        Returns None on 404 / binary files. If `ref` is None, GitHub serves
+        the repo's default branch."""
+        params: Dict[str, Any] = {}
+        if ref:
+            params["ref"] = ref
         async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
             resp = await client.get(
                 f"{_BASE}/repos/{owner}/{repo}/contents/{path}",
                 headers=_headers(token),
+                params=params,
             )
             if resp.status_code == 404:
                 return None
