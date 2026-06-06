@@ -69,14 +69,18 @@ _ACTIVE_REPO = "WalkingDevFlag/Shipmate-AI"
 
 class _ActuateShim:
     """Minimal duck-typed stand-in for ActuateRequest — CoderOrchestrator.
-    _run_decomposed only reads .owner/.repo/.branch/.finding. The loop drives
-    its own gates (it doesn't open PRs), so we don't need the full request."""
+    _run_decomposed reads .owner/.repo/.branch/.finding/.access_token. The
+    loop drives its own gates (it doesn't open PRs), so we don't need the
+    full request — just enough for the decomposer to fetch step-path
+    originals."""
 
-    def __init__(self, owner: str, repo: str, branch: str, finding) -> None:
+    def __init__(self, owner: str, repo: str, branch: str, finding,
+                 access_token: str = "") -> None:
         self.owner = owner
         self.repo = repo
         self.branch = branch
         self.finding = finding
+        self.access_token = access_token
 
 
 def _load_state() -> Dict[str, Any]:
@@ -442,7 +446,7 @@ async def _actuate_one(
         if decompose and finding.kind in ("milestone", "blocker"):
             from app.services.coder_orchestrator import CoderOrchestrator
             coder_out = await CoderOrchestrator._run_decomposed(
-                _ActuateShim(owner, repo, branch, finding), ctx, file_tree,
+                _ActuateShim(owner, repo, branch, finding, token), ctx, file_tree,
                 target_files, _mode,
             )
         else:

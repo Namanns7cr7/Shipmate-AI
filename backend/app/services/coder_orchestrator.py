@@ -415,6 +415,26 @@ class CoderOrchestrator:
             len(plan.steps), req.finding.kind, req.finding.id,
         )
 
+        # Fetch the CURRENT content of every path any step declares but that
+        # the finding's own target resolution missed. Without this, a step
+        # editing e.g. analysis.py gets an EMPTY original and blind-rewrites
+        # it — silently dropping existing code (e.g. an auth guard) that the
+        # scope guard then can't catch because it has no original to diff
+        # against. We mutate `target_files` IN PLACE so the caller's downstream
+        # scope guard sees these originals too. (Observed live: an SSE
+        # milestone resolved to README.md only, then decomposed into edits of
+        # analysis.py/orchestrator.py and dropped _verify_repo_write_access.)
+        declared = {p for step in plan.steps for p in step.target_paths}
+        missing = [p for p in declared if p not in target_files]
+        if missing:
+            fetched = await _fetch_current_contents(
+                req.access_token, req.owner, req.repo, missing, ref=req.branch,
+            )
+            for p, content in fetched.items():
+                target_files.setdefault(p, content)
+            logger.info("decompose: fetched %d step-path original(s): %s",
+                        len(missing), missing)
+
         agent = CoderAgent()
         # Accumulated file contents, seeded with the originally-fetched files.
         # path -> latest content. Later steps see earlier steps' output.
