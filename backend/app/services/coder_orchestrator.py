@@ -443,8 +443,27 @@ class CoderOrchestrator:
         # error instead of opening a bogus PR.
         lint_issues = _lint_coder_output(coder_out, target_files, file_tree)
         if lint_issues:
+            # One auto-retry with the issues fed back to Coder before giving
+            # up. A large fraction of lint rejections are first-shot
+            # hallucinated imports the model will fix when told exactly what
+            # was wrong — cheaper than a wasted PR or a human round-trip.
             logger.warning(
-                "Coder output rejected by post-lint for %s/%s: %s",
+                "Coder output rejected by post-lint for %s/%s: %s — retrying once with feedback",
+                req.finding.kind, req.finding.id, lint_issues,
+            )
+            try:
+                coder_out = await asyncio.to_thread(
+                    agent.run_with_lint_feedback, brief, lint_issues,
+                    _deployment_hint(req.finding),
+                )
+            except Exception as e:
+                logger.warning("lint-feedback retry raised %s; keeping first output", e)
+            if coder_out.files:
+                lint_issues = _lint_coder_output(coder_out, target_files, file_tree)
+
+        if lint_issues or not coder_out.files:
+            logger.warning(
+                "Coder output still rejected after lint-feedback retry for %s/%s: %s",
                 req.finding.kind, req.finding.id, lint_issues,
             )
             return ActuateResponse(
@@ -454,10 +473,10 @@ class CoderOrchestrator:
                 files_changed=[],
                 skipped=[cf.path for cf in coder_out.files],
                 summary=(
-                    f"Coder produced output but post-lint rejected it: "
-                    f"{'; '.join(lint_issues)}. The patch was discarded "
-                    f"and no branch/PR was created. Original Coder summary: "
-                    f"{coder_out.summary[:300]}"
+                    f"Coder produced output but post-lint rejected it (after "
+                    f"one feedback retry): {'; '.join(lint_issues) or 'no files'}. "
+                    f"The patch was discarded and no branch/PR was created. "
+                    f"Original Coder summary: {coder_out.summary[:300]}"
                 ),
             )
 

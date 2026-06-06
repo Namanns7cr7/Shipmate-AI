@@ -32,6 +32,12 @@ from pydantic import BaseModel
 
 logger = logging.getLogger("shipmate.bedrock_provider")
 
+# A CoderOutput with files but a near-empty summary is a known flaky-output
+# signature (the model emitted a patch but truncated its reasoning). We retry
+# once with a tighter prompt. 30 chars ≈ "Fixes the bug." — anything shorter
+# alongside a real patch is suspect.
+_MIN_CODER_SUMMARY_CHARS = 30
+
 
 def _coerce_stringified_json(value: Any) -> Any:
     """
@@ -59,6 +65,29 @@ def _coerce_stringified_json(value: Any) -> Any:
     if isinstance(value, dict):
         return {k: _coerce_stringified_json(v) for k, v in value.items()}
     return value
+
+
+def _shrink_oversized_file_blocks(user_prompt: str, threshold: int = 8_000) -> str:
+    """Halve the size of any single oversized region in the prompt to free
+    token budget for the model's own output on a short-summary retry.
+
+    We don't parse the prompt structure (it's built by coder_agent), we just
+    cap total length: if the prompt exceeds 2*threshold, keep the head (task +
+    early files) and the tail, dropping the middle with a marker. This biases
+    toward preserving the task framing and the most-recently-listed file,
+    which is usually the edit target.
+    """
+    if len(user_prompt) <= 2 * threshold:
+        return user_prompt
+    head = user_prompt[:threshold]
+    tail = user_prompt[-threshold:]
+    dropped = len(user_prompt) - 2 * threshold
+    return (
+        head
+        + f"\n\n# ... [ShipMate retry: dropped {dropped} chars of file context "
+        "to free output budget; focus on the task and the file content shown] ...\n\n"
+        + tail
+    )
 
 
 class BedrockProvider:
@@ -125,7 +154,16 @@ class BedrockProvider:
                 model_id, tool_name, schema, system_prompt, user_prompt, max_tokens
             )
             coerced = _coerce_stringified_json(payload)
-            return schema_class.model_validate(coerced)
+            result = schema_class.model_validate(coerced)
+            # Flaky-output guard: a CoderOutput that has files but an almost
+            # empty summary is a sign the model truncated. Retry once with a
+            # shrunk context (drop the back half of oversized target-file
+            # blocks so the model has more budget for its reasoning).
+            result = self._maybe_retry_short_summary(
+                result, schema_class, model_id, tool_name, schema,
+                system_prompt, user_prompt, max_tokens,
+            )
+            return result
         except Exception as first_err:
             from pydantic import ValidationError as _VE
             err_str = str(first_err)
@@ -156,7 +194,11 @@ class BedrockProvider:
                     model_id, tool_name, schema, system_prompt, user_prompt, max_tokens
                 )
                 coerced = _coerce_stringified_json(payload)
-                return schema_class.model_validate(coerced)
+                result = schema_class.model_validate(coerced)
+                return self._maybe_retry_short_summary(
+                    result, schema_class, model_id, tool_name, schema,
+                    system_prompt, user_prompt, max_tokens,
+                )
 
             is_validation = isinstance(first_err, _VE) or "validation error" in err_str.lower()
             if not is_validation:
@@ -179,6 +221,86 @@ class BedrockProvider:
             )
             coerced = _coerce_stringified_json(payload)
             return schema_class.model_validate(coerced)
+
+    @staticmethod
+    def _is_short_summary_coder_output(result: BaseModel) -> bool:
+        """True when *result* is a CoderOutput carrying a patch but an
+        implausibly short summary (a flaky-truncation signature)."""
+        if type(result).__name__ != "CoderOutput":
+            return False
+        files = getattr(result, "files", None) or []
+        summary = getattr(result, "summary", "") or ""
+        return len(files) > 0 and len(summary.strip()) < _MIN_CODER_SUMMARY_CHARS
+
+    def _maybe_retry_short_summary(
+        self,
+        result: BaseModel,
+        schema_class: Type[BaseModel],
+        model_id: str,
+        tool_name: str,
+        schema: dict,
+        system_prompt: str,
+        user_prompt: str,
+        max_tokens: int,
+    ) -> BaseModel:
+        """One-shot retry when a CoderOutput came back with files but a
+        near-empty summary. Shrinks oversized target-file blocks in the
+        prompt to free token budget, then re-invokes once. If the retry is
+        ALSO short, keep whichever has the longer summary (never worse)."""
+        if not self._is_short_summary_coder_output(result):
+            return result
+        logger.warning(
+            "BedrockProvider: CoderOutput summary suspiciously short "
+            "(%d chars, %d files) — retrying once with shrunk context",
+            len(getattr(result, "summary", "") or ""),
+            len(getattr(result, "files", []) or []),
+        )
+        shrunk_user = _shrink_oversized_file_blocks(user_prompt)
+        try:
+            payload = self._call_converse(
+                model_id, tool_name, schema, system_prompt, shrunk_user, max_tokens
+            )
+            coerced = _coerce_stringified_json(payload)
+            retried = schema_class.model_validate(coerced)
+        except Exception as e:
+            logger.info("short-summary retry failed (%s); keeping first result", e)
+            return result
+        # Prefer whichever summary is longer — the retry isn't guaranteed better.
+        first_len = len(getattr(result, "summary", "") or "")
+        retry_len = len(getattr(retried, "summary", "") or "")
+        return retried if retry_len >= first_len else result
+
+    def invoke_with_lint_feedback(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        schema_class: Type[BaseModel],
+        lint_issues: list[str],
+        deployment_hint: Literal["smart", "fast"] = "smart",
+    ) -> BaseModel:
+        """Re-invoke after a patch was rejected by post-Coder lint. Appends an
+        explicit fix-up notice listing the issues so the model corrects them
+        rather than re-emitting the same mistake. Reuses the full
+        invoke_structured_sync path (auth-retry, validation-retry,
+        short-summary retry all still apply)."""
+        issues_block = "\n".join(f"  - {i}" for i in lint_issues)
+        feedback_user = (
+            user_prompt
+            + "\n\n# LINT REJECTION — CORRECT AND RESUBMIT\n"
+            "Your previous patch was rejected by automated lint for:\n"
+            f"{issues_block}\n"
+            "Produce a corrected patch that resolves every issue above. Do not "
+            "reintroduce them. If an issue was a hallucinated import or symbol, "
+            "either add the missing definition to a file in `files` or remove "
+            "the reference. Return ONLY the structured object."
+        )
+        logger.info(
+            "BedrockProvider: re-invoking with lint feedback (%d issue(s))",
+            len(lint_issues),
+        )
+        return self.invoke_structured_sync(
+            system_prompt, feedback_user, schema_class, deployment_hint,
+        )
 
     async def invoke_structured(
         self,

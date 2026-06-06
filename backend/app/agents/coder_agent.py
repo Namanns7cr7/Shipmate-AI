@@ -260,6 +260,34 @@ class CoderAgent:
             schema_class=CoderOutput,
             deployment_hint=deployment_hint,
         )
+        return self._cap_runaway(result)
+
+    def run_with_lint_feedback(
+        self,
+        brief: CoderBrief,
+        lint_issues: List[str],
+        deployment_hint: Literal["smart", "fast"] = "smart",
+    ) -> CoderOutput:
+        """Re-run after post-Coder lint rejected the first patch, feeding the
+        specific issues back so the model corrects them. Used by the
+        orchestrator for one auto-retry before returning `lint_rejected`."""
+        provider = self._get_provider()
+        user_prompt = _build_user_prompt(brief)
+        logger.info(
+            "Coder.run_with_lint_feedback kind=%s id=%s issues=%d",
+            brief.finding_kind, brief.finding_id, len(lint_issues),
+        )
+        result = provider.invoke_with_lint_feedback(
+            system_prompt=_SYSTEM_PROMPT,
+            user_prompt=user_prompt,
+            schema_class=CoderOutput,
+            lint_issues=lint_issues,
+            deployment_hint=deployment_hint,
+        )
+        return self._cap_runaway(result)
+
+    @staticmethod
+    def _cap_runaway(result: CoderOutput) -> CoderOutput:
         # Sanity-only soft cap. Anything above 25 files in a single patch
         # is almost certainly a runaway generation — log and trim. Below
         # that, trust the model: real refactors and feature work
