@@ -25,6 +25,7 @@ from app.api.routes.analysis import router as analysis_router
 from app.api.routes.actuate import router as actuate_router
 from app.api.routes.watcher import router as watcher_router
 from app.api.routes.branches import router as branches_router
+from app.api.routes.findings import router as findings_router
 
 # ---------------------------------------------------------------------------
 # Rate Limiting: Token Bucket Implementation
@@ -464,6 +465,7 @@ app.include_router(analysis_router, prefix="/api")
 app.include_router(actuate_router, prefix="/api")
 app.include_router(watcher_router, prefix="/api")
 app.include_router(branches_router, prefix="/api")
+app.include_router(findings_router, prefix="/api")
 
 
 @app.get("/")

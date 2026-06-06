@@ -451,6 +451,16 @@ def journal_get_state(finding_sig: str) -> Optional[Dict[str, Any]]:
     return dict(row) if row else None
 
 
+def journal_delete(finding_sig: str) -> bool:
+    """Remove a journal row entirely. Used by 'reopen' — absence from the
+    journal IS the fresh state everywhere else, so deleting is how we undo a
+    dismissal/park. Returns True if a row was deleted."""
+    c = _conn()
+    cur = c.execute("DELETE FROM finding_journal WHERE finding_sig=?", (finding_sig,))
+    c.commit()
+    return cur.rowcount > 0
+
+
 def journal_list(
     repo_full_name: Optional[str] = None,
     state_in: Optional[List[str]] = None,
