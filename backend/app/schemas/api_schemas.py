@@ -67,6 +67,13 @@ class ActuateRequest(BaseModel):
     finding: FindingPayload
     context: Optional[RepoLensSummary] = None
     open_pr: bool = True
+    # Tier-2 opt-ins, both off by default (current behaviour unchanged):
+    #  • diff_mode: ask Coder for unified diffs (token-saving; auto-falls back
+    #    to full-file on any apply failure).
+    #  • decompose: for multi-file features, plan ordered steps and run Coder
+    #    once per step into one branch before opening the PR.
+    diff_mode: bool = False
+    decompose: bool = False
 
 
 class ActuatedFile(BaseModel):

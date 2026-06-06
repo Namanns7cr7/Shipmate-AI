@@ -26,7 +26,7 @@ import re
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
-from app.agents.coder_agent import CoderAgent, CoderBrief, CoderOutput
+from app.agents.coder_agent import CoderAgent, CoderBrief, CoderFile, CoderOutput
 from app.schemas.api_schemas import (
     ActuateRequest, ActuateResponse, ActuatedFile, FindingPayload, RepoLensSummary,
 )
@@ -384,6 +384,81 @@ def _build_task(finding: FindingPayload) -> str:
 class CoderOrchestrator:
 
     @classmethod
+    async def _run_decomposed(
+        cls,
+        req: "ActuateRequest",
+        ctx: RepoLensSummary,
+        file_tree: List[str],
+        target_files: Dict[str, str],
+        mode: str,
+    ) -> CoderOutput:
+        """Tier-2 decompose path: plan ordered steps, run Coder once per step,
+        and MERGE the steps into a single CoderOutput. Each step sees prior
+        steps' new files folded into its target_files (so step N can import
+        symbols step N-1 defined). Returns the merged output; all the normal
+        gates downstream (lint → scope → pytest → branch → PR) then operate on
+        the union, and everything lands in ONE branch / ONE PR.
+
+        Falls back to a single full-finding run if planning yields one step."""
+        from app.agents.decomposer import Decomposer
+
+        plan = await asyncio.to_thread(
+            Decomposer().plan,
+            _build_task(req.finding),
+            f"{req.owner}/{req.repo}",
+            ctx.primary_language,
+            ctx.tech_stack,
+            file_tree,
+        )
+        logger.info(
+            "decompose: %d step(s) for %s/%s",
+            len(plan.steps), req.finding.kind, req.finding.id,
+        )
+
+        agent = CoderAgent()
+        # Accumulated file contents, seeded with the originally-fetched files.
+        # path -> latest content. Later steps see earlier steps' output.
+        merged: Dict[str, CoderFile] = {}
+        working_files: Dict[str, str] = dict(target_files)
+        hint = _deployment_hint(req.finding)
+
+        for idx, step in enumerate(plan.steps):
+            # Each step's target_files = its declared paths (current content
+            # from working_files if present, else empty=new) UNION every file
+            # produced so far (ground truth for cross-step references).
+            step_targets: Dict[str, str] = {}
+            for p in step.target_paths:
+                step_targets[p] = working_files.get(p, "")
+            for p, cf in merged.items():
+                step_targets[p] = cf.new_content
+
+            step_brief = CoderBrief(
+                task=f"[Step {idx + 1}/{len(plan.steps)}: {step.name}] {step.task}",
+                repo_full_name=f"{req.owner}/{req.repo}",
+                primary_language=ctx.primary_language,
+                tech_stack=ctx.tech_stack,
+                entry_points=ctx.entry_points,
+                target_files=step_targets,
+                finding_kind=req.finding.kind,
+                finding_id=f"{req.finding.id}-step{idx + 1}",
+                finding_severity=req.finding.severity,
+            )
+            step_out: CoderOutput = await asyncio.to_thread(
+                agent.run, step_brief, hint, mode,
+            )
+            for cf in step_out.files:
+                merged[cf.path] = cf
+                working_files[cf.path] = cf.new_content
+
+        summary = plan.summary or (req.finding.title or "decomposed feature")
+        summary = f"{summary} ({len(plan.steps)} steps, {len(merged)} files)"
+        return CoderOutput(
+            files=list(merged.values()),
+            skipped=[],
+            summary=summary,
+        )
+
+    @classmethod
     async def run_actuation(cls, req: ActuateRequest) -> ActuateResponse:
         ctx = req.context or RepoLensSummary()
         branch_name = _branch_name(req.finding)
@@ -423,9 +498,15 @@ class CoderOrchestrator:
             finding_severity=req.finding.severity,
         )
         agent = CoderAgent()
-        coder_out: CoderOutput = await asyncio.to_thread(
-            agent.run, brief, _deployment_hint(req.finding),
-        )
+        _mode = "diff" if getattr(req, "diff_mode", False) else "full"
+        if getattr(req, "decompose", False):
+            coder_out = await cls._run_decomposed(
+                req, ctx, file_tree, target_files, _mode,
+            )
+        else:
+            coder_out = await asyncio.to_thread(
+                agent.run, brief, _deployment_hint(req.finding), _mode,
+            )
 
         if not coder_out.files:
             # Coder decided no change is needed (or skipped everything).
