@@ -32,6 +32,7 @@ from __future__ import annotations
 import logging
 import re
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -39,6 +40,12 @@ from typing import Dict, List, Optional, Tuple
 from app.services import inflight_registry as ir
 
 logger = logging.getLogger("shipmate.validation_gate")
+
+# The interpreter running THIS process — correct in every environment:
+# local venv (backend/venv/bin/python), the hosted Oryx container
+# (/workspace/pythonenv3.11/bin/python), and CI. Hardcoding './venv/bin/python'
+# broke actuation on Azure, where no ./venv exists relative to the CWD.
+PYTHON = sys.executable
 
 # Repo root resolved once at import: this file lives at
 # backend/app/services/validation_gate.py — go up three levels to repo root.
@@ -130,7 +137,7 @@ def smoke_imports(module: str = "app.main") -> Tuple[bool, str]:
     Bounded by 10s. Returns (ok, error_text_tail)."""
     try:
         proc = subprocess.run(
-            ["./venv/bin/python", "-c", f"import {module}"],
+            [PYTHON, "-c", f"import {module}"],
             cwd=str(BACKEND_DIR),
             capture_output=True, text=True, timeout=SMOKE_TIMEOUT_S,
         )
@@ -169,7 +176,7 @@ def run_pytest(target: str = "tests/") -> Tuple[int, int, str]:
     """
     try:
         proc = subprocess.run(
-            ["./venv/bin/python", "-m", "pytest", target,
+            [PYTHON, "-m", "pytest", target,
              "-q", "--tb=no", "--no-header", "-p", "no:cacheprovider",
              "--continue-on-collection-errors"],
             cwd=str(BACKEND_DIR),
