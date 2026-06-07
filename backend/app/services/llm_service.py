@@ -52,23 +52,25 @@ _provider_init_attempted = False
 
 
 def _get_provider():
-    """Return a Bedrock provider singleton, or None if unavailable."""
+    """Return the configured LLM provider singleton, or None if unavailable.
+
+    Routed through the factory so the same flag (SHIPMATE_LLM_PROVIDER, or the
+    legacy LLM_PROVIDER) selects Bedrock or Azure OpenAI. Unlike the agents'
+    hard get_provider() (which raises), the enhancement layer stays
+    None-tolerant: any construction failure (missing creds, missing SDK)
+    disables prose enhancement gracefully — deterministic scores/verdicts are
+    unaffected."""
     global _provider, _provider_init_attempted
     if _provider_init_attempted:
         return _provider
     _provider_init_attempted = True
 
-    kind = os.getenv("LLM_PROVIDER", "").lower()
-    if kind != "bedrock":
-        logger.info("LLMService: LLM_PROVIDER=%r → enhancements disabled", kind or "(unset)")
-        return None
-
     try:
-        from app.services.bedrock_provider import BedrockProvider
-        _provider = BedrockProvider()
-        logger.info("LLMService: BedrockProvider ready")
+        from app.services.llm_provider import get_provider, provider_kind
+        _provider = get_provider()
+        logger.info("LLMService: %s provider ready", provider_kind())
     except Exception as e:
-        logger.warning("LLMService: BedrockProvider init failed (%s); enhancements disabled", e)
+        logger.warning("LLMService: provider init failed (%s); enhancements disabled", e)
         _provider = None
     return _provider
 
@@ -100,6 +102,13 @@ def _maybe_invalidate_provider(err: BaseException) -> None:
         )
         _provider = None
         _provider_init_attempted = False
+        # Also drop the factory's cached singleton so the rebuild actually
+        # constructs a fresh client (the factory is what we now build through).
+        try:
+            from app.services.llm_provider import reset_provider
+            reset_provider()
+        except Exception:
+            pass
 
 
 # ── Per-agent enhancement schemas ────────────────────────────────────────────

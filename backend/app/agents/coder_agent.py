@@ -26,6 +26,7 @@ from typing import Dict, List, Literal, Optional
 from pydantic import BaseModel, Field
 
 from app.services.bedrock_provider import BedrockProvider
+from app.services.llm_provider import get_provider
 
 logger = logging.getLogger("shipmate.coder_agent")
 
@@ -277,8 +278,12 @@ class CoderAgent:
         self._provider = provider
 
     def _get_provider(self) -> BedrockProvider:
+        # Routed through the factory so SHIPMATE_LLM_PROVIDER=azure swaps in the
+        # AzureOpenAIProvider (same invoke_structured contract). The type hint
+        # stays BedrockProvider for back-compat; both providers are structurally
+        # identical from the caller's side.
         if self._provider is None:
-            self._provider = BedrockProvider()
+            self._provider = get_provider()
         return self._provider
 
     def run(
