@@ -26,6 +26,7 @@ from app.api.routes.watcher import router as watcher_router
 from app.api.routes.branches import router as branches_router
 from app.api.routes.findings import router as findings_router
 from app.api.routes.auto_fix import router as auto_fix_router
+from app.api.routes.history import router as history_router
 
 # ---------------------------------------------------------------------------
 # Rate Limiting: Token Bucket Implementation
@@ -426,6 +427,7 @@ app.include_router(watcher_router, prefix="/api")
 app.include_router(branches_router, prefix="/api")
 app.include_router(findings_router, prefix="/api")
 app.include_router(auto_fix_router, prefix="/api")
+app.include_router(history_router, prefix="/api")
 
 
 @app.get("/")
@@ -463,12 +465,61 @@ def _verify_github_webhook_signature(body: bytes, signature_header: str) -> bool
     return hmac.compare_digest(expected, provided)
 
 
+async def _run_webhook_analysis(
+    owner: str,
+    repo: str,
+    branch: str,
+    pr_number: int | None,
+    installation_token: str,
+) -> None:
+    """Background task: run the full analysis pipeline and post a PR comment."""
+    try:
+        from app.services.repo_analysis_service import RepoAnalysisService
+        from app.orchestrator.shipmate_orchestrator import ShipMateOrchestrator
+        from app.services.github_comment_service import post_pr_comment
+        from app.services.score_history_service import record_score
+
+        repo_context = await RepoAnalysisService.build_context(
+            token=installation_token,
+            owner=owner,
+            repo=repo,
+            branch=branch,
+            pr_number=pr_number,
+            feature_context="",
+        )
+        orchestrator = ShipMateOrchestrator()
+        report = await orchestrator.run(repo_context)
+
+        record_score(
+            owner=owner, repo=repo, branch=branch,
+            score=report.readiness_score,
+            breakdown={
+                "repo": report.score_breakdown.repo_score,
+                "delivery": report.score_breakdown.delivery_score,
+                "security": report.score_breakdown.security_score,
+                "test": report.score_breakdown.test_score,
+            },
+        )
+
+        if pr_number:
+            await post_pr_comment(
+                token=installation_token,
+                owner=owner, repo=repo,
+                pr_number=pr_number,
+                report=report,
+            )
+        logger.info("Webhook analysis complete for %s/%s#%s score=%d",
+                    owner, repo, pr_number or branch, report.readiness_score)
+    except Exception as e:
+        logger.warning("Webhook analysis failed for %s/%s: %s", owner, repo, e)
+
+
 @app.post("/webhooks/github")
 async def github_webhook(request: Request):
     """Handle GitHub webhook events for push and pull_request.
 
     Validates webhook signature, extracts repository and branch info,
-    and triggers automatic analysis.
+    and triggers automatic analysis in the background.
     """
     body_bytes = await request.body()
 
@@ -489,63 +540,60 @@ async def github_webhook(request: Request):
 
     event_type = request.headers.get("x-github-event", "")
 
+    # The installation token for automated analysis — must be set as env var
+    # when running as a GitHub App. Falls back to empty (analysis skipped).
+    installation_token = os.getenv("GITHUB_INSTALLATION_TOKEN", "")
+
     if event_type == "push":
-        repo_name = payload.get("repository", {}).get("full_name")
+        repo_full = payload.get("repository", {}).get("full_name", "")
         branch = payload.get("ref", "").split("/")[-1]
+        owner, _, repo = repo_full.partition("/")
 
-        if not repo_name or not branch:
-            return JSONResponse(
-                status_code=400,
-                content={"detail": "Missing repository or branch info"},
-            )
+        if not repo_full or not branch:
+            return JSONResponse(status_code=400, content={"detail": "Missing repo or branch"})
 
-        return JSONResponse(
-            status_code=202,
-            content={
-                "status": "accepted",
-                "message": f"Analysis queued for {repo_name}:{branch}",
-                "event": "push",
-            },
-        )
+        if installation_token:
+            import asyncio
+            asyncio.create_task(_run_webhook_analysis(owner, repo, branch, None, installation_token))
+
+        return JSONResponse(status_code=202, content={
+            "status": "accepted",
+            "message": f"Analysis queued for {repo_full}:{branch}",
+            "event": "push",
+        })
 
     elif event_type == "pull_request":
-        repo_name = payload.get("repository", {}).get("full_name")
+        repo_full = payload.get("repository", {}).get("full_name", "")
         pr_number = payload.get("pull_request", {}).get("number")
+        branch = payload.get("pull_request", {}).get("head", {}).get("ref", "main")
         action = payload.get("action")
+        owner, _, repo = repo_full.partition("/")
 
-        if not repo_name or not pr_number:
-            return JSONResponse(
-                status_code=400,
-                content={"detail": "Missing repository or PR info"},
-            )
+        if not repo_full or not pr_number:
+            return JSONResponse(status_code=400, content={"detail": "Missing repo or PR info"})
 
         if action not in ["opened", "synchronize", "reopened"]:
-            return JSONResponse(
-                status_code=202,
-                content={
-                    "status": "ignored",
-                    "message": f"PR action '{action}' does not trigger analysis",
-                    "event": "pull_request",
-                },
-            )
-
-        return JSONResponse(
-            status_code=202,
-            content={
-                "status": "accepted",
-                "message": f"Analysis queued for {repo_name} PR #{pr_number}",
+            return JSONResponse(status_code=202, content={
+                "status": "ignored",
+                "message": f"PR action '{action}' does not trigger analysis",
                 "event": "pull_request",
-            },
-        )
+            })
+
+        if installation_token:
+            import asyncio
+            asyncio.create_task(_run_webhook_analysis(owner, repo, branch, pr_number, installation_token))
+
+        return JSONResponse(status_code=202, content={
+            "status": "accepted",
+            "message": f"Analysis queued for {repo_full} PR #{pr_number}",
+            "event": "pull_request",
+        })
 
     else:
-        return JSONResponse(
-            status_code=202,
-            content={
-                "status": "ignored",
-                "message": f"Event type '{event_type}' is not processed",
-            },
-        )
+        return JSONResponse(status_code=202, content={
+            "status": "ignored",
+            "message": f"Event type '{event_type}' is not processed",
+        })
 
 
 # HTML template for the backend-served OAuth callback page.

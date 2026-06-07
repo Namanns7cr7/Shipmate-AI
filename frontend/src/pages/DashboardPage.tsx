@@ -1,4 +1,5 @@
 import { motion } from 'framer-motion';
+import { useState, useEffect } from 'react';
 import { AlertTriangle, FileText, RotateCcw, TrendingUp, List, ExternalLink, Lock, BookOpen } from 'lucide-react';
 import { ScoreRing } from '../components/ui/ScoreRing';
 import { VerdictPill, toVerdict } from '../components/ui/VerdictPill';
@@ -6,7 +7,8 @@ import { RadarBg } from '../components/ui/RadarBg';
 import { Reveal } from '../components/ui/Reveal';
 import { scoreColor } from '../lib/agents';
 import { AGENTS } from '../lib/agents';
-import type { GitHubUser, GitHubRepo, ShipMateReport } from '../types';
+import { api } from '../lib/api';
+import type { GitHubUser, GitHubRepo, ShipMateReport, ScorePoint } from '../types';
 import type { Page } from '../components/app/AppSidebar';
 
 interface Props {
@@ -185,10 +187,57 @@ function RecentAnalysesTable({ repos, report, onNavigate, onAnalyze }: { repos: 
   );
 }
 
+/* ---- Score sparkline ---- */
+function ScoreSparkline({ history, currentScore }: { history: ScorePoint[]; currentScore: number }) {
+  // Use real history if available, pad with current score if < 2 points
+  const points = history.length >= 2
+    ? history.slice(-10).map(p => p.score)
+    : history.length === 1
+      ? [history[0].score, currentScore]
+      : [currentScore];
+
+  const max = Math.max(...points, 1);
+  const delta = history.length >= 2 ? points[points.length - 1] - points[0] : 0;
+  const label = history.length >= 2
+    ? (delta >= 0 ? `+${delta} since start` : `${delta} since start`)
+    : 'First analysis';
+  const toneClass = delta >= 0 ? 'tone-emerald' : 'tone-red';
+
+  return (
+    <div className="card" style={{ padding: 18 }}>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 14 }}>
+        <span style={{ fontWeight: 700, fontSize: 13.5 }}>Readiness trend</span>
+        <span className={`chip ${toneClass}`}><TrendingUp size={12} /> {label}</span>
+      </div>
+      <div style={{ display: 'flex', alignItems: 'flex-end', gap: 6, height: 70 }}>
+        {points.map((score, i) => {
+          const isLast = i === points.length - 1;
+          const heightPct = Math.max(8, (score / max) * 100);
+          return (
+            <div key={i} title={`Score: ${score}`} style={{
+              flex: 1, height: `${heightPct}%`, borderRadius: '5px 5px 2px 2px',
+              background: isLast ? 'linear-gradient(180deg,#60a5fa,#2563eb)' : 'rgba(59,130,246,0.22)',
+              boxShadow: isLast ? '0 0 14px rgba(59,130,246,0.5)' : 'none',
+              transition: 'height .6s ease',
+              cursor: 'default',
+            }} />
+          );
+        })}
+      </div>
+      {history.length >= 2 && (
+        <div className="mono" style={{ display: 'flex', justifyContent: 'space-between', marginTop: 8, fontSize: 10, color: 'var(--ink-4)' }}>
+          <span>{new Date(history[0].recorded_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}</span>
+          <span>{history.length} runs</span>
+          <span>{new Date(history[history.length - 1].recorded_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}</span>
+        </div>
+      )}
+    </div>
+  );
+}
+
 /* ---- AI Insights panel ---- */
-function AIInsightsPanel({ report, onView }: { report: ShipMateReport; onView: () => void }) {
+function AIInsightsPanel({ report, history, onView }: { report: ShipMateReport; history: ScorePoint[]; onView: () => void }) {
   const top = report.agents.guardrail.findings[0];
-  const days = [40, 62, 55, 71, 58, 66, report.readiness_score];
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
@@ -219,26 +268,7 @@ function AIInsightsPanel({ report, onView }: { report: ShipMateReport; onView: (
         </div>
       </div>
 
-      {/* Trend bar chart */}
-      <div className="card" style={{ padding: 18 }}>
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 14 }}>
-          <span style={{ fontWeight: 700, fontSize: 13.5 }}>Readiness trend</span>
-          <span className="chip tone-emerald"><TrendingUp size={12} /> +12 this week</span>
-        </div>
-        <div style={{ display: 'flex', alignItems: 'flex-end', gap: 8, height: 70 }}>
-          {days.map((d, i) => (
-            <div key={i} style={{
-              flex: 1, height: `${d}%`, borderRadius: '5px 5px 2px 2px',
-              background: i === days.length - 1 ? 'linear-gradient(180deg,#60a5fa,#2563eb)' : 'rgba(59,130,246,0.22)',
-              boxShadow: i === days.length - 1 ? '0 0 14px rgba(59,130,246,0.5)' : 'none',
-              transition: 'height .6s ease',
-            }} />
-          ))}
-        </div>
-        <div className="mono" style={{ display: 'flex', justifyContent: 'space-between', marginTop: 8, fontSize: 10, color: 'var(--ink-4)' }}>
-          {['M','T','W','T','F','S','S'].map((d, i) => <span key={i}>{d}</span>)}
-        </div>
-      </div>
+      <ScoreSparkline history={history} currentScore={report.readiness_score} />
     </div>
   );
 }
@@ -247,6 +277,15 @@ function AIInsightsPanel({ report, onView }: { report: ShipMateReport; onView: (
 export function DashboardPage({ user, repos, report, onNavigate, onAnalyze }: Props) {
   const greeting = new Date().getHours() < 12 ? 'Good morning' : new Date().getHours() < 17 ? 'Good afternoon' : 'Good evening';
   const name = user?.name?.split(' ')[0] || user?.login || 'Developer';
+  const [history, setHistory] = useState<ScorePoint[]>([]);
+
+  // Fetch score history whenever the active report changes
+  useEffect(() => {
+    if (!report) return;
+    api.getHistory(report.repo.owner, report.repo.name, report.repo.branch)
+      .then(setHistory)
+      .catch(() => setHistory([]));
+  }, [report?.repo.full_name, report?.repo.branch]);
 
   return (
     <motion.div initial={{ opacity: 0, y: 14 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.55, ease: [0.2,0.7,0.2,1] }}
@@ -270,7 +309,7 @@ export function DashboardPage({ user, repos, report, onNavigate, onAnalyze }: Pr
         <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0,1.7fr) minmax(0,1fr)', gap: 20 }}>
           <RecentAnalysesTable repos={repos} report={report} onNavigate={onNavigate} onAnalyze={onAnalyze} />
           {report
-            ? <AIInsightsPanel report={report} onView={() => onNavigate('reports')} />
+            ? <AIInsightsPanel report={report} history={history} onView={() => onNavigate('reports')} />
             : <div className="card" style={{ padding: 32, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', textAlign: 'center', gap: 12 }}>
                 <div style={{ fontSize: 40 }}>✦</div>
                 <p className="muted" style={{ fontSize: 13 }}>Run your first analysis to see AI insights.</p>

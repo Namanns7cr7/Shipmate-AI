@@ -1,10 +1,16 @@
+import asyncio
+import logging
+
 from fastapi import APIRouter, HTTPException
 from app.schemas.api_schemas import AnalyzeRequest, AnalyzeResponse
 from app.services.repo_analysis_service import RepoAnalysisService
 from app.orchestrator.shipmate_orchestrator import ShipMateOrchestrator
 from app.utils.github_auth import verify_repo_write_access
+from app.services.github_comment_service import post_pr_comment
+from app.services.score_history_service import record_score
 
 router = APIRouter(tags=["analysis"])
+logger = logging.getLogger("shipmate.analysis_route")
 
 _orchestrator = ShipMateOrchestrator()
 
@@ -45,8 +51,35 @@ async def analyze(request: AnalyzeRequest):
         )
 
     try:
-        report = _orchestrator.run(repo_context)
+        report = await _orchestrator.run(repo_context)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Analysis pipeline failed: {str(e)}")
+
+    # Persist score history (non-fatal)
+    try:
+        record_score(
+            owner=request.owner,
+            repo=request.repo,
+            branch=request.branch,
+            score=report.readiness_score,
+            breakdown={
+                "repo": report.score_breakdown.repo_score,
+                "delivery": report.score_breakdown.delivery_score,
+                "security": report.score_breakdown.security_score,
+                "test": report.score_breakdown.test_score,
+            },
+        )
+    except Exception as e:
+        logger.warning("score_history record failed: %s", e)
+
+    # Post PR comment (non-fatal, fire-and-forget)
+    if request.pr_number:
+        asyncio.create_task(post_pr_comment(
+            token=request.access_token,
+            owner=request.owner,
+            repo=request.repo,
+            pr_number=request.pr_number,
+            report=report,
+        ))
 
     return AnalyzeResponse(status="complete", report=report)

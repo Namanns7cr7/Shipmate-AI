@@ -1,3 +1,4 @@
+import asyncio
 from datetime import datetime, timezone
 from typing import Any, Dict
 
@@ -18,7 +19,7 @@ class ShipMateOrchestrator:
 
     Execution order:
       1. RepoLens  — repo structure, tech stack, architecture risks (context builder)
-      2. PlanForge, GuardRail, TestPilot  — run with enriched context (parallel-safe)
+      2. PlanForge, GuardRail, TestPilot  — run in parallel via asyncio.to_thread
       3. ScoringService  — deterministic weighted score
       4. ReportService   — final report assembly
     """
@@ -29,7 +30,7 @@ class ShipMateOrchestrator:
         self.guardrail = GuardRailAgent()
         self.testpilot = TestPilotAgent()
 
-    def run(self, repo_context: Dict[str, Any]) -> ShipMateReport:
+    async def run(self, repo_context: Dict[str, Any]) -> ShipMateReport:
         """
         Args:
             repo_context: dict with keys:
@@ -43,15 +44,17 @@ class ShipMateOrchestrator:
             ShipMateReport
         """
         # ── Step 1: RepoLens (must run first — other agents need its output) ──
-        repo_lens_out = self.repo_lens.run(repo_context)
+        repo_lens_out = await asyncio.to_thread(self.repo_lens.run, repo_context)
 
         # Enrich context with RepoLens output
         enriched = {**repo_context, "repo_lens": repo_lens_out}
 
-        # ── Step 2: Run remaining agents (all consume enriched context) ──
-        plan_forge_out = self.plan_forge.run(enriched)
-        guardrail_out = self.guardrail.run(enriched)
-        testpilot_out = self.testpilot.run(enriched)
+        # ── Step 2: PlanForge, GuardRail, TestPilot run in parallel ──────────
+        plan_forge_out, guardrail_out, testpilot_out = await asyncio.gather(
+            asyncio.to_thread(self.plan_forge.run, enriched),
+            asyncio.to_thread(self.guardrail.run, enriched),
+            asyncio.to_thread(self.testpilot.run, enriched),
+        )
 
         # ── Step 3: Score ──
         score_breakdown = ScoringService.calculate(

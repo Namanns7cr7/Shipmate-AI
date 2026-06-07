@@ -52,24 +52,42 @@ _provider_init_attempted = False
 
 
 def _get_provider():
-    """Return a Bedrock provider singleton, or None if unavailable."""
+    """Return an LLM provider singleton, or None if unavailable.
+
+    Priority:
+      LLM_PROVIDER=bedrock   → BedrockProvider (AWS Bedrock / Converse API)
+      LLM_PROVIDER=anthropic → AnthropicProvider (Anthropic API, needs ANTHROPIC_API_KEY)
+      unset / other          → enhancements disabled
+    """
     global _provider, _provider_init_attempted
     if _provider_init_attempted:
         return _provider
     _provider_init_attempted = True
 
     kind = os.getenv("LLM_PROVIDER", "").lower()
-    if kind != "bedrock":
-        logger.info("LLMService: LLM_PROVIDER=%r → enhancements disabled", kind or "(unset)")
-        return None
 
-    try:
-        from app.services.bedrock_provider import BedrockProvider
-        _provider = BedrockProvider()
-        logger.info("LLMService: BedrockProvider ready")
-    except Exception as e:
-        logger.warning("LLMService: BedrockProvider init failed (%s); enhancements disabled", e)
+    if kind == "bedrock":
+        try:
+            from app.services.bedrock_provider import BedrockProvider
+            _provider = BedrockProvider()
+            logger.info("LLMService: BedrockProvider ready")
+        except Exception as e:
+            logger.warning("LLMService: BedrockProvider init failed (%s); enhancements disabled", e)
+            _provider = None
+
+    elif kind == "anthropic":
+        try:
+            from app.services.anthropic_provider import AnthropicProvider
+            _provider = AnthropicProvider()
+            logger.info("LLMService: AnthropicProvider ready")
+        except Exception as e:
+            logger.warning("LLMService: AnthropicProvider init failed (%s); enhancements disabled", e)
+            _provider = None
+
+    else:
+        logger.info("LLMService: LLM_PROVIDER=%r → enhancements disabled", kind or "(unset)")
         _provider = None
+
     return _provider
 
 

@@ -3,6 +3,7 @@ import type {
   AnalyzeResponse, GitHubRepo, GitHubBranch, GitHubPR,
   ActuateResponse, FindingPayload, RepoLensSummary,
   WatcherState, WatcherLogLine, JournalResponse, AutoFixEvent,
+  ScorePoint,
 } from '../types';
 
 const BASE = '/api';
@@ -137,6 +138,15 @@ export const api = {
     kind: string; title: string; file?: string | null; repo_full_name: string;
   }): Promise<{ signature: string; state: string }> {
     const { data } = await gh.post('/findings/reopen', params);
+    return data;
+  },
+
+  // ── Score history ────────────────────────────────────────────────────────
+
+  async getHistory(owner: string, repo: string, branch?: string, limit = 30): Promise<ScorePoint[]> {
+    const { data } = await gh.get<ScorePoint[]>('/history', {
+      params: { owner, repo, branch, limit },
+    });
     return data;
   },
 

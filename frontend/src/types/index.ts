@@ -305,6 +305,16 @@ export interface AutoFixEvent {
   message?: string;
 }
 
+// ── Score history ───────────────────────────────────────────────────────────────
+
+export interface ScorePoint {
+  id: number;
+  score: number;
+  branch: string;
+  recorded_at: string;
+  breakdown: { repo?: number; delivery?: number; security?: number; test?: number };
+}
+
 // ── App state ─────────────────────────────────────────────────────────────────
 
 export type AppState =
