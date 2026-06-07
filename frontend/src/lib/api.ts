@@ -3,6 +3,7 @@ import type {
   AnalyzeResponse, GitHubRepo, GitHubBranch, GitHubPR,
   ActuateResponse, FindingPayload, RepoLensSummary,
   WatcherState, WatcherLogLine, JournalResponse, AutoFixEvent,
+  ShipMateReport,
 } from '../types';
 
 // API base. Locally we default to '/api' and let the Vite dev proxy forward to
@@ -73,6 +74,57 @@ export const api = {
   }): Promise<AnalyzeResponse> {
     const { data } = await gh.post<AnalyzeResponse>('/analyze', params);
     return data;
+  },
+
+  // Streaming analyze (SSE): fires `onEvent` per agent as it completes, returns
+  // the final ShipMateReport. Same body as analyze(); the backend emits
+  // event:agent.done frames then event:report.done. Falls back to throwing on
+  // a non-OK response so the caller can retry via the batch analyze().
+  async streamAnalyze(
+    params: {
+      owner: string; repo: string; branch: string; access_token: string;
+      pr_number?: number; feature_context?: string;
+    },
+    onEvent: (e: { event: string; agent?: string; output?: unknown; report?: unknown; detail?: string }) => void,
+    signal?: AbortSignal,
+  ): Promise<ShipMateReport | null> {
+    const resp = await fetch(`${BASE}/analyze/stream`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(params),
+      signal,
+    });
+    if (!resp.ok || !resp.body) {
+      throw new Error(`analyze stream failed: HTTP ${resp.status}`);
+    }
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let finalReport: ShipMateReport | null = null;
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let sep: number;
+      while ((sep = buffer.indexOf('\n\n')) !== -1) {
+        const frame = buffer.slice(0, sep);
+        buffer = buffer.slice(sep + 2);
+        for (const line of frame.split('\n')) {
+          if (line.startsWith('data: ')) {
+            try {
+              const evt = JSON.parse(line.slice(6));
+              onEvent(evt);
+              if (evt.event === 'report.done' && evt.report) {
+                finalReport = evt.report as ShipMateReport;
+              }
+            } catch {
+              // ignore malformed frame
+            }
+          }
+        }
+      }
+    }
+    return finalReport;
   },
 
   // ── Actuate (Coder → branch + PR) ───────────────────────────────────────

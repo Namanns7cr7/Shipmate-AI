@@ -152,11 +152,17 @@ interface Props {
   progressByAgent?: Record<AgentProgress['id'], number>;
   /** 0..100 overall, capped at 95 until API resolves. */
   overallPct?: number;
+  /** Real per-agent log lines from the SSE stream. When non-empty, these
+   *  replace the scripted simulation so the Activity Log shows live events. */
+  liveLines?: LogLine[];
   onCancel: () => void;
 }
 
-export function AnalysisPage({ selectedRepo, selectedBranch, agents, progressByAgent, overallPct, onCancel }: Props) {
-  const logs = useActivityLog(true);
+export function AnalysisPage({ selectedRepo, selectedBranch, agents, progressByAgent, overallPct, liveLines, onCancel }: Props) {
+  // Use the real SSE-driven lines when present; fall back to the scripted
+  // simulation only when no live lines have arrived yet (e.g. batch mode).
+  const scriptedLogs = useActivityLog(!liveLines || liveLines.length === 0);
+  const logs = liveLines && liveLines.length > 0 ? liveLines : scriptedLogs;
 
   const statuses = AGENTS.map((_, i) => {
     const match = agents.find(a => ID_TO_INDEX[a.id] === i);

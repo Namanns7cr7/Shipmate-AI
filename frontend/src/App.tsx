@@ -12,7 +12,23 @@ import { Spinner } from './components/ui/GitHubConnectButton';
 import { BranchPicker } from './components/ui/BranchPicker';
 import { AutoFixDrawer } from './components/ui/AutoFixDrawer';
 import type { Page } from './components/app/AppSidebar';
+import type { LogLine } from './components/ui/LiveActivityLog';
 import type { AgentProgress, GitHubRepo, GitHubPR, ShipMateReport } from './types';
+
+// Pretty per-agent labels + tones for the live Activity Log (maps SSE
+// agent.done events to the LiveActivityLog line shape).
+const AGENT_LOG_META: Record<string, { label: string; tone: string }> = {
+  repo_lens:  { label: 'RepoLens',  tone: 'emerald' },
+  plan_forge: { label: 'PlanForge', tone: 'purple'  },
+  guardrail:  { label: 'GuardRail', tone: 'amber'   },
+  testpilot:  { label: 'TestPilot', tone: 'cyan'    },
+};
+
+function _nowHMS(): string {
+  const d = new Date();
+  return [d.getHours(), d.getMinutes(), d.getSeconds()]
+    .map(n => String(n).padStart(2, '0')).join(':');
+}
 
 const INITIAL_AGENTS: AgentProgress[] = [
   { id: 'repo_lens',  label: 'RepoLens',  icon: '🔍', status: 'idle', description: 'Repo structure, tech stack & architecture risks' },
@@ -142,6 +158,8 @@ export default function App() {
   const [report, setReport]                 = useState<ShipMateReport | null>(null);
   const [analyzing, setAnalyzing]           = useState(false);
   const [autoFixOpen, setAutoFixOpen]       = useState(false);
+  // Real per-agent activity-log lines from the SSE stream (empty until events arrive).
+  const [liveLines, setLiveLines]           = useState<LogLine[]>([]);
 
   const { agents, progressByAgent, overallPct, markAllComplete, markAllError } = useAgentSimulation(analyzing);
 
@@ -171,24 +189,52 @@ export default function App() {
 
     setAnalyzing(true);
     setReport(null);
+    setLiveLines([]);
     setPage('analysis');
 
     const [owner, repoName] = target.full_name.split('/');
+    const params = {
+      owner, repo: repoName,
+      branch: selectedBranch,
+      access_token: auth.accessToken,
+      pr_number: selectedPull?.number,
+    };
+
+    const pushLine = (line: LogLine) => setLiveLines(prev => [...prev, line]);
+
     try {
-      const res = await api.analyze({
-        owner, repo: repoName,
-        branch: selectedBranch,
-        access_token: auth.accessToken,
-        pr_number: selectedPull?.number,
+      pushLine({ agent: 'system', text: `Cloning ${target.full_name} @ ${selectedBranch}…`, tone: 'slate', time: _nowHMS() });
+      // Stream per-agent results so the Activity Log fills live. The final
+      // report.done event carries the assembled report.
+      const finalReport = await api.streamAnalyze(params, (evt) => {
+        if (evt.event === 'agent.done' && evt.agent) {
+          const meta = AGENT_LOG_META[evt.agent] ?? { label: evt.agent, tone: 'slate' };
+          pushLine({ agent: meta.label, text: 'analysis complete ✓', tone: meta.tone, time: _nowHMS() });
+        } else if (evt.event === 'report.done') {
+          pushLine({ agent: 'system', text: '✓ Readiness score computed — shipping report', tone: 'emerald', time: _nowHMS() });
+        } else if (evt.event === 'error') {
+          pushLine({ agent: 'system', text: `⚠ ${evt.detail ?? 'analysis error'}`, tone: 'red', time: _nowHMS() });
+        }
       });
+      if (!finalReport) throw new Error('stream ended without a report');
       markAllComplete();
-      setReport(res.report);
+      setReport(finalReport as ShipMateReport);
       setAnalyzing(false);
       setPage('reports');
     } catch {
-      markAllError();
-      setAnalyzing(false);
-      setPage('repos');
+      // Fall back to the batch endpoint if streaming isn't available (older
+      // backend / proxy buffering). Same result, just no live progress.
+      try {
+        const res = await api.analyze(params);
+        markAllComplete();
+        setReport(res.report);
+        setAnalyzing(false);
+        setPage('reports');
+      } catch {
+        markAllError();
+        setAnalyzing(false);
+        setPage('repos');
+      }
     }
   }, [selectedRepo, selectedBranch, selectedPull, auth.accessToken, markAllComplete, markAllError, handleSelectRepo]);
 
@@ -307,6 +353,7 @@ export default function App() {
             selectedPull={selectedPull} agents={agents}
             progressByAgent={progressByAgent}
             overallPct={overallPct}
+            liveLines={liveLines}
             onCancel={() => { setAnalyzing(false); setPage('repos'); }}
           />
         )}

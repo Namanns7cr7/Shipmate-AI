@@ -361,7 +361,13 @@ class LLMService:
                 schema_class=PlanForgeDiscovery,
                 deployment_hint="smart",  # discovery is the slow + smart pass
             )
-            return _merge_plan_discovery(base, discovery)
+            merged = _merge_plan_discovery(base, discovery)
+            # Suppress dismissed/shipped blockers (the actionable findings that
+            # flow into the journal/actuate path). Critic verifies them too.
+            merged.blockers = cls._refine_findings(
+                merged.blockers, "blocker", context, code_blob, provider,
+            )
+            return merged
         except Exception as e:
             logger.warning("PlanForge discovery failed (%s); using base output", e)
             _maybe_invalidate_provider(e)
@@ -384,6 +390,11 @@ class LLMService:
                 "Refresh ADA + restart the backend to enable AI discovery.",
                 os.getenv("LLM_PROVIDER", "(unset)"),
             )
+            # Even with no LLM, still apply journal suppression (it's local +
+            # free) so dismissed findings don't recur in pure-heuristic mode.
+            base.findings = cls._refine_findings(
+                base.findings, "guardrail", context, "", None,
+            )
             return base
 
         try:
@@ -398,11 +409,32 @@ class LLMService:
                 schema_class=GuardRailDiscovery,
                 deployment_hint="smart",
             )
-            return _merge_guardrail_discovery(base, discovery)
+            merged = _merge_guardrail_discovery(base, discovery)
+            # Critic + journal suppression on the COMPLETE finding set (heuristic
+            # + LLM-discovered), judged against the same code_blob the agent saw.
+            merged.findings = cls._refine_findings(
+                merged.findings, "guardrail", context, code_blob, provider,
+            )
+            return merged
         except Exception as e:
             logger.warning("GuardRail discovery failed (%s); using base output", e)
             _maybe_invalidate_provider(e)
             return base
+
+    @staticmethod
+    def _refine_findings(findings, kind, context, code_blob, provider):
+        """Shared post-processing for a finding list: drop journal-suppressed
+        (dismissed/shipped) findings, then run the critic verifier against the
+        exact code that was analyzed. Both fail-open — a failure here returns
+        the findings unchanged rather than hiding anything."""
+        try:
+            from app.services import finding_critic as fc
+            repo_full = (context.get("repo_info") or {}).get("full_name", "") or ""
+            findings = fc.filter_suppressed(findings, kind, repo_full)
+            findings = fc.verify_findings(findings, code_blob, provider)
+        except Exception as e:  # pragma: no cover - defensive
+            logger.debug("_refine_findings failed (%s); keeping findings as-is", e)
+        return findings
 
     @classmethod
     def discover_testpilot(

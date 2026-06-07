@@ -290,6 +290,17 @@ _NEW_TEST_THEATER_PATTERNS = (
     re.compile(r"^\s*assert\s+True\s*$", re.MULTILINE),
 )
 
+# Dynamic-execution sinks the inbound sanitize middleware blocks. We reject a
+# patch that INTRODUCES one (vs the original). The negative-lookbehind avoids
+# matching method calls like `ast.literal_eval(` / `self.exec(`.
+_CODER_INJECTION_PATTERNS = (
+    re.compile(r"(?<![\w.])eval\s*\("),
+    re.compile(r"(?<![\w.])exec\s*\("),
+    re.compile(r"(?<![\w.])__import__\s*\("),
+    re.compile(r"\bos\.system\s*\("),
+    re.compile(r"\bsubprocess\.(?:call|run|Popen)\s*\([^)]*shell\s*=\s*True"),
+)
+
 
 def _looks_like_test_path(path: str) -> bool:
     name = path.rsplit("/", 1)[-1]
@@ -362,6 +373,20 @@ def _lint_coder_output(
                 f"{cf.path}: .gitkeep inside an ignored/build directory "
                 "(theater pattern — preserves a dir the patch claims to remove)"
             )
+
+        # Back-door symmetry: the Coder must not INTRODUCE a dynamic-execution
+        # sink that the inbound sanitize middleware blocks. Flag a real
+        # eval/exec/__import__ CALL the patch ADDS that wasn't in the original
+        # (pre-existing ones aren't this patch's fault). Closes the asymmetry
+        # where the front door rejects eval( but our own generator could write it.
+        if cf.path.endswith(".py"):
+            for pat in _CODER_INJECTION_PATTERNS:
+                if pat.search(cf.new_content) and not pat.search(original):
+                    issues.append(
+                        f"{cf.path}: patch introduces a dynamic-execution call "
+                        f"(`{pat.pattern}`) not present in the original — the same "
+                        "pattern the inbound sanitizer blocks. Use a safe alternative."
+                    )
     return issues
 
 
@@ -622,8 +647,32 @@ class CoderOrchestrator:
             ]
             scope_issues = sg.check_patch(serialized, target_files, coder_out.summary)
             if scope_issues:
+                # One auto-retry feeding the scope violations back to the Coder
+                # before giving up — same rationale as the lint-feedback retry:
+                # a whole-file rewrite that dropped an untested def is often
+                # fixed when the model is told exactly which lines it must
+                # preserve, cheaper than a wasted human round-trip. (Previously
+                # only lint failures got a retry; scope failures hard-rejected.)
                 logger.warning(
-                    "scope guard rejected %s/%s: %s",
+                    "scope guard rejected %s/%s: %s — retrying once with feedback",
+                    req.finding.kind, req.finding.id, "; ".join(scope_issues),
+                )
+                try:
+                    coder_out = await asyncio.to_thread(
+                        agent.run_with_lint_feedback, brief, scope_issues,
+                        _deployment_hint(req.finding),
+                    )
+                    serialized = [
+                        {"path": cf.path, "new_content": cf.new_content,
+                         "rationale": cf.rationale}
+                        for cf in coder_out.files
+                    ]
+                    scope_issues = sg.check_patch(serialized, target_files, coder_out.summary)
+                except Exception as e:
+                    logger.warning("scope-feedback retry raised %s; keeping first output", e)
+            if scope_issues:
+                logger.warning(
+                    "scope guard still rejected %s/%s after feedback retry: %s",
                     req.finding.kind, req.finding.id, "; ".join(scope_issues),
                 )
                 return ActuateResponse(
@@ -650,10 +699,38 @@ class CoderOrchestrator:
                 result, snap = await asyncio.to_thread(vg.gate_patch, serialized)
                 if not result.passed:
                     await asyncio.to_thread(vg.restore_snapshot, snap)
+                    # Feed the actual test failure back to the Coder and retry
+                    # once — a regression is often a one-line miss the model
+                    # fixes when shown which tests broke (previously the pytest
+                    # gate hard-rejected with no retry).
                     logger.warning(
-                        "pytest gate rejected %s/%s: %s",
+                        "pytest gate rejected %s/%s: %s — retrying once with feedback",
                         req.finding.kind, req.finding.id, result.reason,
                     )
+                    try:
+                        coder_out = await asyncio.to_thread(
+                            agent.run_with_lint_feedback, brief,
+                            [f"Your patch broke the test suite: {result.reason}. "
+                             "Fix the regression while still addressing the finding."],
+                            _deployment_hint(req.finding),
+                        )
+                        serialized = [
+                            {"path": cf.path, "new_content": cf.new_content,
+                             "rationale": cf.rationale}
+                            for cf in coder_out.files
+                        ]
+                        # Re-lint + re-scope the retry output before re-gating.
+                        if _lint_coder_output(coder_out, target_files, file_tree) or \
+                                sg.check_patch(serialized, target_files, coder_out.summary):
+                            result, snap = (result, snap)  # keep failed result
+                        else:
+                            result, snap = await asyncio.to_thread(vg.gate_patch, serialized)
+                            if result.passed:
+                                await asyncio.to_thread(vg.restore_snapshot, snap)
+                    except Exception as e:
+                        logger.warning("pytest-feedback retry raised %s; keeping rejection", e)
+                if not result.passed:
+                    await asyncio.to_thread(vg.restore_snapshot, snap)
                     return ActuateResponse(
                         status="pytest_rejected",
                         pr_url=None,
@@ -661,9 +738,9 @@ class CoderOrchestrator:
                         files_changed=[],
                         skipped=[cf.path for cf in coder_out.files],
                         summary=(
-                            f"Patch passed lint but failed the local pytest gate: "
-                            f"{result.reason}. The working tree was restored and no "
-                            f"PR was created. Coder summary: {coder_out.summary[:200]}"
+                            f"Patch failed the local pytest gate (incl. one feedback "
+                            f"retry): {result.reason}. The working tree was restored "
+                            f"and no PR was created. Coder summary: {coder_out.summary[:200]}"
                         ),
                     )
                 # Gate passed — restore the tree (GitHub commit is the source of
@@ -674,6 +751,38 @@ class CoderOrchestrator:
                 logger.info(
                     "pytest gate passed for %s/%s (%dp → %dp)",
                     req.finding.kind, req.finding.id, result.before, result.after,
+                )
+
+            # 3e. Fix-resolution check — for detectable finding categories, the
+            # patch must actually REMOVE the offending pattern. 'shipped' should
+            # mean the issue is gone, not merely that tests still pass. A patch
+            # that leaves the pattern in place is rejected (resolution_failed)
+            # rather than opening a PR that doesn't fix anything. None/unknown
+            # categories fall through to the test/lint gate (fail-open).
+            try:
+                from app.services import finding_critic as fc
+                resolved = fc.is_finding_resolved(
+                    getattr(req.finding, "category", "") or req.finding.kind,
+                    [cf.new_content for cf in coder_out.files],
+                )
+            except Exception:
+                resolved = None
+            if resolved is False:
+                logger.warning(
+                    "resolution check FAILED for %s/%s: offending pattern still present",
+                    req.finding.kind, req.finding.id,
+                )
+                return ActuateResponse(
+                    status="resolution_failed",
+                    pr_url=None,
+                    branch_name=branch_name,
+                    files_changed=[],
+                    skipped=[cf.path for cf in coder_out.files],
+                    summary=(
+                        "Patch passed lint/tests but did NOT remove the issue it "
+                        "targets (the offending pattern is still present), so no PR "
+                        f"was opened. Coder summary: {coder_out.summary[:200]}"
+                    ),
                 )
 
             # 4. Create the branch.
