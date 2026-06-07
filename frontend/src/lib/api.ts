@@ -5,7 +5,12 @@ import type {
   WatcherState, WatcherLogLine, JournalResponse, AutoFixEvent,
 } from '../types';
 
-const BASE = '/api';
+// API base. Locally we default to '/api' and let the Vite dev proxy forward to
+// the backend on :8000 (see vite.config.ts). When hosted there's no dev proxy,
+// so the build injects VITE_API_BASE (e.g. https://shipmate-api.<region>
+// .azurecontainerapps.io/api) at build time. Trailing slashes are trimmed so
+// the per-call paths ('/auth/...') concatenate cleanly.
+const BASE = (import.meta.env.VITE_API_BASE ?? '/api').replace(/\/$/, '');
 
 const gh = axios.create({ baseURL: BASE });
 
