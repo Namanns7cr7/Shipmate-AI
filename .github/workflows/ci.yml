@@ -249,7 +249,10 @@ jobs:
       - name: Build backend image
         uses: docker/build-push-action@v5
         with:
-          context: .
+          # Context is backend/ — the Dockerfile is self-contained (COPY paths
+          # are relative to backend/) so the same image builds via Azure
+          # Container Apps `--source backend`. Keep these in lockstep.
+          context: backend
           file: backend/Dockerfile
           push: false
           load: true                 # keep image in the local daemon for `docker run`
