@@ -8,6 +8,7 @@ import time
 import hmac
 import hashlib
 import logging
+import unicodedata
 from collections import defaultdict
 from io import BytesIO
 from typing import Any, Callable
@@ -328,9 +329,43 @@ _DANGEROUS_PATTERNS: list[re.Pattern] = [
 _SKIP_HEADERS = {"authorization", "cookie"}
 
 
+def _normalize_for_scanning(text: str, max_passes: int = 3) -> str:
+    """Defeat common blocklist-evasion encodings before pattern matching.
+
+    An attacker can hide `eval(` as `eval%2528` (double URL-encode), `ev%61l(`
+    (partial), or via Unicode compatibility forms. We:
+      1. Recursively URL-decode until the string stops changing (bounded passes,
+         so a pathological input can't loop) — catches multi-layer %-encoding.
+      2. Apply Unicode NFKC normalization — folds compatibility/full-width
+         variants (e.g. ﹙ -> '(') to their canonical ASCII so the regexes match.
+    Returns the most-decoded form; callers scan BOTH this and the raw text."""
+    from urllib.parse import unquote_plus
+
+    prev = text
+    for _ in range(max_passes):
+        decoded = unquote_plus(prev)
+        if decoded == prev:
+            break
+        prev = decoded
+    try:
+        prev = unicodedata.normalize("NFKC", prev)
+    except Exception:
+        pass
+    return prev
+
+
 def _contains_dangerous_pattern(text: str) -> bool:
-    """Return True if *text* matches any known code-injection pattern."""
-    return any(p.search(text) for p in _DANGEROUS_PATTERNS)
+    """Return True if *text* matches any known code-injection pattern.
+
+    Scans BOTH the raw text and an encoding-normalized form (recursive
+    URL-decode + Unicode NFKC) so blocklist-evasion via %-encoding or Unicode
+    compatibility variants can't slip a payload past the regexes."""
+    if any(p.search(text) for p in _DANGEROUS_PATTERNS):
+        return True
+    normalized = _normalize_for_scanning(text)
+    if normalized != text and any(p.search(normalized) for p in _DANGEROUS_PATTERNS):
+        return True
+    return False
 
 
 from contextlib import asynccontextmanager
@@ -360,12 +395,21 @@ async def _lifespan(app: "FastAPI"):
     # --- shutdown --- (no-op; sqlite is durable per-commit)
 
 
+# Production hardening flag. In production we disable the interactive API docs
+# (/docs, /redoc) and the OpenAPI schema (/openapi.json) so the full route map,
+# request/response models, and "Try it out" console aren't exposed to anonymous
+# visitors. Local/dev keeps them on for convenience. Driven by ENVIRONMENT
+# (already present in .env / .env.example); "production" or "prod" => hardened.
+_ENVIRONMENT = os.getenv("ENVIRONMENT", "development").strip().lower()
+_IS_PRODUCTION = _ENVIRONMENT in ("production", "prod")
+
 app = FastAPI(
     title="ShipMate AI",
     description="AI-native multi-agent release readiness platform",
     version="2.0.0",
-    docs_url="/docs",
-    redoc_url="/redoc",
+    docs_url=None if _IS_PRODUCTION else "/docs",
+    redoc_url=None if _IS_PRODUCTION else "/redoc",
+    openapi_url=None if _IS_PRODUCTION else "/openapi.json",
     lifespan=_lifespan,
 )
 
@@ -473,6 +517,32 @@ async def strict_cors_middleware(request: Request, call_next):
             content={"detail": "Origin not allowed"},
         )
     return await call_next(request)
+
+
+# HSTS is opt-in (ENABLE_HSTS=true) because the header must only be sent when the
+# site is genuinely served over TLS — emitting it on a plain-http dev origin would
+# wrongly pin the browser to https for a year. In production behind a TLS proxy
+# (Azure Container Apps terminates TLS), set ENABLE_HSTS=true. The other headers
+# below are always-safe and sent unconditionally.
+_HSTS_ENABLED = os.getenv("ENABLE_HSTS", "false").strip().lower() in ("1", "true", "yes")
+
+
+@app.middleware("http")
+async def security_headers_middleware(request: Request, call_next):
+    """Attach hardening response headers. HSTS (gated on ENABLE_HSTS so we never
+    pin a plain-http dev origin to https); plus always-safe headers that cost
+    nothing and close common low-severity findings (clickjacking, MIME-sniffing,
+    referrer leakage)."""
+    response = await call_next(request)
+    if _HSTS_ENABLED:
+        response.headers.setdefault(
+            "Strict-Transport-Security",
+            "max-age=31536000; includeSubDomains",
+        )
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    return response
 
 
 app.include_router(auth_router, prefix="/api")

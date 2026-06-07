@@ -14,11 +14,9 @@ _TIMEOUT = httpx.Timeout(20.0)
 
 
 def _headers(token: str) -> Dict[str, str]:
-    return {
-        "Authorization": f"token {token}",
-        "Accept": "application/vnd.github.v3+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-    }
+    # Delegates to the single shared definition (see github_client.gh_headers).
+    from app.services.github_client import gh_headers
+    return gh_headers(token)
 
 
 class GitHubAPIService:

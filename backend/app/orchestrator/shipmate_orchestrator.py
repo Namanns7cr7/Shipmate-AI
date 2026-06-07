@@ -1,5 +1,6 @@
+import asyncio
 from datetime import datetime, timezone
-from typing import Any, Dict
+from typing import Any, AsyncGenerator, Dict
 
 from ..agents.repo_lens_agent import RepoLensAgent
 from ..agents.plan_forge_agent import PlanForgeAgent
@@ -53,14 +54,65 @@ class ShipMateOrchestrator:
         guardrail_out = self.guardrail.run(enriched)
         testpilot_out = self.testpilot.run(enriched)
 
-        # ── Step 3: Score ──
+        # ── Steps 3+4: Score + assemble (shared with run_stream) ──
+        return self._assemble_report(
+            repo_context, repo_lens_out, plan_forge_out, guardrail_out, testpilot_out
+        )
+
+    async def run_stream(
+        self, repo_context: Dict[str, Any]
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """Async generator that yields one event per agent as it completes, then
+        a final assembled report. Powers the SSE endpoint so the frontend renders
+        each agent's result incrementally instead of waiting for the whole batch.
+
+        Event shapes:
+          {"event": "agent.done", "agent": "<name>", "output": {...}}
+          {"event": "report.done", "report": {...}}
+          {"event": "error", "detail": "..."}
+
+        The agents' .run() methods are blocking (heuristics + one LLM call each),
+        so each is dispatched via asyncio.to_thread to keep the event loop free
+        while the SSE connection streams. run() stays the synchronous source of
+        truth used by auto_fix and the non-streaming /analyze route."""
+        try:
+            repo_lens_out = await asyncio.to_thread(self.repo_lens.run, repo_context)
+            yield {"event": "agent.done", "agent": "repo_lens",
+                   "output": repo_lens_out.model_dump()}
+
+            enriched = {**repo_context, "repo_lens": repo_lens_out}
+
+            plan_forge_out = await asyncio.to_thread(self.plan_forge.run, enriched)
+            yield {"event": "agent.done", "agent": "plan_forge",
+                   "output": plan_forge_out.model_dump()}
+
+            guardrail_out = await asyncio.to_thread(self.guardrail.run, enriched)
+            yield {"event": "agent.done", "agent": "guardrail",
+                   "output": guardrail_out.model_dump()}
+
+            testpilot_out = await asyncio.to_thread(self.testpilot.run, enriched)
+            yield {"event": "agent.done", "agent": "testpilot",
+                   "output": testpilot_out.model_dump()}
+
+            report = self._assemble_report(
+                repo_context, repo_lens_out, plan_forge_out, guardrail_out, testpilot_out
+            )
+            yield {"event": "report.done", "report": report.model_dump()}
+        except Exception as e:  # pragma: no cover - defensive stream guard
+            yield {"event": "error", "detail": f"Analysis failed: {e}"}
+
+    def _assemble_report(
+        self, repo_context, repo_lens_out, plan_forge_out, guardrail_out, testpilot_out
+    ) -> ShipMateReport:
+        """Score + assemble the final ShipMateReport from the four agent outputs.
+        Shared by run() (sync) and run_stream() (SSE) so the assembly logic lives
+        in exactly one place."""
         score_breakdown = ScoringService.calculate(
             repo_lens_out, plan_forge_out, guardrail_out, testpilot_out
         )
         final_score = score_breakdown["final_score"]
         recommendation = ScoringService.recommendation(final_score)
 
-        # ── Step 4: Assemble report ──
         info = repo_context.get("repo_info", {})
         branch = repo_context.get("branch", "main")
 

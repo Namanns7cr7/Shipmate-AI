@@ -1,8 +1,11 @@
+import logging
 import os
 from fastapi import APIRouter, HTTPException, Query
 from app.services.github_auth_service import GitHubAuthService
 from app.services.github_api_service import GitHubAPIService
 from app.schemas.api_schemas import RepoSummary
+
+logger = logging.getLogger("shipmate.auth_route")
 
 router = APIRouter(prefix="/auth/github", tags=["github-auth"])
 
@@ -34,11 +37,19 @@ async def github_callback(code: str = Query(...), state: str = Query(...)):
             "scope": token_data.get("scope"),
             "user": user_profile,
         }
+    except HTTPException:
+        # Already a clean, intentional error (e.g. the 400 above) — don't
+        # re-wrap it into a 500 with a traceback.
+        raise
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        import traceback
-        raise HTTPException(status_code=500, detail=f"Callback failed: {str(e)}\n{traceback.format_exc()}")
+    except Exception:
+        # SECURITY: never return the traceback to the client. The failing call
+        # stack runs through get_user_profile(access_token), so format_exc()
+        # could serialize the OAuth access token into the HTTP response. Log the
+        # full traceback server-side only; return a generic message.
+        logger.exception("GitHub OAuth callback failed")
+        raise HTTPException(status_code=500, detail="OAuth callback failed. Please try signing in again.")
 
 
 @router.get("/me")

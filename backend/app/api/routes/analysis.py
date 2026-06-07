@@ -1,9 +1,16 @@
+import json
+import logging
+
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import StreamingResponse
 from app.schemas.api_schemas import AnalyzeRequest, AnalyzeResponse
 from app.services.repo_analysis_service import RepoAnalysisService
+from app.services import report_store
 from app.orchestrator.shipmate_orchestrator import ShipMateOrchestrator
 
 import httpx
+
+logger = logging.getLogger("shipmate.analysis_route")
 
 router = APIRouter(tags=["analysis"])
 
@@ -124,4 +131,82 @@ async def analyze(request: AnalyzeRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Analysis pipeline failed: {str(e)}")
 
+    # Persist the run for the history/trend dashboard. Best-effort: a storage
+    # failure must not fail the analysis the caller already has in hand.
+    report_store.save_report(report)
+
     return AnalyzeResponse(status="complete", report=report)
+
+
+@router.post("/analyze/stream")
+async def analyze_stream(request: AnalyzeRequest):
+    """Server-Sent Events variant of /analyze: emits one event per agent as it
+    completes (repo_lens → plan_forge → guardrail → testpilot), then a final
+    report event. Lets the frontend render incremental progress instead of a
+    blank wait screen on large repos.
+
+    Same auth + context-build prelude as /analyze; only the orchestration is
+    streamed. The final report is persisted exactly like the batch route."""
+    if not request.owner or not request.repo:
+        raise HTTPException(status_code=400, detail="owner and repo are required.")
+
+    await _verify_repo_write_access(
+        token=request.access_token, owner=request.owner, repo=request.repo,
+    )
+
+    try:
+        repo_context = await RepoAnalysisService.build_context(
+            token=request.access_token,
+            owner=request.owner,
+            repo=request.repo,
+            branch=request.branch,
+            pr_number=request.pr_number,
+            feature_context=request.feature_context or "",
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to fetch repository data from GitHub: {str(e)}",
+        )
+
+    async def _event_source():
+        try:
+            async for event in _orchestrator.run_stream(repo_context):
+                # Persist the streamed run too, so the history dashboard sees it.
+                # The report.done frame carries the assembled report as a dict;
+                # rebuild a ShipMateReport from it for the store (best-effort).
+                if event.get("event") == "report.done":
+                    try:
+                        from app.schemas.agent_schemas import ShipMateReport
+                        report_store.save_report(
+                            ShipMateReport.model_validate(event["report"])
+                        )
+                    except Exception:
+                        pass
+                yield f"event: {event.get('event', 'message')}\ndata: {json.dumps(event)}\n\n"
+        except Exception as e:  # pragma: no cover - stream guard
+            logger.exception("analyze_stream failed")
+            yield f"event: error\ndata: {json.dumps({'detail': f'stream failed: {e}'})}\n\n"
+
+    return StreamingResponse(
+        _event_source(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@router.get("/repos/{owner}/{repo}/history")
+async def repo_history(owner: str, repo: str, limit: int = 20):
+    """Return the persisted analysis-run history for owner/repo (newest first),
+    so the dashboard can chart readiness-score trends over time."""
+    runs = report_store.list_reports(owner, repo, limit=limit)
+    return {"owner": owner, "repo": repo, "count": len(runs), "runs": runs}
+
+
+@router.get("/analysis/{report_id}")
+async def get_analysis(report_id: int):
+    """Return a single persisted ShipMateReport by id (full detail view)."""
+    rep = report_store.get_report(report_id)
+    if rep is None:
+        raise HTTPException(status_code=404, detail=f"No analysis run with id {report_id}.")
+    return rep
