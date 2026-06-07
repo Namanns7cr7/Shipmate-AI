@@ -25,6 +25,7 @@ from typing import Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field
 
+import os
 from app.services.bedrock_provider import BedrockProvider
 
 logger = logging.getLogger("shipmate.coder_agent")
@@ -276,9 +277,14 @@ class CoderAgent:
     def __init__(self, provider: Optional[BedrockProvider] = None) -> None:
         self._provider = provider
 
-    def _get_provider(self) -> BedrockProvider:
+    def _get_provider(self):
         if self._provider is None:
-            self._provider = BedrockProvider()
+            kind = os.getenv("LLM_PROVIDER", "bedrock").lower()
+            if kind == "anthropic":
+                from app.services.anthropic_provider import AnthropicProvider
+                self._provider = AnthropicProvider()
+            else:
+                self._provider = BedrockProvider()
         return self._provider
 
     def run(

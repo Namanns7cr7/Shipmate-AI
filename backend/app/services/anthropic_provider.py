@@ -45,6 +45,28 @@ class AnthropicProvider:
         self._client = self._anthropic.Anthropic(api_key=api_key)
         logger.info("AnthropicProvider ready (model=%s)", _DEFAULT_MODEL)
 
+    def invoke_with_lint_feedback(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        schema_class: Type[BaseModel],
+        lint_issues: list,
+        deployment_hint: str = "smart",
+    ) -> BaseModel:
+        """Re-invoke after lint rejection — same as BedrockProvider's contract."""
+        issues_block = "\n".join(f"  - {i}" for i in lint_issues)
+        feedback_user = (
+            user_prompt
+            + "\n\n# LINT REJECTION — CORRECT AND RESUBMIT\n"
+            "Your previous patch was rejected by automated lint for:\n"
+            f"{issues_block}\n"
+            "Produce a corrected patch that resolves every issue above. "
+            "Return ONLY the structured object."
+        )
+        return self.invoke_structured_sync(
+            system_prompt, feedback_user, schema_class, deployment_hint,
+        )
+
     def invoke_structured_sync(
         self,
         system_prompt: str,
