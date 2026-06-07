@@ -212,9 +212,9 @@ class BedrockProvider:
                 user_prompt
                 + "\n\n# RETRY NOTICE\nA prior attempt returned the `files` field "
                 "as a JSON-encoded STRING instead of a native JSON array, which "
-                "broke parsing. Return `files` as a native JSON array of "
-                "objects: `[{\"path\": ..., \"new_content\": ..., "
-                "\"rationale\": ...}, ...]`. Do not stringify the array."
+                "broke parsing. Return `files` as a native JSON array of objects "
+                "matching the tool schema exactly (each object's fields as "
+                "native values). Do not stringify the array or any nested object."
             )
             payload = self._call_converse(
                 model_id, tool_name, schema, system_prompt, retry_user, max_tokens

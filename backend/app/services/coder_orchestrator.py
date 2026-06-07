@@ -32,6 +32,7 @@ from app.schemas.api_schemas import (
 )
 from app.services import ast_lint
 from app.services import inflight_registry as ir
+from app.services import scope_guard as sg
 from app.services import validation_gate as vg
 from app.services.github_api_service import GitHubAPIService
 from app.services.github_pr_service import GitHubPRService
@@ -508,6 +509,101 @@ def _build_task(finding: FindingPayload) -> str:
 class CoderOrchestrator:
 
     @classmethod
+    async def _run_decomposed(
+        cls,
+        req: "ActuateRequest",
+        ctx: RepoLensSummary,
+        file_tree: List[str],
+        target_files: Dict[str, str],
+        mode: str,
+    ) -> CoderOutput:
+        """Tier-2 decompose path: plan ordered steps, run Coder once per step,
+        and MERGE the steps into a single CoderOutput. Each step sees prior
+        steps' new files folded into its target_files (so step N can import
+        symbols step N-1 defined). Returns the merged output; all the normal
+        gates downstream (lint → scope → pytest → branch → PR) then operate on
+        the union, and everything lands in ONE branch / ONE PR.
+
+        Falls back to a single full-finding run if planning yields one step."""
+        from app.agents.decomposer import Decomposer
+
+        plan = await asyncio.to_thread(
+            Decomposer().plan,
+            _build_task(req.finding),
+            f"{req.owner}/{req.repo}",
+            ctx.primary_language,
+            ctx.tech_stack,
+            file_tree,
+        )
+        logger.info(
+            "decompose: %d step(s) for %s/%s",
+            len(plan.steps), req.finding.kind, req.finding.id,
+        )
+
+        # Fetch the CURRENT content of every path any step declares but that
+        # the finding's own target resolution missed. Without this, a step
+        # editing e.g. analysis.py gets an EMPTY original and blind-rewrites
+        # it — silently dropping existing code (e.g. an auth guard) that the
+        # scope guard then can't catch because it has no original to diff
+        # against. We mutate `target_files` IN PLACE so the caller's downstream
+        # scope guard sees these originals too. (Observed live: an SSE
+        # milestone resolved to README.md only, then decomposed into edits of
+        # analysis.py/orchestrator.py and dropped _verify_repo_write_access.)
+        declared = {p for step in plan.steps for p in step.target_paths}
+        missing = [p for p in declared if p not in target_files]
+        if missing:
+            fetched = await _fetch_current_contents(
+                req.access_token, req.owner, req.repo, missing, ref=req.branch,
+            )
+            for p, content in fetched.items():
+                target_files.setdefault(p, content)
+            logger.info("decompose: fetched %d step-path original(s): %s",
+                        len(missing), missing)
+
+        agent = CoderAgent()
+        # Accumulated file contents, seeded with the originally-fetched files.
+        # path -> latest content. Later steps see earlier steps' output.
+        merged: Dict[str, CoderFile] = {}
+        working_files: Dict[str, str] = dict(target_files)
+        hint = _deployment_hint(req.finding)
+
+        for idx, step in enumerate(plan.steps):
+            # Each step's target_files = its declared paths (current content
+            # from working_files if present, else empty=new) UNION every file
+            # produced so far (ground truth for cross-step references).
+            step_targets: Dict[str, str] = {}
+            for p in step.target_paths:
+                step_targets[p] = working_files.get(p, "")
+            for p, cf in merged.items():
+                step_targets[p] = cf.new_content
+
+            step_brief = CoderBrief(
+                task=f"[Step {idx + 1}/{len(plan.steps)}: {step.name}] {step.task}",
+                repo_full_name=f"{req.owner}/{req.repo}",
+                primary_language=ctx.primary_language,
+                tech_stack=ctx.tech_stack,
+                entry_points=ctx.entry_points,
+                target_files=step_targets,
+                finding_kind=req.finding.kind,
+                finding_id=f"{req.finding.id}-step{idx + 1}",
+                finding_severity=req.finding.severity,
+            )
+            step_out: CoderOutput = await asyncio.to_thread(
+                agent.run, step_brief, hint, mode,
+            )
+            for cf in step_out.files:
+                merged[cf.path] = cf
+                working_files[cf.path] = cf.new_content
+
+        summary = plan.summary or (req.finding.title or "decomposed feature")
+        summary = f"{summary} ({len(plan.steps)} steps, {len(merged)} files)"
+        return CoderOutput(
+            files=list(merged.values()),
+            skipped=[],
+            summary=summary,
+        )
+
+    @classmethod
     async def run_actuation(cls, req: ActuateRequest) -> ActuateResponse:
         ctx = req.context or RepoLensSummary()
         branch_name = _branch_name(req.finding)
@@ -547,9 +643,15 @@ class CoderOrchestrator:
             finding_severity=req.finding.severity,
         )
         agent = CoderAgent()
-        coder_out: CoderOutput = await asyncio.to_thread(
-            agent.run, brief, _deployment_hint(req.finding),
-        )
+        _mode = "diff" if getattr(req, "diff_mode", False) else "full"
+        if getattr(req, "decompose", False):
+            coder_out = await cls._run_decomposed(
+                req, ctx, file_tree, target_files, _mode,
+            )
+        else:
+            coder_out = await asyncio.to_thread(
+                agent.run, brief, _deployment_hint(req.finding), _mode,
+            )
 
         if not coder_out.files:
             # Coder decided no change is needed (or skipped everything).
@@ -632,6 +734,36 @@ class CoderOrchestrator:
                     )
                 claimed_paths.append(cf.path)
 
+            # 3c.5. Scope-discipline guard. Pure text analysis (no local tree
+            # needed) so it runs for ALL repos, not just the dogfood case.
+            # Catches whole-file rewrites that silently drop pre-existing
+            # top-level defs (the untested-_lifespan-hook miss) or delete lines
+            # from protected config files (the .gitignore miss) — drift the
+            # pass-count gate can't see. Reject before touching GitHub.
+            serialized = [
+                {"path": cf.path, "new_content": cf.new_content,
+                 "rationale": cf.rationale}
+                for cf in coder_out.files
+            ]
+            scope_issues = sg.check_patch(serialized, target_files, coder_out.summary)
+            if scope_issues:
+                logger.warning(
+                    "scope guard rejected %s/%s: %s",
+                    req.finding.kind, req.finding.id, "; ".join(scope_issues),
+                )
+                return ActuateResponse(
+                    status="scope_rejected",
+                    pr_url=None,
+                    branch_name=branch_name,
+                    files_changed=[],
+                    skipped=[cf.path for cf in coder_out.files],
+                    summary=(
+                        f"Patch passed lint but failed the scope-discipline guard: "
+                        f"{' | '.join(scope_issues)} No branch/PR was created. "
+                        f"Coder summary: {coder_out.summary[:200]}"
+                    ),
+                )
+
             # 3d. Local pytest gate — only when actuating THIS repo on a local
             # checkout (the dogfood case). For external repos there's no local
             # tree to test against, so we skip. Snapshot → apply → smoke import
@@ -640,10 +772,6 @@ class CoderOrchestrator:
             gate_ran = False
             if _PYTEST_GATE_ENABLED and repo_full == _SELF_REPO:
                 gate_ran = True
-                serialized = [
-                    {"path": cf.path, "new_content": cf.new_content}
-                    for cf in coder_out.files
-                ]
                 result, snap = await asyncio.to_thread(vg.gate_patch, serialized)
                 if not result.passed:
                     await asyncio.to_thread(vg.restore_snapshot, snap)

@@ -42,6 +42,7 @@ from app.agents.coder_agent import CoderAgent, CoderBrief, CoderOutput, CoderFil
 from app.schemas.api_schemas import FindingPayload, RepoLensSummary
 from app.services import inflight_registry as ir
 from app.services import validation_gate as vg
+from app.services import scope_guard as sg
 from app.services.coder_orchestrator import (
     _resolve_target_paths,
     _fetch_current_contents,
@@ -64,6 +65,22 @@ _MAX_ATTEMPTS = 2  # findings that fail this many times go to `parked`
 
 # The repo this loop run targets — used to attribute journal rows. Set in main().
 _ACTIVE_REPO = "WalkingDevFlag/Shipmate-AI"
+
+
+class _ActuateShim:
+    """Minimal duck-typed stand-in for ActuateRequest — CoderOrchestrator.
+    _run_decomposed reads .owner/.repo/.branch/.finding/.access_token. The
+    loop drives its own gates (it doesn't open PRs), so we don't need the
+    full request — just enough for the decomposer to fetch step-path
+    originals."""
+
+    def __init__(self, owner: str, repo: str, branch: str, finding,
+                 access_token: str = "") -> None:
+        self.owner = owner
+        self.repo = repo
+        self.branch = branch
+        self.finding = finding
+        self.access_token = access_token
 
 
 def _load_state() -> Dict[str, Any]:
@@ -160,6 +177,15 @@ def _verdict_for(
 
     issues = list(_lint_coder_output(coder_out, target_files, file_tree))
 
+    # Scope-discipline guard: catch whole-file rewrites that drop pre-existing
+    # top-level defs (untested-infra miss) or delete protected config lines.
+    # Same drift the orchestrator rejects with `scope_rejected`.
+    _serialized = [
+        {"path": cf.path, "new_content": cf.new_content, "rationale": cf.rationale}
+        for cf in coder_out.files
+    ]
+    issues.extend(sg.check_patch(_serialized, target_files, coder_out.summary))
+
     # Per-file extra: empty content (except __init__.py), gitkeep theater,
     # NEW test theater, mismatched first-party imports for tests.
     for cf in coder_out.files:
@@ -184,14 +210,30 @@ def _verdict_for(
 
 async def _fetch_findings(
     base_url: str, owner: str, repo: str, branch: str, token: str,
+    attempts: int = 2,
 ) -> Dict[str, Any]:
-    async with httpx.AsyncClient(timeout=180) as client:
-        r = await client.post(
-            f"{base_url}/api/analyze",
-            json={"owner": owner, "repo": repo, "branch": branch, "access_token": token},
-        )
-        r.raise_for_status()
-        return r.json()["report"]
+    """POST /api/analyze and return the report. The full 4-agent Bedrock
+    pipeline can take 2-3 min (longer under cold creds / throttling), so the
+    read timeout is generous and a transient ReadTimeout is retried ONCE
+    rather than crashing the whole round."""
+    # connect quickly, but allow a long read for the slow analyze pipeline.
+    timeout = httpx.Timeout(connect=10.0, read=300.0, write=30.0, pool=10.0)
+    last_err: Optional[Exception] = None
+    for i in range(1, attempts + 1):
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                r = await client.post(
+                    f"{base_url}/api/analyze",
+                    json={"owner": owner, "repo": repo, "branch": branch,
+                          "access_token": token},
+                )
+                r.raise_for_status()
+                return r.json()["report"]
+        except (httpx.ReadTimeout, httpx.ConnectError, httpx.RemoteProtocolError) as e:
+            last_err = e
+            print(f"  analyze attempt {i}/{attempts} failed ({type(e).__name__}); "
+                  f"{'retrying' if i < attempts else 'giving up'}")
+    raise last_err  # type: ignore[misc]
 
 
 def _slug(s: str, n: int = 40) -> str:
@@ -382,6 +424,8 @@ async def _actuate_one(
     owner: str,
     repo: str,
     branch: str,
+    diff_mode: bool = False,
+    decompose: bool = False,
 ) -> Dict[str, Any]:
     """Actuate one finding against current state. Returns verdict record."""
     started = time.time()
@@ -412,7 +456,19 @@ async def _actuate_one(
             finding_severity=finding.severity,
         )
         agent = CoderAgent()
-        coder_out = await asyncio.to_thread(agent.run, brief, _deployment_hint(finding))
+        _mode = "diff" if diff_mode else "full"
+        # Decompose only multi-file kinds (milestone/blocker); a guardrail/test
+        # tweak is single-file by nature and planning would just add latency.
+        if decompose and finding.kind in ("milestone", "blocker"):
+            from app.services.coder_orchestrator import CoderOrchestrator
+            coder_out = await CoderOrchestrator._run_decomposed(
+                _ActuateShim(owner, repo, branch, finding, token), ctx, file_tree,
+                target_files, _mode,
+            )
+        else:
+            coder_out = await asyncio.to_thread(
+                agent.run, brief, _deployment_hint(finding), _mode,
+            )
 
         verdict, reasons = _verdict_for(coder_out, target_files, file_tree)
         rec.update({
@@ -485,6 +541,8 @@ async def run_round(
     out_path: Path,
     apply: bool,
     state: Dict[str, Any],
+    diff_mode: bool = False,
+    decompose: bool = False,
 ) -> Tuple[int, int, int]:
     """Returns (good_count, bad_count, applied_count).
 
@@ -524,7 +582,8 @@ async def run_round(
     print(f"→ Actuating {len(findings)} in parallel…")
     t0 = time.time()
     recs = await asyncio.gather(*[
-        _actuate_one(f, ctx, file_tree, token, owner, repo, branch)
+        _actuate_one(f, ctx, file_tree, token, owner, repo, branch,
+                     diff_mode=diff_mode, decompose=decompose)
         for f in findings
     ])
     print(f"  actuate: {round(time.time()-t0,1)}s")
@@ -678,6 +737,12 @@ async def main() -> None:
     p.add_argument("--token-from", default="gh")
     p.add_argument("--reset", action="store_true",
                    help="wipe persistent state (seen signatures, baseline)")
+    p.add_argument("--diff-mode", action="store_true",
+                   help="Tier-2: ask Coder for unified diffs (token-saving; "
+                        "auto-falls back to full-file on apply failure)")
+    p.add_argument("--decompose", action="store_true",
+                   help="Tier-2: split multi-file milestone/blocker findings "
+                        "into ordered Coder steps")
     args = p.parse_args()
 
     if args.token_from == "gh":
@@ -706,6 +771,10 @@ async def main() -> None:
     apply = not args.no_apply
     print(f"Mode: {'APPLY (will modify local working tree)' if apply else 'DRY-RUN (verdicts only)'}")
     print(f"Rounds: up to {args.rounds}")
+    if args.diff_mode:
+        print("Tier-2: diff-mode ON (Coder emits unified diffs; full-file fallback)")
+    if args.decompose:
+        print("Tier-2: decompose ON (milestone/blocker findings split into steps)")
     if seen_signatures:
         print(f"Loaded {len(seen_signatures)} previously-attempted finding signatures")
 
@@ -715,6 +784,7 @@ async def main() -> None:
             g, b, a = await run_round(
                 r, args.base_url, args.owner, args.repo, args.branch,
                 token, seen_signatures, cooled_paths, out_path, apply, state,
+                diff_mode=args.diff_mode, decompose=args.decompose,
             )
             # Persist accumulated state across runs.
             state["seen_signatures"] = sorted(seen_signatures)
