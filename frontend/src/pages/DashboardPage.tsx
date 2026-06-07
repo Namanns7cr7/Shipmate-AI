@@ -285,7 +285,8 @@ export function DashboardPage({ user, repos, report, onNavigate, onAnalyze }: Pr
     api.getHistory(report.repo.owner, report.repo.name, report.repo.branch)
       .then(setHistory)
       .catch(() => setHistory([]));
-  }, [report?.repo.full_name, report?.repo.branch]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [report?.repo.full_name, report?.repo.branch]); // intentional: only refetch when repo/branch identity changes
 
   return (
     <motion.div initial={{ opacity: 0, y: 14 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.55, ease: [0.2,0.7,0.2,1] }}

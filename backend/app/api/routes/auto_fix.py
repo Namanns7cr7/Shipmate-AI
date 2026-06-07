@@ -103,7 +103,7 @@ async def _run_loop(req: AutoFixRequest) -> AsyncIterator[str]:
                 token=req.access_token, owner=req.owner, repo=req.repo,
                 branch=req.branch, pr_number=None, feature_context="",
             )
-            report = await asyncio.to_thread(orchestrator.run, repo_context)
+            report = await orchestrator.run(repo_context)
             report_dict = report.model_dump()
         except Exception as e:
             logger.warning("auto-fix analyze failed: %s", e)
