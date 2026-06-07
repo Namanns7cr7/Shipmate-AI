@@ -210,14 +210,30 @@ def _verdict_for(
 
 async def _fetch_findings(
     base_url: str, owner: str, repo: str, branch: str, token: str,
+    attempts: int = 2,
 ) -> Dict[str, Any]:
-    async with httpx.AsyncClient(timeout=180) as client:
-        r = await client.post(
-            f"{base_url}/api/analyze",
-            json={"owner": owner, "repo": repo, "branch": branch, "access_token": token},
-        )
-        r.raise_for_status()
-        return r.json()["report"]
+    """POST /api/analyze and return the report. The full 4-agent Bedrock
+    pipeline can take 2-3 min (longer under cold creds / throttling), so the
+    read timeout is generous and a transient ReadTimeout is retried ONCE
+    rather than crashing the whole round."""
+    # connect quickly, but allow a long read for the slow analyze pipeline.
+    timeout = httpx.Timeout(connect=10.0, read=300.0, write=30.0, pool=10.0)
+    last_err: Optional[Exception] = None
+    for i in range(1, attempts + 1):
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                r = await client.post(
+                    f"{base_url}/api/analyze",
+                    json={"owner": owner, "repo": repo, "branch": branch,
+                          "access_token": token},
+                )
+                r.raise_for_status()
+                return r.json()["report"]
+        except (httpx.ReadTimeout, httpx.ConnectError, httpx.RemoteProtocolError) as e:
+            last_err = e
+            print(f"  analyze attempt {i}/{attempts} failed ({type(e).__name__}); "
+                  f"{'retrying' if i < attempts else 'giving up'}")
+    raise last_err  # type: ignore[misc]
 
 
 def _slug(s: str, n: int = 40) -> str:
