@@ -423,10 +423,10 @@ async def sanitize_input_middleware(request: Request, call_next):
                         status_code=400,
                         content={"detail": "Request contains disallowed content"},
                     )
-                # Re-inject body bytes so downstream handlers can read them
-                async def _receive():
-                    return {"type": "http.request", "body": body_bytes, "more_body": False}
-                request = Request(request.scope, receive=_receive)
+                # Cache the body bytes back onto the request so downstream handlers
+                # (Pydantic model binding, route handlers calling await request.body())
+                # can still access the full payload.
+                request._body = body_bytes
             except Exception:
                 pass  # Don't crash on body-read errors; let the route handle it
 
