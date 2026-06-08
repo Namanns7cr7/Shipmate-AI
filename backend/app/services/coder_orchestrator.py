@@ -805,6 +805,37 @@ class CoderOrchestrator:
                     req.finding.kind, req.finding.id, result.before, result.after,
                 )
 
+            # 3d-ii. TARGET-REPO gate — for repos that AREN'T ShipMate's own
+            # checkout. Clones the user's repo, applies the patch, runs THEIR
+            # test command in a sandboxed subprocess. OFF by default
+            # (SHIPMATE_TARGET_REPO_GATE=1) because it runs untrusted code.
+            # Without it, "Build It" on an external repo opens PRs with zero
+            # local validation — this closes that gap when explicitly enabled.
+            elif vg.target_repo_gate_enabled() and repo_full != _SELF_REPO:
+                gate_ran = True
+                await _emit("gate.start", phase="target-pytest")
+                tgt = await asyncio.to_thread(
+                    vg.gate_patch_target_repo,
+                    req.owner, req.repo, req.branch, serialized, req.access_token,
+                )
+                if not tgt.passed:
+                    await _emit("done", status="pytest_rejected", pr_url=None)
+                    return ActuateResponse(
+                        status="pytest_rejected",
+                        pr_url=None,
+                        branch_name=branch_name,
+                        files_changed=[],
+                        skipped=[cf.path for cf in coder_out.files],
+                        summary=(
+                            f"Patch failed the target-repo test gate: {tgt.reason}. "
+                            f"No PR was created. Coder summary: {coder_out.summary[:200]}"
+                        ),
+                    )
+                logger.info(
+                    "target-repo gate passed for %s/%s (%df failing)",
+                    req.owner, req.repo, tgt.failed,
+                )
+
             # 3e. Fix-resolution check — for detectable finding categories, the
             # patch must actually REMOVE the offending pattern. 'shipped' should
             # mean the issue is gone, not merely that tests still pass. A patch

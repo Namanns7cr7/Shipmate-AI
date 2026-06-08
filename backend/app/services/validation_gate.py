@@ -29,11 +29,16 @@ Key invariants:
 """
 from __future__ import annotations
 
+import json
 import logging
+import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
+import uuid
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -327,3 +332,218 @@ def gate_patch(files: List[Dict[str, str]]) -> Tuple[GateResult, Dict[str, Optio
     logger.info("gate_patch: ACCEPT (%dp → %dp, %df) in %.1fs",
                 before, after, failed, elapsed)
     return result, snap
+
+
+# ── Target-repo validation (clone + run THEIR tests) ─────────────────────────
+#
+# The gate above only ever tested ShipMate's OWN checkout (REPO_ROOT), so for
+# every OTHER repo a user analyzes, "Build It" opened PRs with zero local
+# validation. This validates the TARGET repo: shallow-clone it, apply the
+# patch, detect + run ITS test command in a subprocess, parse pass/fail.
+#
+# ⚠️  SECURITY — this RUNS UNTRUSTED USER CODE (the cloned repo's test suite).
+# It is therefore OFF by default and must be explicitly enabled with
+# SHIPMATE_TARGET_REPO_GATE=1. Hardening applied:
+#   • the test subprocess gets a STRIPPED environment (no backend secrets / .env
+#     — only PATH/HOME/LANG + a flag), so a malicious test can't read our creds;
+#   • everything is bounded (clone timeout, test timeout) and the temp workdir
+#     is always removed in a finally;
+#   • the clone uses --depth=1 --single-branch for speed.
+# For real multi-tenant safety this should run in a container/VM; the env-strip
+# + bounds here are the floor, not the ceiling. Document loudly when enabling.
+
+_TARGET_REPO_GATE_ENABLED = os.getenv("SHIPMATE_TARGET_REPO_GATE", "0") == "1"
+_CLONE_TIMEOUT_S = int(os.getenv("SHIPMATE_TARGET_CLONE_TIMEOUT_S", "60"))
+_TARGET_TEST_TIMEOUT_S = int(os.getenv("SHIPMATE_TARGET_TEST_TIMEOUT_S", "180"))
+_TARGET_TMP_PREFIX = "shipmate_target_"
+
+
+def target_repo_gate_enabled() -> bool:
+    """Read the flag at call time so tests/env changes take effect."""
+    return os.getenv("SHIPMATE_TARGET_REPO_GATE", "0") == "1"
+
+
+def detect_test_command(repo_path: str) -> Optional[List[str]]:
+    """Best-effort detection of how to run THIS repo's tests, in priority order:
+      1. Python: pytest.ini / pyproject.toml / setup.cfg / a tests dir → pytest
+      2. Node:   package.json with a "test" script → npm test
+      3. Make:   a Makefile with a `test:` target → make test
+    Returns the argv list, or None if nothing recognizable is present (caller
+    decides whether 'no tests' fails open or closed)."""
+    root = Path(repo_path)
+
+    # Python — pytest is the dominant runner.
+    py_markers = ["pytest.ini", "tox.ini", "setup.cfg"]
+    has_py_marker = any((root / m).exists() for m in py_markers)
+    pyproject = root / "pyproject.toml"
+    if pyproject.exists():
+        try:
+            txt = pyproject.read_text(encoding="utf-8", errors="replace")
+            if "pytest" in txt or "[tool.poetry]" in txt or "[project]" in txt:
+                has_py_marker = True
+        except Exception:
+            pass
+    if not has_py_marker:
+        for d in ("tests", "test"):
+            if (root / d).is_dir():
+                has_py_marker = True
+                break
+    if has_py_marker:
+        return [sys.executable, "-m", "pytest", "-q", "--tb=no", "-p", "no:cacheprovider"]
+
+    # Node — only if a real "test" script exists (skip the CRA placeholder that
+    # exits 1 with no tests).
+    pkg = root / "package.json"
+    if pkg.exists():
+        try:
+            data = json.loads(pkg.read_text(encoding="utf-8", errors="replace"))
+            scripts = data.get("scripts") or {}
+            test_script = scripts.get("test", "")
+            if test_script and "no test specified" not in test_script:
+                return ["npm", "test", "--silent"]
+        except Exception:
+            pass
+
+    # Make — a `test:` target.
+    mk = root / "Makefile"
+    if mk.exists():
+        try:
+            if re.search(r"^test\s*:", mk.read_text(encoding="utf-8", errors="replace"), re.MULTILINE):
+                return ["make", "test"]
+        except Exception:
+            pass
+
+    return None
+
+
+def _safe_clone_url(owner: str, repo: str, access_token: Optional[str]) -> str:
+    """HTTPS clone URL with the token embedded for private repos. The token is
+    only ever passed to git here and never logged (we log the tokenless form)."""
+    if access_token:
+        return f"https://x-access-token:{access_token}@github.com/{owner}/{repo}.git"
+    return f"https://github.com/{owner}/{repo}.git"
+
+
+def _stripped_env() -> Dict[str, str]:
+    """A minimal environment for the untrusted test subprocess — deliberately
+    omits everything from the backend's env (BEDROCK_*, GITHUB_*, AWS_*, the
+    OAuth secret, …) so a hostile test script can't exfiltrate our secrets."""
+    keep = {}
+    for var in ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "SYSTEMROOT"):
+        if var in os.environ:
+            keep[var] = os.environ[var]
+    keep["SHIPMATE_SANDBOX"] = "1"   # marker tests can branch on if they want
+    keep["CI"] = "true"
+    return keep
+
+
+def gate_patch_target_repo(
+    owner: str, repo: str, branch: str,
+    files: List[Dict[str, str]],
+    access_token: Optional[str] = None,
+    *,
+    fail_open_when_no_tests: bool = True,
+) -> GateResult:
+    """Clone owner/repo@branch into an isolated tmp dir, apply `files`, detect +
+    run the repo's own test command, and report. Always cleans up the workdir.
+
+    Returns a GateResult. `before`/`after` are pass counts from the SINGLE post-
+    patch run (there's no cheap baseline for an arbitrary repo, so the gate is
+    'tests must not fail' rather than 'no regression'): passed=True iff the test
+    command ran and reported 0 failures. When no test command is detected,
+    `fail_open_when_no_tests` decides (default True → don't block a PR just
+    because the repo has no tests; the reason makes that explicit)."""
+    started = time.time()
+    if not target_repo_gate_enabled():
+        # Caller shouldn't reach here, but be safe: treat as skipped/pass.
+        return GateResult(True, 0, 0, 0, "target-repo gate disabled", "")
+
+    workdir = tempfile.mkdtemp(prefix=_TARGET_TMP_PREFIX + uuid.uuid4().hex[:8] + "_")
+    try:
+        # 1. Shallow clone the branch.
+        clone_url = _safe_clone_url(owner, repo, access_token)
+        try:
+            proc = subprocess.run(
+                ["git", "clone", "--depth=1", "--single-branch",
+                 "--branch", branch, clone_url, workdir],
+                capture_output=True, text=True, timeout=_CLONE_TIMEOUT_S,
+                env=_stripped_env(),
+            )
+        except subprocess.TimeoutExpired:
+            return GateResult(False, 0, 0, 0,
+                              f"clone timed out (>{_CLONE_TIMEOUT_S}s)", "")
+        if proc.returncode != 0:
+            # Don't leak the tokened URL in the error.
+            tail = (proc.stderr or "")[-300:].replace(access_token or "\0", "***")
+            return GateResult(False, 0, 0, 0,
+                              f"clone failed for {owner}/{repo}@{branch}", tail)
+
+        # 2. Apply the patch files into the clone (reuse the same path-safety
+        #    rules as the local gate, rooted at the clone dir).
+        _apply_files_to_dir(workdir, files)
+
+        # 3. Detect the test command.
+        cmd = detect_test_command(workdir)
+        if cmd is None:
+            reason = "no test command detected in target repo"
+            logger.warning("gate_patch_target_repo: %s (%s/%s)", reason, owner, repo)
+            return GateResult(
+                passed=fail_open_when_no_tests, before=0, after=0, failed=0,
+                reason=reason + (" — passing (fail-open)" if fail_open_when_no_tests
+                                 else " — blocking (fail-closed)"),
+                summary_tail="",
+            )
+
+        # 4. Run the tests in the clone with a stripped env + timeout.
+        try:
+            proc = subprocess.run(
+                cmd, cwd=workdir, capture_output=True, text=True,
+                timeout=_TARGET_TEST_TIMEOUT_S, env=_stripped_env(),
+            )
+        except subprocess.TimeoutExpired:
+            return GateResult(False, 0, 0, 0,
+                              f"target tests timed out (>{_TARGET_TEST_TIMEOUT_S}s)", "")
+        except FileNotFoundError as e:
+            # Runner not installed on the host (e.g. npm/make missing).
+            return GateResult(True, 0, 0, 0,
+                              f"test runner unavailable ({e}); skipping gate", "")
+
+        out = (proc.stdout or "") + (proc.stderr or "")
+        passed = int(m.group(1)) if (m := _PASSED_RE.search(out)) else 0
+        failed = int(m.group(1)) if (m := _FAILED_RE.search(out)) else 0
+        errors = int(m.group(1)) if (m := _ERROR_RE.search(out)) else 0
+        failed += errors
+        elapsed = time.time() - started
+
+        # 'tests must not fail' — a non-zero exit with parsed failures rejects.
+        ok = failed == 0 and proc.returncode == 0
+        reason = "ok" if ok else f"target tests failed ({failed} failing, exit={proc.returncode})"
+        logger.info("gate_patch_target_repo: %s/%s %s (%dp/%df) in %.1fs",
+                    owner, repo, "ACCEPT" if ok else "REJECT", passed, failed, elapsed)
+        return GateResult(ok, before=passed, after=passed, failed=failed,
+                          reason=reason, summary_tail=out[-2000:])
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def _apply_files_to_dir(base_dir: str, files: List[Dict[str, str]]) -> List[str]:
+    """Write Coder output files under `base_dir`, with the same path-traversal
+    guards as write_files_to_tree but rooted at an arbitrary directory (the
+    clone), not REPO_ROOT."""
+    root = Path(base_dir).resolve()
+    written: List[str] = []
+    for f in files:
+        path = f["path"]
+        if path.startswith("/") or ".." in path.split("/"):
+            logger.warning("_apply_files_to_dir: refusing suspicious path %s", path)
+            continue
+        full = root / path
+        try:
+            full.resolve().relative_to(root)
+        except ValueError:
+            logger.warning("_apply_files_to_dir: refusing path outside clone: %s", path)
+            continue
+        full.parent.mkdir(parents=True, exist_ok=True)
+        full.write_text(f["new_content"])
+        written.append(path)
+    return written
