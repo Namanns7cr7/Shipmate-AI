@@ -309,6 +309,86 @@ export interface AutoFixEvent {
   message?: string;
 }
 
+// ── Opportunity Planner (Build tab) ─────────────────────────────────────────────
+
+export interface Opportunity {
+  id: string;
+  title: string;
+  category: 'feature' | 'improvement' | 'tweak' | 'bug' | string;
+  description: string;
+  impact: string;
+  effort: 'S' | 'M' | 'L' | string;
+  estimated_days: number;
+  target_files: string[];
+  suggested_approach: string[];
+  evidence: string[];
+  rationale: string;
+  value_score: number;
+  priority: 'critical' | 'high' | 'medium' | 'low' | string;
+  grounded: boolean;
+  worth_doing: boolean;
+  verify_reason?: string | null;
+  journal_state?: string | null;
+  source: string;
+}
+
+export interface BuildPlanResponse {
+  owner: string;
+  repo: string;
+  branch: string;
+  opportunities: Opportunity[];
+  total_found: number;
+  grounded_count: number;
+  verified_count: number;
+  ai_enhanced: boolean;
+  generated_at: string;
+}
+
+export interface BuildStep {
+  index: number;
+  title: string;
+  description: string;
+  target_files: string[];
+  depends_on: number[];
+  kind: string;
+  rationale: string;
+}
+
+export interface ExecutionPlan {
+  opportunity_id: string;
+  opportunity_title: string;
+  summary: string;
+  steps: BuildStep[];
+  estimated_days: number;
+  grounded: boolean;
+  notes: string[];
+}
+
+export interface PlanCritique {
+  approved: boolean;
+  coherent: boolean;
+  complete: boolean;
+  in_scope: boolean;
+  issues: string[];
+  reason: string;
+}
+
+export interface BuildExecuteResponse {
+  owner: string;
+  repo: string;
+  branch: string;
+  opportunity_id: string;
+  plan?: ExecutionPlan | null;
+  critique?: PlanCritique | null;
+  executed: boolean;
+  pr_url?: string | null;
+  files_changed: string[];
+  status: 'planned' | 'plan_rejected' | 'executed' | 'execute_failed' | 'degraded' | string;
+  summary: string;
+  ai_enhanced: boolean;
+  generated_at: string;
+}
+
 // ── App state ─────────────────────────────────────────────────────────────────
 
 export type AppState =

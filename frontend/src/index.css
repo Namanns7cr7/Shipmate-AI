@@ -612,6 +612,8 @@ a { color: inherit; text-decoration: none; }
   0%   { transform: translateX(-120%); }
   100% { transform: translateX(320%); }
 }
+/* Spinning icon utility (e.g. lucide Loader2 in buttons). */
+.spin { animation: spin 0.9s linear infinite; }
 
 /* ── Misc / helpers ─────────────────────────────────────────── */
 

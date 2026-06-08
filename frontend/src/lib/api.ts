@@ -3,7 +3,7 @@ import type {
   AnalyzeResponse, GitHubRepo, GitHubBranch, GitHubPR,
   ActuateResponse, FindingPayload, RepoLensSummary,
   WatcherState, WatcherLogLine, JournalResponse, AutoFixEvent,
-  ShipMateReport,
+  ShipMateReport, BuildPlanResponse, BuildExecuteResponse, Opportunity,
 } from '../types';
 
 // API base. Locally we default to '/api' and let the Vite dev proxy forward to
@@ -219,6 +219,30 @@ export const api = {
         }
       }
     }
+  },
+
+  // ── Build (Opportunity Planner) ───────────────────────────────────────────
+
+  async buildPlan(params: {
+    owner: string; repo: string; branch: string; access_token: string;
+    max_opportunities?: number; include_ungrounded?: boolean;
+  }): Promise<BuildPlanResponse> {
+    // Discovery + critic + ranker is a multi-LLM pass; allow generous time.
+    const { data } = await gh.post<BuildPlanResponse>('/build/plan', params, {
+      timeout: 180_000,
+    });
+    return data;
+  },
+
+  async buildExecute(params: {
+    owner: string; repo: string; branch: string; access_token: string;
+    opportunity: Opportunity; execute: boolean;
+  }): Promise<BuildExecuteResponse> {
+    // Plan + critique is quick; execute opens PRs (Coder per step) so allow long.
+    const { data } = await gh.post<BuildExecuteResponse>('/build/execute', params, {
+      timeout: 300_000,
+    });
+    return data;
   },
 
   // ── CI watcher ──────────────────────────────────────────────────────────

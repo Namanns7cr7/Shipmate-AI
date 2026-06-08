@@ -7,6 +7,7 @@ import { AppSidebar } from './components/app/AppSidebar';
 import { DashboardPage } from './pages/DashboardPage';
 import { RepositoriesPage } from './pages/RepositoriesPage';
 import { AnalysisPage } from './pages/AnalysisPage';
+import { BuildPage } from './pages/BuildPage';
 import { ReportsPage } from './pages/ReportsPage';
 import { Spinner } from './components/ui/GitHubConnectButton';
 import { BranchPicker } from './components/ui/BranchPicker';
@@ -375,6 +376,13 @@ export default function App() {
             overallPct={overallPct}
             liveLines={liveLines}
             onCancel={() => { setAnalyzing(false); setPage('repos'); }}
+          />
+        )}
+        {activePage === 'build' && (
+          <BuildPage
+            selectedRepo={selectedRepo}
+            selectedBranch={selectedBranch}
+            accessToken={auth.accessToken}
           />
         )}
         {activePage === 'reports' && report && (
