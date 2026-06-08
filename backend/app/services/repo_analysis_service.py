@@ -6,10 +6,15 @@ then builds the context dict consumed by the ShipMate orchestrator.
 """
 
 import asyncio
+import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import httpx
+
 from .github_api_service import GitHubAPIService
+
+logger = logging.getLogger("shipmate.repo_analysis")
 
 # Files we always try to fetch (order = priority)
 _KEY_FILE_NAMES = [
@@ -62,13 +67,30 @@ class RepoAnalysisService:
         # Fetch key file contents in parallel (bounded concurrency)
         key_files = await cls._fetch_files(token, owner, repo, files_to_fetch)
 
-        # Optional PR context
+        # Optional PR context. A missing PR (404) is an expected, benign case —
+        # we proceed with pr_info=None. But a transient/server error (429/5xx,
+        # network) should NOT be silently swallowed: it means the PR context the
+        # caller asked for is missing for a fixable reason. We surface it via a
+        # `warnings` list in the context so the orchestrator/route can tell the
+        # user "PR context unavailable" instead of degrading invisibly.
         pr_info = None
+        warnings: List[str] = []
         if pr_number:
             try:
                 pr_info = await GitHubAPIService.get_pr_info(token, owner, repo, pr_number)
-            except Exception:
-                pass
+            except httpx.HTTPStatusError as e:
+                status = e.response.status_code if e.response is not None else None
+                if status == 404:
+                    # PR genuinely not found — expected, proceed without it.
+                    pass
+                else:
+                    msg = f"Could not fetch PR #{pr_number} context (HTTP {status}); analysis proceeds without PR diff."
+                    warnings.append(msg)
+                    logger.warning(msg)
+            except Exception as e:
+                msg = f"Could not fetch PR #{pr_number} context ({type(e).__name__}); analysis proceeds without PR diff."
+                warnings.append(msg)
+                logger.warning(msg)
 
         return {
             "repo_info": repo_info,
@@ -77,6 +99,7 @@ class RepoAnalysisService:
             "branch": branch,
             "pr_info": pr_info,
             "feature_context": feature_context,
+            "warnings": warnings,
         }
 
     @classmethod

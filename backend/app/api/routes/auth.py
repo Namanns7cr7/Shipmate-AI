@@ -1,6 +1,8 @@
 import logging
 import os
-from fastapi import APIRouter, HTTPException, Query
+from typing import Optional
+
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from app.services.github_auth_service import GitHubAuthService
 from app.services.github_api_service import GitHubAPIService
 from app.schemas.api_schemas import RepoSummary
@@ -8,6 +10,32 @@ from app.schemas.api_schemas import RepoSummary
 logger = logging.getLogger("shipmate.auth_route")
 
 router = APIRouter(prefix="/auth/github", tags=["github-auth"])
+
+
+def resolve_access_token(
+    authorization: Optional[str] = Header(default=None),
+    access_token: Optional[str] = Query(default=None),
+) -> str:
+    """Resolve the GitHub token from the Authorization header (preferred) or the
+    legacy ?access_token= query param (fallback).
+
+    OPP-001: passing the token as a query param leaks it into server access
+    logs, the Referer header, and browser history. The frontend now sends
+    `Authorization: Bearer <token>`. We still accept the query param so older
+    clients / in-flight sessions keep working during the migration; new code
+    should always use the header."""
+    if authorization:
+        parts = authorization.split(" ", 1)
+        if len(parts) == 2 and parts[0].lower() in ("bearer", "token"):
+            tok = parts[1].strip()
+            if tok:
+                return tok
+    if access_token:
+        return access_token
+    raise HTTPException(
+        status_code=401,
+        detail="Missing access token. Send 'Authorization: Bearer <token>'.",
+    )
 
 
 @router.get("/login")
@@ -53,7 +81,7 @@ async def github_callback(code: str = Query(...), state: str = Query(...)):
 
 
 @router.get("/me")
-async def get_me(access_token: str = Query(...)):
+async def get_me(access_token: str = Depends(resolve_access_token)):
     """Return the authenticated user's GitHub profile."""
     try:
         user = await GitHubAuthService.get_user_profile(access_token)
@@ -63,7 +91,7 @@ async def get_me(access_token: str = Query(...)):
 
 
 @router.get("/repos")
-async def get_repos(access_token: str = Query(...)):
+async def get_repos(access_token: str = Depends(resolve_access_token)):
     """Return the authenticated user's repositories."""
     try:
         repos = await GitHubAPIService.get_user_repos(access_token)
@@ -93,7 +121,7 @@ async def get_repos(access_token: str = Query(...)):
 
 
 @router.get("/repos/{owner}/{repo_name}/branches")
-async def get_branches(owner: str, repo_name: str, access_token: str = Query(...)):
+async def get_branches(owner: str, repo_name: str, access_token: str = Depends(resolve_access_token)):
     """Return branches for a repository."""
     try:
         branches = await GitHubAPIService.get_branches(access_token, owner, repo_name)
@@ -111,7 +139,7 @@ async def get_branches(owner: str, repo_name: str, access_token: str = Query(...
 
 
 @router.get("/repos/{owner}/{repo_name}/pulls")
-async def get_pulls(owner: str, repo_name: str, access_token: str = Query(...)):
+async def get_pulls(owner: str, repo_name: str, access_token: str = Depends(resolve_access_token)):
     """Return open pull requests for a repository."""
     try:
         pulls = await GitHubAPIService.get_open_pulls(access_token, owner, repo_name)
@@ -132,7 +160,7 @@ async def get_pulls(owner: str, repo_name: str, access_token: str = Query(...)):
 
 
 @router.post("/logout")
-async def logout(access_token: str = Query(...)):
+async def logout(access_token: str = Depends(resolve_access_token)):
     try:
         GitHubAuthService.clear_token(access_token)
         return {"success": True, "message": "Logged out"}

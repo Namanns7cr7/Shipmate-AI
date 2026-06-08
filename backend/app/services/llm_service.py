@@ -32,6 +32,7 @@ import asyncio
 import json
 import logging
 import os
+import threading
 from typing import Any, Dict, List, Optional, Type, TypeVar
 
 from pydantic import BaseModel, Field
@@ -49,6 +50,14 @@ logger = logging.getLogger("shipmate.llm_service")
 # so subsequent enhance() calls cheaply short-circuit.
 _provider: Optional[Any] = None
 _provider_init_attempted = False
+# The agents run via asyncio.to_thread, so _get_provider() / _maybe_invalidate
+# can be entered from multiple worker THREADS concurrently. A plain
+# check-then-set on the module globals is a TOCTOU race that can construct the
+# provider (and its boto3/Azure client) twice. A threading.Lock — NOT an
+# asyncio.Lock, because these call sites are synchronous — serializes init and
+# invalidation. Double-checked locking keeps the hot path lock-free once the
+# provider is resolved.
+_provider_lock = threading.Lock()
 
 
 def _get_provider():
@@ -59,19 +68,26 @@ def _get_provider():
     hard get_provider() (which raises), the enhancement layer stays
     None-tolerant: any construction failure (missing creds, missing SDK)
     disables prose enhancement gracefully — deterministic scores/verdicts are
-    unaffected."""
+    unaffected.
+
+    Thread-safe: double-checked locking so concurrent worker threads can't
+    construct two providers."""
     global _provider, _provider_init_attempted
     if _provider_init_attempted:
         return _provider
-    _provider_init_attempted = True
-
-    try:
-        from app.services.llm_provider import get_provider, provider_kind
-        _provider = get_provider()
-        logger.info("LLMService: %s provider ready", provider_kind())
-    except Exception as e:
-        logger.warning("LLMService: provider init failed (%s); enhancements disabled", e)
-        _provider = None
+    with _provider_lock:
+        # Re-check inside the lock: another thread may have initialized while
+        # we waited to acquire it.
+        if _provider_init_attempted:
+            return _provider
+        try:
+            from app.services.llm_provider import get_provider, provider_kind
+            _provider = get_provider()
+            logger.info("LLMService: %s provider ready", provider_kind())
+        except Exception as e:
+            logger.warning("LLMService: provider init failed (%s); enhancements disabled", e)
+            _provider = None
+        _provider_init_attempted = True
     return _provider
 
 
@@ -100,8 +116,12 @@ def _maybe_invalidate_provider(err: BaseException) -> None:
             "analyze call should succeed.",
             type(err).__name__,
         )
-        _provider = None
-        _provider_init_attempted = False
+        # Reset under the same lock _get_provider uses, so an invalidation can't
+        # race a concurrent re-init into an inconsistent (attempted=True,
+        # provider=None-but-being-built) state.
+        with _provider_lock:
+            _provider = None
+            _provider_init_attempted = False
         # Also drop the factory's cached singleton so the rebuild actually
         # constructs a fresh client (the factory is what we now build through).
         try:

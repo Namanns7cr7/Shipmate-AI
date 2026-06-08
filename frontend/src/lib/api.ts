@@ -15,6 +15,32 @@ const BASE = (import.meta.env.VITE_API_BASE ?? '/api').replace(/\/$/, '');
 
 const gh = axios.create({ baseURL: BASE });
 
+// ── Auth token store + interceptor (OPP-001) ────────────────────────────────
+// Previously every authenticated call passed the GitHub token as
+// `?access_token=…`, which leaks it into server access logs, the Referer
+// header, and browser history. We now hold the token in a module-level store
+// and inject it as `Authorization: Bearer <token>` via a request interceptor —
+// headers don't end up in any of those places. Call setAuthToken() once after
+// the OAuth callback resolves (and on logout with null to clear it).
+let _authToken: string | null = null;
+
+export function setAuthToken(token: string | null): void {
+  _authToken = token;
+}
+
+gh.interceptors.request.use((config) => {
+  if (_authToken) {
+    config.headers = config.headers ?? {};
+    (config.headers as Record<string, string>).Authorization = `Bearer ${_authToken}`;
+  }
+  return config;
+});
+
+// Header builder for the raw fetch() SSE calls (which don't go through axios).
+function authHeaders(extra: Record<string, string> = {}): Record<string, string> {
+  return _authToken ? { ...extra, Authorization: `Bearer ${_authToken}` } : { ...extra };
+}
+
 export const api = {
   // ── Auth ────────────────────────────────────────────────────────────────
 
@@ -29,35 +55,36 @@ export const api = {
   },
 
   async getMe(token: string) {
-    const { data } = await gh.get('/auth/github/me', { params: { access_token: token } });
+    setAuthToken(token);
+    const { data } = await gh.get('/auth/github/me');
     return data.user;
   },
 
   async logout(token: string) {
-    await gh.post('/auth/github/logout', null, { params: { access_token: token } });
+    setAuthToken(token);
+    await gh.post('/auth/github/logout', null);
   },
 
   // ── Repos / Branches ────────────────────────────────────────────────────
 
   async getRepos(token: string): Promise<GitHubRepo[]> {
-    const { data } = await gh.get<{ repos: GitHubRepo[] }>('/auth/github/repos', {
-      params: { access_token: token },
-    });
+    setAuthToken(token);
+    const { data } = await gh.get<{ repos: GitHubRepo[] }>('/auth/github/repos');
     return data.repos;
   },
 
   async getBranches(owner: string, repo: string, token: string): Promise<GitHubBranch[]> {
+    setAuthToken(token);
     const { data } = await gh.get<{ branches: GitHubBranch[] }>(
       `/auth/github/repos/${owner}/${repo}/branches`,
-      { params: { access_token: token } }
     );
     return data.branches;
   },
 
   async getPulls(owner: string, repo: string, token: string): Promise<GitHubPR[]> {
+    setAuthToken(token);
     const { data } = await gh.get<{ pulls: GitHubPR[] }>(
       `/auth/github/repos/${owner}/${repo}/pulls`,
-      { params: { access_token: token } }
     );
     return data.pulls;
   },
@@ -90,7 +117,7 @@ export const api = {
   ): Promise<ShipMateReport | null> {
     const resp = await fetch(`${BASE}/analyze/stream`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify(params),
       signal,
     });
@@ -145,6 +172,53 @@ export const api = {
       timeout: 120_000,
     });
     return data;
+  },
+
+  // Streaming actuate (SSE, OPP-006): fires `onEvent` per pipeline phase
+  // (resolve → coding → gate → branch → commit → pr → done). The terminal
+  // `done` event carries { status, pr_url }. Same body as actuate(); falls
+  // back to throwing on a non-OK response so callers can retry via actuate().
+  async streamActuate(
+    params: {
+      owner: string; repo: string; branch: string; access_token: string;
+      finding: FindingPayload; context?: RepoLensSummary; open_pr?: boolean;
+    },
+    onEvent: (e: { event: string; status?: string; pr_url?: string | null;
+                   files?: string[]; paths?: string[]; phase?: string;
+                   detail?: string }) => void,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const resp = await fetch(`${BASE}/actuate/stream`, {
+      method: 'POST',
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify(params),
+      signal,
+    });
+    if (!resp.ok || !resp.body) {
+      throw new Error(`actuate stream failed: HTTP ${resp.status}`);
+    }
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let sep: number;
+      while ((sep = buffer.indexOf('\n\n')) !== -1) {
+        const frame = buffer.slice(0, sep);
+        buffer = buffer.slice(sep + 2);
+        for (const line of frame.split('\n')) {
+          if (line.startsWith('data: ')) {
+            try {
+              onEvent(JSON.parse(line.slice(6)));
+            } catch {
+              // ignore malformed frame
+            }
+          }
+        }
+      }
+    }
   },
 
   // ── CI watcher ──────────────────────────────────────────────────────────
@@ -206,7 +280,7 @@ export const api = {
   ): Promise<void> {
     const resp = await fetch(`${BASE}/auto-fix/start`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify(params),
       signal,
     });

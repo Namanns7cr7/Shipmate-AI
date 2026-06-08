@@ -55,7 +55,21 @@ export function AgentCard({ agent: a, status = 'pending', progress = 0, stats, c
 
       {status !== 'pending' && (
         <div className="track" style={{ marginTop: 12 }}>
-          <i style={{ width: `${progress}%`, background: `linear-gradient(90deg, ${a.hex}, ${a.hex}aa)` }} />
+          {/* When running with no concrete progress yet, show an indeterminate
+              shimmer at a visible minimum width instead of an empty (0%) bar
+              that reads as "stuck". Once real progress arrives it drives width
+              normally; complete pins to 100%. */}
+          <i
+            className={isRunning && progress === 0 ? 'bar-indeterminate' : undefined}
+            style={{
+              width: isComplete
+                ? '100%'
+                : isRunning && progress === 0
+                ? '35%'
+                : `${Math.max(progress, isRunning ? 6 : 0)}%`,
+              background: `linear-gradient(90deg, ${a.hex}, ${a.hex}aa)`,
+            }}
+          />
         </div>
       )}
 
