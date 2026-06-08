@@ -1,5 +1,5 @@
 import { useState, useCallback, useEffect, useRef } from 'react';
-import { Zap, Bell, BookOpen, Clock, Sparkles } from 'lucide-react';
+import { Zap, Bell, Clock, Sparkles } from 'lucide-react';
 import { useGithubAuth } from './hooks/useGithubAuth';
 import { api } from './lib/api';
 import { LandingPage } from './components/landing/LandingPage';
@@ -10,6 +10,7 @@ import { AnalysisPage } from './pages/AnalysisPage';
 import { ReportsPage } from './pages/ReportsPage';
 import { Spinner } from './components/ui/GitHubConnectButton';
 import { BranchPicker } from './components/ui/BranchPicker';
+import { RepoPicker } from './components/ui/RepoPicker';
 import { AutoFixDrawer } from './components/ui/AutoFixDrawer';
 import type { Page } from './components/app/AppSidebar';
 import type { LogLine } from './components/ui/LiveActivityLog';
@@ -290,9 +291,16 @@ export default function App() {
             </div>
             <span style={{ width: 1, height: 18, background: 'var(--line-2)' }} />
             <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              {repos.length > 0 && (
+                <RepoPicker
+                  repos={repos}
+                  selected={selectedRepo}
+                  onSelect={r => { handleSelectRepo(r); }}
+                  disabled={analyzing}
+                />
+              )}
               {selectedRepo && (
                 <>
-                  <span className="mono chip tone-slate"><BookOpen size={12} /> {selectedRepo.name}</span>
                   <BranchPicker
                     repoFullName={selectedRepo.full_name}
                     defaultBranch={selectedRepo.default_branch}
