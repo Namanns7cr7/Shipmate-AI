@@ -19,58 +19,50 @@ as the inflight registry) and is overridable via SHIPMATE_REPORTS_DB.
 from __future__ import annotations
 
 import logging
-import os
 import sqlite3
-import threading
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+from app.services import sqlite_store
+
 logger = logging.getLogger("shipmate.report_store")
 
-_DEFAULT_DB_PATH = "/tmp/shipmate_reports.db"
+_STORE = "reports"
+_DEFAULT_DB_PATH = "/tmp/shipmate_reports.db"  # kept for docstring/back-ref only
 
-# One connection per thread (sqlite connections aren't safe to share across
-# threads). FastAPI runs blocking handlers in a threadpool, so a thread-local
-# cache keeps each worker thread on its own connection without re-opening.
-_local = threading.local()
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS analysis_runs (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    owner               TEXT NOT NULL,
+    repo                TEXT NOT NULL,
+    branch              TEXT NOT NULL,
+    readiness_score     INTEGER NOT NULL,
+    ship_recommendation TEXT NOT NULL,
+    report_json         TEXT NOT NULL,
+    created_at          TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_runs_repo ON analysis_runs(owner, repo, id);
+"""
+
+# Register with the shared connection manager. SHIPMATE_REPORTS_DB still wins as
+# a legacy override (test fixtures use it); otherwise the file lives under
+# SHIPMATE_STORE_DIR (default /tmp).
+sqlite_store.register(
+    _STORE,
+    filename="shipmate_reports.db",
+    legacy_env="SHIPMATE_REPORTS_DB",
+    schema=_SCHEMA,
+)
 
 
 def _db_path() -> str:
-    return os.getenv("SHIPMATE_REPORTS_DB", _DEFAULT_DB_PATH)
+    """Resolved path for this store (honours SHIPMATE_REPORTS_DB override)."""
+    return sqlite_store.db_path(_STORE)
 
 
 def _conn() -> sqlite3.Connection:
-    cached = getattr(_local, "conn", None)
-    cached_path = getattr(_local, "path", None)
-    path = _db_path()
-    if cached is not None and cached_path == path:
-        return cached
-    conn = sqlite3.connect(path, check_same_thread=False, timeout=5.0)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=5000")
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS analysis_runs (
-            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-            owner               TEXT NOT NULL,
-            repo                TEXT NOT NULL,
-            branch              TEXT NOT NULL,
-            readiness_score     INTEGER NOT NULL,
-            ship_recommendation TEXT NOT NULL,
-            report_json         TEXT NOT NULL,
-            created_at          TEXT NOT NULL
-        )
-        """
-    )
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_runs_repo "
-        "ON analysis_runs(owner, repo, id)"
-    )
-    conn.commit()
-    _local.conn = conn
-    _local.path = path
-    return conn
+    """Per-(thread, path) cached connection from the shared store manager."""
+    return sqlite_store.connect(_STORE)
 
 
 def save_report(report: Any) -> int:

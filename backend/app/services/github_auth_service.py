@@ -9,7 +9,6 @@ Handles the complete GitHub OAuth flow:
 """
 
 import os
-import sqlite3
 import logging
 import httpx
 import secrets
@@ -17,50 +16,56 @@ from typing import Optional, Dict, Any
 from datetime import datetime, timedelta
 from urllib.parse import urlencode
 
+from app.services import sqlite_store
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Persistent OAuth state store (SQLite)
 # ---------------------------------------------------------------------------
-# Using stdlib sqlite3 so no new dependency is required.  The DB file is
-# placed next to this module by default; override with OAUTH_STATE_DB env var.
+# Connection lifecycle + location are owned by the shared sqlite_store. The
+# OAUTH_STATE_DB env var still wins as a legacy override (test fixtures rely on
+# it); otherwise the file lives under SHIPMATE_STORE_DIR (default /tmp) — note
+# this moved OUT of the source tree, where it used to sit next to this module.
 # ---------------------------------------------------------------------------
 
-_DEFAULT_DB_PATH = os.path.join(os.path.dirname(__file__), "oauth_state.db")
+_STORE = "oauth"
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS oauth_states (
+    state        TEXT PRIMARY KEY,
+    redirect_uri TEXT NOT NULL,
+    created_at   REAL NOT NULL
+);
+"""
+
+sqlite_store.register(
+    _STORE,
+    filename="shipmate_oauth.db",
+    legacy_env="OAUTH_STATE_DB",
+    schema=_SCHEMA,
+)
 
 
 def _get_db_path() -> str:
-    return os.getenv("OAUTH_STATE_DB", _DEFAULT_DB_PATH)
+    """Resolved path for the OAuth-state store (honours OAUTH_STATE_DB)."""
+    return sqlite_store.db_path(_STORE)
 
 
-def _get_conn() -> sqlite3.Connection:
-    """Return a thread-safe SQLite connection with WAL mode enabled."""
-    conn = sqlite3.connect(_get_db_path(), check_same_thread=False)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS oauth_states (
-            state       TEXT PRIMARY KEY,
-            redirect_uri TEXT NOT NULL,
-            created_at  REAL NOT NULL
-        )
-        """
-    )
-    conn.commit()
-    return conn
+def _get_conn():
+    """Per-(thread, path) cached connection from the shared store manager.
+    No longer opened/closed per call — the cache owns the lifecycle."""
+    return sqlite_store.connect(_STORE)
 
 
 def _store_state(state: str, redirect_uri: str) -> None:
     """Persist a new OAuth state token."""
     conn = _get_conn()
-    try:
-        conn.execute(
-            "INSERT INTO oauth_states (state, redirect_uri, created_at) VALUES (?, ?, ?)",
-            (state, redirect_uri, datetime.now().timestamp()),
-        )
-        conn.commit()
-    finally:
-        conn.close()
+    conn.execute(
+        "INSERT INTO oauth_states (state, redirect_uri, created_at) VALUES (?, ?, ?)",
+        (state, redirect_uri, datetime.now().timestamp()),
+    )
+    conn.commit()
 
 
 def _consume_state(state: str) -> Optional[str]:
@@ -71,38 +76,32 @@ def _consume_state(state: str) -> Optional[str]:
     or None if it is missing.  Raises ValueError if the token has expired.
     """
     conn = _get_conn()
-    try:
-        row = conn.execute(
-            "SELECT redirect_uri, created_at FROM oauth_states WHERE state = ?",
-            (state,),
-        ).fetchone()
+    row = conn.execute(
+        "SELECT redirect_uri, created_at FROM oauth_states WHERE state = ?",
+        (state,),
+    ).fetchone()
 
-        if row is None:
-            return None
+    if row is None:
+        return None
 
-        redirect_uri, created_ts = row
-        age = datetime.now().timestamp() - created_ts
-        # Always delete — single-use regardless of outcome
-        conn.execute("DELETE FROM oauth_states WHERE state = ?", (state,))
-        conn.commit()
+    redirect_uri, created_ts = row[0], row[1]
+    age = datetime.now().timestamp() - created_ts
+    # Always delete — single-use regardless of outcome
+    conn.execute("DELETE FROM oauth_states WHERE state = ?", (state,))
+    conn.commit()
 
-        if age > 600:  # 10-minute TTL
-            raise ValueError("State parameter expired. Please try again.")
+    if age > 600:  # 10-minute TTL
+        raise ValueError("State parameter expired. Please try again.")
 
-        return redirect_uri
-    finally:
-        conn.close()
+    return redirect_uri
 
 
 def _purge_expired_states() -> None:
     """Remove state tokens older than 10 minutes (housekeeping)."""
     cutoff = datetime.now().timestamp() - 600
     conn = _get_conn()
-    try:
-        conn.execute("DELETE FROM oauth_states WHERE created_at < ?", (cutoff,))
-        conn.commit()
-    finally:
-        conn.close()
+    conn.execute("DELETE FROM oauth_states WHERE created_at < ?", (cutoff,))
+    conn.commit()
 
 
 # ---------------------------------------------------------------------------

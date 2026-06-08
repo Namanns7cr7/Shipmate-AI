@@ -41,20 +41,27 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import sqlite3
-import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
+from app.services import sqlite_store
+
 logger = logging.getLogger("shipmate.inflight_registry")
 
-_DEFAULT_DB_PATH = "/tmp/shipmate_inflight.db"
+# Store identity in the shared connection manager. The legacy env override
+# SHIPMATE_INFLIGHT_DB still wins (test fixtures rely on it); otherwise the file
+# lives under SHIPMATE_STORE_DIR (default /tmp) as shipmate_inflight.db.
+_STORE = "inflight"
+_DEFAULT_DB_PATH = "/tmp/shipmate_inflight.db"  # kept for docstring/back-ref only
 _DEFAULT_CLAIM_TTL_S = 600  # 10min — long enough for Coder + pytest, short enough that crashes self-heal
 
 
 def _db_path() -> str:
-    return os.getenv("SHIPMATE_INFLIGHT_DB", _DEFAULT_DB_PATH)
+    """Resolved path for this store. Delegates to sqlite_store (which honours
+    the SHIPMATE_INFLIGHT_DB legacy override). Retained for callers/tests that
+    introspect the location."""
+    return sqlite_store.db_path(_STORE)
 
 
 # ── Schema ──────────────────────────────────────────────────────────────────
@@ -132,37 +139,27 @@ CREATE TABLE IF NOT EXISTS meta_kv (
 """
 
 
-# ── Connection pool (per-thread) ────────────────────────────────────────────
+# ── Connection (delegated to the shared sqlite_store) ───────────────────────
 
-_thread_local = threading.local()
+sqlite_store.register(
+    _STORE,
+    filename="shipmate_inflight.db",
+    legacy_env="SHIPMATE_INFLIGHT_DB",
+    schema=_SCHEMA,
+)
 
 
 def _conn() -> sqlite3.Connection:
-    """Return a thread-local sqlite connection. Tables created on first use."""
-    cached = getattr(_thread_local, "conn", None)
-    if cached is not None:
-        return cached
-    path = _db_path()
-    # check_same_thread=False because asyncio runs handlers on a worker pool —
-    # the same connection may legitimately move threads. We compensate with
-    # the per-thread cache above; same connection is never used by two
-    # threads simultaneously in practice because we open once per thread.
-    conn = sqlite3.connect(path, check_same_thread=False, timeout=5.0)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=5000")
-    conn.execute("PRAGMA foreign_keys=ON")
-    conn.row_factory = sqlite3.Row
-    # Idempotent schema apply. CREATE TABLE IF NOT EXISTS makes this safe.
-    conn.executescript(_SCHEMA)
-    conn.commit()
-    _thread_local.conn = conn
-    return conn
+    """Per-(thread, path) cached connection from the shared store manager.
+    Shared PRAGMAs (WAL, busy_timeout, foreign_keys) + this store's schema are
+    applied on first open."""
+    return sqlite_store.connect(_STORE)
 
 
 def init_db() -> None:
     """Eager-create tables. Called from FastAPI lifespan startup so the
     first request doesn't pay the schema-create cost."""
-    _conn()  # side-effect: creates tables
+    sqlite_store.init_schema(_STORE)
     logger.info("InflightRegistry initialized at %s", _db_path())
 
 

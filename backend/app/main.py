@@ -380,10 +380,13 @@ async def _lifespan(app: "FastAPI"):
     Shutdown: nothing to flush — sqlite commits are synchronous per write."""
     # --- startup ---
     try:
-        from app.services import inflight_registry as _ir
-        _ir.init_db()
+        # One call creates every registered sqlite store (inflight, reports,
+        # oauth) with the shared connection/PRAGMA/location policy. The route
+        # imports above have already executed each store module's register().
+        from app.services import sqlite_store as _store
+        _store.init_all()
     except Exception as e:  # pragma: no cover - startup best-effort
-        logger.warning("inflight_registry init failed: %s", e)
+        logger.warning("sqlite_store init_all failed: %s", e)
     try:
         from app.services.ci_watcher import CIWatcher
         resumed = CIWatcher.resume_from_db()

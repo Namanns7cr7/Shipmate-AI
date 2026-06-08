@@ -89,9 +89,13 @@ class TestSecurityHeaders:
 class TestReportStore:
     def test_save_list_get_roundtrip(self, tmp_path, monkeypatch):
         monkeypatch.setenv("SHIPMATE_REPORTS_DB", str(tmp_path / "reports.db"))
-        # Fresh thread-local connection for the new path.
+        # Connection lifecycle now lives in the shared sqlite_store. Its
+        # connect() is path-aware (re-opens when the resolved path changes), so
+        # repointing SHIPMATE_REPORTS_DB above is enough; close_all() just
+        # guarantees a clean handle for this test.
         from app.services import report_store as rs
-        rs._local.__dict__.clear()
+        from app.services import sqlite_store
+        sqlite_store.close_all()
 
         class _Repo:
             owner, name, branch = "acme", "widget", "main"
