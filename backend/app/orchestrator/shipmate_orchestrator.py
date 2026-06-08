@@ -112,6 +112,17 @@ class ShipMateOrchestrator:
         """Score + assemble the final ShipMateReport from the four agent outputs.
         Shared by run() (sync) and run_stream() (SSE) so the assembly logic lives
         in exactly one place."""
+        # Anti-recurrence: strip findings that are already-resolved in the repo
+        # or dismissed/shipped in the journal BEFORE scoring + assembly. The
+        # analyze pipeline had no equivalent of the Build path's already_built
+        # gate, so it kept re-proposing shipped work (token-in-query after the
+        # routes already use the header dep, "persist results" after save_report
+        # is wired in) and keyword false-positives. Done here so both run() and
+        # run_stream() get it, and so the SCORE reflects the filtered findings.
+        plan_forge_out, guardrail_out, testpilot_out = self._filter_findings(
+            repo_context, plan_forge_out, guardrail_out, testpilot_out
+        )
+
         score_breakdown = ScoringService.calculate(
             repo_lens_out, plan_forge_out, guardrail_out, testpilot_out
         )
@@ -161,3 +172,71 @@ class ShipMateOrchestrator:
             generated_at=datetime.now(timezone.utc).isoformat(),
             ai_enhanced=ai_enhanced,
         )
+
+    def _filter_findings(self, repo_context, plan_forge_out, guardrail_out, testpilot_out):
+        """Apply the shared finding_critic gates to the analyze-side outputs so
+        the diagnostic agents stop re-surfacing already-resolved / dismissed /
+        false-positive findings — the same protection the Build path's
+        already_built + journal gates give the Opportunity pipeline.
+
+        Three passes per agent, all fail-open (any error keeps the findings):
+          1. already-resolved prefilter — deterministic, scans the FULL corpus
+             for proof the demanded control already exists.
+          2. journal suppression — drop dismissed/shipped signatures.
+          3. LLM critic verify (GuardRail only) — refute remaining false
+             positives against the exact code blob.
+        Returns the three (possibly-filtered) agent outputs."""
+        try:
+            from app.services import finding_critic as fc
+        except Exception:
+            return plan_forge_out, guardrail_out, testpilot_out
+
+        file_tree = repo_context.get("file_tree") or []
+        key_files = repo_context.get("key_files") or {}
+        info = repo_context.get("repo_info") or {}
+        owner = (
+            info.get("owner", {}).get("login", "")
+            if isinstance(info.get("owner"), dict) else info.get("owner", "")
+        )
+        full_name = info.get("full_name", "") or (
+            f"{owner}/{info.get('name','')}" if owner and info.get("name") else ""
+        )
+
+        # GuardRail security findings — the noisiest surface.
+        try:
+            f = guardrail_out.findings
+            f = fc.filter_already_resolved(f, file_tree, key_files, kind="guardrail")
+            f = fc.filter_suppressed(f, "guardrail", full_name)
+            # LLM critic verify against the real code blob (fail-open inside).
+            try:
+                from app.services.llm_service import LLMService
+                provider = LLMService.provider()
+                code_blob = LLMService.opportunity_code_blob(repo_context) if provider else ""
+                if provider and code_blob:
+                    f = fc.verify_findings(f, code_blob, provider)
+            except Exception:
+                pass
+            guardrail_out.findings = f
+        except Exception as e:  # pragma: no cover - defensive
+            pass
+
+        # PlanForge blockers (milestones are roadmap items, not 'findings' — left
+        # to the Build/Opportunity pipeline's own already_built gate).
+        try:
+            b = plan_forge_out.blockers
+            b = fc.filter_already_resolved(b, file_tree, key_files, kind="blocker")
+            b = fc.filter_suppressed(b, "blocker", full_name)
+            plan_forge_out.blockers = b
+        except Exception:
+            pass
+
+        # TestPilot suggested tests — suppress dismissed/shipped. SuggestedTest
+        # uses `.name`, not `.title`, so adapt to the signature scheme.
+        try:
+            tests = testpilot_out.suggested_tests
+            tests = fc.filter_suppressed_by_name(tests, "test", full_name)
+            testpilot_out.suggested_tests = tests
+        except Exception:
+            pass
+
+        return plan_forge_out, guardrail_out, testpilot_out

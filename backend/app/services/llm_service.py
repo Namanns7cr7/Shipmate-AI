@@ -450,7 +450,16 @@ class LLMService:
                 context, max_files=6, max_chars_per_file=3500,
                 prefer=("auth", "cors", "main", "security", ".env", "config", "routes"),
             )
-            user = _user_prompt_guardrail_discovery(context, base, code_blob)
+            # Recurrence-aware (same as PlanForge/Opportunity discovery): tell the
+            # LLM what already exists (capability digest) and what's already
+            # shipped/dismissed (journaled guardrail+blocker titles) so it stops
+            # re-inventing fixed findings under new wording.
+            capability_digest = _capability_digest(context)
+            exclude_titles = _journaled_titles(context, ("guardrail::", "blocker::"))
+            user = _user_prompt_guardrail_discovery(
+                context, base, code_blob,
+                capability_digest=capability_digest, exclude_titles=exclude_titles,
+            )
             discovery = provider.invoke_structured_sync(
                 system_prompt=_DISCOVERY_GUARDRAIL_SYSTEM,
                 user_prompt=user,
@@ -935,15 +944,34 @@ def _user_prompt_plan_discovery(
 
 def _user_prompt_guardrail_discovery(
     context: Dict[str, Any], base: GuardRailOutput, code_blob: str,
+    *, capability_digest: str = "", exclude_titles: Optional[List[str]] = None,
 ) -> str:
     base_titles = [f.title for f in base.findings]
+    exclude_titles = exclude_titles or []
+    digest_block = f"\n\n# {capability_digest}" if capability_digest else ""
+    exclude_block = ""
+    if exclude_titles:
+        exclude_block = (
+            "\n\n# ALREADY SHIPPED / DISMISSED security findings — the control "
+            "these ask for is ALREADY PRESENT. DO NOT propose them again or "
+            "anything overlapping (e.g. don't re-flag 'token in query param' if "
+            "a header/session auth dependency already exists):\n"
+            + "\n".join(f"- {t}" for t in exclude_titles[:60])
+        )
     return (
-        f"# Repo summary\n{_repo_summary(context)}\n\n"
+        f"# Repo summary\n{_repo_summary(context)}"
+        f"{digest_block}"
+        f"{exclude_block}\n\n"
         f"# Heuristic findings already covered (DO NOT duplicate)\n"
         + ("\n".join(f"- {t}" for t in base_titles) or "(none)")
         + f"\n\n# Repo code\n{code_blob[:18000]}\n\n"
         "Read the code carefully. Emit up to 5 NEW findings the regex pass "
-        "missed. Cite the file + specific construct in each rationale. "
+        "missed AND that are NOT in the ALREADY-PRESENT / DO-NOT-PROPOSE lists "
+        "above. A finding is only valid if the control it demands is genuinely "
+        "ABSENT from the code shown — if the code already implements it (a "
+        "session/header auth dependency, a sqlite-backed state store, a "
+        "save_report call, a sanitiser, a security-headers middleware), DO NOT "
+        "emit it. Cite the file + specific construct in each rationale. "
         "Return ONLY the GuardRailDiscovery schema."
     )
 
@@ -1018,13 +1046,14 @@ def _capability_digest(context: Dict[str, Any]) -> str:
     return "\n\n".join(parts) if parts else "(no capability digest available)"
 
 
-def _journaled_milestone_titles(context: Dict[str, Any]) -> List[str]:
-    """Titles of milestones already in the journal (dismissed / shipped /
-    in_progress) for this repo — fed to the plan-discovery prompt as
-    DO-NOT-PROPOSE. Unlike filter_suppressed (which only HIDES dismissed/shipped
-    from the visible list), this also excludes in_progress so a milestone with an
-    open PR isn't re-proposed while its fix is in flight. Best-effort: [] on any
-    error or missing repo."""
+def _journaled_titles(context: Dict[str, Any], namespaces: tuple) -> List[str]:
+    """Titles already in the journal (dismissed / shipped / in_progress) for this
+    repo, restricted to the given signature `namespaces` (e.g. ('milestone::',)
+    or ('guardrail::', 'blocker::')). Fed to a discovery prompt as DO-NOT-PROPOSE
+    so the stateless LLM stops re-inventing shipped work under new wording.
+    Unlike filter_suppressed (which only HIDES dismissed/shipped from the visible
+    list), this also excludes in_progress so a finding with an open PR isn't
+    re-proposed mid-flight. Best-effort: [] on any error or missing repo."""
     repo_full = (context.get("repo_info") or {}).get("full_name", "") or ""
     if not repo_full:
         return []
@@ -1034,16 +1063,20 @@ def _journaled_milestone_titles(context: Dict[str, Any]) -> List[str]:
         titles: List[str] = []
         for r in rows:
             sig = str(r.get("finding_sig", ""))
-            # milestone::<title>::<file> — only the milestone namespace.
-            if not sig.startswith("milestone::"):
+            if not any(sig.startswith(ns) for ns in namespaces):
                 continue
             parts = sig.split("::")
             if len(parts) >= 2 and parts[1]:
                 titles.append(parts[1])
         return titles
     except Exception as e:  # pragma: no cover - defensive
-        logger.debug("_journaled_milestone_titles failed (%s)", e)
+        logger.debug("_journaled_titles failed (%s)", e)
         return []
+
+
+def _journaled_milestone_titles(context: Dict[str, Any]) -> List[str]:
+    """Milestone-namespace journaled titles (back-compat wrapper)."""
+    return _journaled_titles(context, ("milestone::",))
 
 
 def _user_prompt_opportunity_discovery(

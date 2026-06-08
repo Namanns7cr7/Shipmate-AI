@@ -91,6 +91,111 @@ def filter_suppressed(findings: List[Any], kind: str, repo_full_name: str) -> Li
     return kept
 
 
+def filter_suppressed_by_name(findings: List[Any], kind: str, repo_full_name: str) -> List[Any]:
+    """Like filter_suppressed, but for findings that carry `.name` instead of
+    `.title` (TestPilot's SuggestedTest). The signature scheme keys on the title
+    slot, so we map `.name` → title and `.target_file` → file. Order preserved."""
+    suppressed = suppressed_signatures(repo_full_name)
+    if not suppressed:
+        return findings
+    kept = []
+    for f in findings:
+        sig = finding_signature(
+            kind, getattr(f, "name", "") or "", getattr(f, "target_file", None)
+        )
+        if sig in suppressed:
+            logger.info("suppressing journaled test finding: %s", sig)
+            continue
+        kept.append(f)
+    return kept
+
+
+# ── Already-resolved prefilter (deterministic, FULL corpus) ──────────────────
+# The analyze pipeline (GuardRail/PlanForge/TestPilot) had NO equivalent of the
+# Build path's `already_built` gate, so it re-proposed controls that are already
+# present — e.g. "Access token leaked in query param" after /me + /repos already
+# moved to Depends(resolve_access_token), or "Persist results to SQLite" after
+# report_store.save_report is already wired in. The LLM critic only sees a
+# truncated blob and is too conservative to refute a *security* finding, so this
+# scans the FULL repo corpus for proof the demanded control already exists and
+# drops the finding deterministically. Same philosophy as
+# opportunity_critic.already_built — don't ask the LLM what inspection decides.
+
+import re as _re2
+
+# (trigger phrases in the finding's title/description, regex that PROVES the
+# control already exists in the corpus). Conservative: only well-known controls
+# with an unambiguous code signature. Targets the exact recurring analyze-side
+# false-positives the loop kept surfacing.
+_RESOLVED_PROOFS = (
+    # token-in-query-param: refuted once the token routes resolve via the shared
+    # header-preferred dependency.
+    (("token leaked in query", "access token leaked", "token in query param",
+      "token via query", "access_token query param", "query parameter on /"),
+     _re2.compile(r"Depends\(\s*resolve_access_token\s*\)|resolve_access_token", _re2.IGNORECASE)),
+    # OAuth state in-memory: refuted once a sqlite/db-backed state store exists.
+    (("oauth state in-memory", "state not validated", "state in memory",
+      "csrf state not persisted", "oauth state stored in memory"),
+     _re2.compile(r"oauth_states|_consume_state|_store_state", _re2.IGNORECASE)),
+    # results not persisted: refuted once report_store.save_report is wired in.
+    (("persist analysis result", "persist analysis results", "results not persisted",
+      "persist results to sqlite", "store analysis results", "no analysis history"),
+     _re2.compile(r"save_report\(|report_store\.", _re2.IGNORECASE)),
+    # body sanitization missing: refuted once the body is actually read+scanned.
+    (("request body not sanitized", "body sanitization", "skips request body",
+      "no body sanitization", "body not validated"),
+     _re2.compile(r"await request\.body\(\)|sanitize_input_middleware", _re2.IGNORECASE)),
+    # wildcard CORS: refuted once an explicit origin allowlist + validation exists.
+    (("wildcard cors", "permissive cors", "cors allows any origin", "cors *"),
+     _re2.compile(r"_validate_origin|_is_origin_allowed|ALLOWED_ORIGINS", _re2.IGNORECASE)),
+    # missing security headers: refuted once the headers middleware is present.
+    (("missing security headers", "no security headers", "hsts not set",
+      "x-frame-options missing", "clickjacking"),
+     _re2.compile(r"security_headers_middleware|strict-transport-security|x-frame-options", _re2.IGNORECASE)),
+    # webhook signature unverified: refuted once HMAC verification is present.
+    (("webhook signature not verified", "unverified webhook", "webhook not authenticated",
+      "no webhook signature"),
+     _re2.compile(r"_verify_github_webhook_signature|x-hub-signature|hmac\.compare_digest", _re2.IGNORECASE)),
+)
+
+
+def _corpus_blob(file_tree: List[Any], key_files: dict) -> str:
+    """Lowercased concat of every file body + the tree — the full search surface
+    (NOT the truncated LLM blob). Mirrors opportunity_critic._corpus."""
+    parts: List[str] = list(file_tree or [])
+    parts.extend((key_files or {}).values())
+    return "\n".join(p for p in parts if p).lower()
+
+
+def filter_already_resolved(
+    findings: List[Any], file_tree: List[Any], key_files: dict, kind: str = "",
+) -> List[Any]:
+    """Drop findings whose demanded control ALREADY EXISTS in the full repo
+    corpus. Conservative: only fires when a finding's text matches a known
+    trigger AND the proof-regex matches somewhere in the corpus. Fail-open:
+    a finding we can't decide on is kept. Order preserved."""
+    corpus = _corpus_blob(file_tree, key_files)
+    if not corpus:
+        return findings
+    kept = []
+    for f in findings:
+        text = (
+            f"{getattr(f, 'title', '') or ''}\n{getattr(f, 'description', '') or ''}"
+        ).lower()
+        refuted = False
+        for phrases, proof in _RESOLVED_PROOFS:
+            if any(ph in text for ph in phrases) and proof.search(corpus):
+                logger.info(
+                    "already-resolved prefilter dropped %r finding: control "
+                    "present (%r)", getattr(f, "title", ""), phrases[0],
+                )
+                refuted = True
+                break
+        if not refuted:
+            kept.append(f)
+    return kept
+
+
 # ── Verification (the critic pass) ───────────────────────────────────────────
 
 class _Verdict(BaseModel):

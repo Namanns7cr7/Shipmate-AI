@@ -85,6 +85,50 @@ def _has_insecure_http_with_auth(combined_lower: str) -> bool:
         return False
     return _NONLOCAL_HTTP_RE.search(combined_lower) is not None
 
+
+# A genuine JWT signing call from a real JWT library — NOT the bare substring
+# "jwt". The old check (`"jwt" in combined and "secret" in combined`) fired on
+# any file that merely mentioned the word jwt (a comment, a doc, even GuardRail's
+# own finding text), producing a chronic false positive in repos that don't use
+# JWT at all (ShipMate uses GitHub OAuth, no JWT anywhere).
+_JWT_SIGN_RE = re.compile(
+    r"\bjwt\.(?:encode|sign)\s*\(|"          # pyjwt: jwt.encode(...)
+    r"\bjsonwebtoken\b|\.sign\s*\([^)]*\bsecret\b|"  # node jsonwebtoken
+    r"\bfrom\s+jose\b|\bimport\s+jwt\b|\brequire\(['\"]jsonwebtoken['\"]\)",
+    re.IGNORECASE,
+)
+# A hardcoded secret literal feeding a sign call: `secret="..."` / `algorithm=`
+# alongside the sign. Conservative — only flag when both a real sign call AND a
+# string-literal secret are present (env-loaded secrets are the correct pattern).
+_JWT_LITERAL_SECRET_RE = re.compile(
+    r"(?:secret|secret_key|signing_key)\s*[=:]\s*[\"'][^\"']{6,}[\"']",
+    re.IGNORECASE,
+)
+
+
+def _has_real_jwt_secret_issue(content: str) -> bool:
+    """True only if the code genuinely SIGNS a JWT with a hardcoded (string-
+    literal) secret rather than an env-loaded one. Line-by-line + defensive-
+    marker skipping, same false-negative bias as _has_real_dynamic_exec: a bare
+    mention of 'jwt'/'secret' in prose or a denylist never trips this."""
+    has_sign = False
+    has_literal_secret = False
+    for raw in content.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "`" in line:
+            continue
+        lowered = line.lower()
+        if any(marker in lowered for marker in _DEFENSIVE_LINE_MARKERS):
+            continue
+        if _JWT_SIGN_RE.search(line):
+            has_sign = True
+        if _JWT_LITERAL_SECRET_RE.search(line) and "os.environ" not in lowered \
+                and "getenv" not in lowered and "process.env" not in lowered:
+            has_literal_secret = True
+    # Require BOTH a real signing call and a literal-secret assignment. A repo
+    # that signs JWTs but loads the secret from env is doing it RIGHT.
+    return has_sign and has_literal_secret
+
 # Patterns that suggest hardcoded secrets
 _SECRET_PATTERNS = [
     (r'(?i)(password|passwd|pwd)\s*=\s*["\'][^"\']{6,}["\']', "Hardcoded password"),
@@ -182,14 +226,20 @@ class GuardRailAgent(BaseAgent):
         # ── Auth risks ─────────────────────────────────────────────────────
         combined = " ".join(kf.values()).lower()
 
-        if "jwt" in combined and "secret" in combined and "env" not in combined[:500]:
+        # JWT: only flag a GENUINE signing call with a hardcoded literal secret.
+        # The old `"jwt" in combined and "secret" in combined` substring test
+        # fired in repos with no JWT at all (e.g. this one — GitHub OAuth, zero
+        # JWT) whenever any file merely mentioned the words, producing a chronic
+        # false positive. _has_real_jwt_secret_issue requires jwt.encode/sign +
+        # a string-literal secret that isn't env-loaded.
+        if any(_has_real_jwt_secret_issue(c) for c in kf.values() if c):
             auth_risks.append("JWT secret may not be loaded from environment variables")
             findings.append(SecurityFinding(
                 id=f"SEC-{fid:03d}",
                 title="JWT secret not loaded from environment",
                 severity=Severity.HIGH,
                 category="auth",
-                description="JWT secret appears to be hardcoded rather than injected via environment variable.",
+                description="A JWT is signed with a hardcoded string-literal secret rather than one injected via environment variable.",
                 recommendation="Load JWT secret exclusively from `os.environ` / `process.env` and never commit it.",
             ))
             fid += 1
