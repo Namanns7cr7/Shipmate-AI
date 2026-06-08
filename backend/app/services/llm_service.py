@@ -382,8 +382,22 @@ class LLMService:
             return base
 
         try:
-            code_blob = _repo_code_blob(context, max_files=5, max_chars_per_file=3500)
-            user = _user_prompt_plan_discovery(context, base, code_blob)
+            # Wider corpus + capability digest + journaled exclusions — same
+            # recurrence defenses the Opportunity (Build) path already has. The
+            # narrow 5-file blob + no digest is why milestones kept recurring in
+            # Reports→PlanForge: the model never saw what already exists and had
+            # no memory of what it proposed before.
+            code_blob = _repo_code_blob(
+                context, max_files=8, max_chars_per_file=3500,
+                prefer=("routes", "main", "api", "service", "agent",
+                        "orchestrator", "components", "pages", "hooks", "lib"),
+            )
+            capability_digest = _capability_digest(context)
+            exclude_titles = _journaled_milestone_titles(context)
+            user = _user_prompt_plan_discovery(
+                context, base, code_blob,
+                capability_digest=capability_digest, exclude_titles=exclude_titles,
+            )
             discovery = provider.invoke_structured_sync(
                 system_prompt=_DISCOVERY_PLAN_SYSTEM,
                 user_prompt=user,
@@ -391,8 +405,13 @@ class LLMService:
                 deployment_hint="smart",  # discovery is the slow + smart pass
             )
             merged = _merge_plan_discovery(base, discovery)
-            # Suppress dismissed/shipped blockers (the actionable findings that
-            # flow into the journal/actuate path). Critic verifies them too.
+            # Suppress dismissed/shipped MILESTONES (the recurring ones the user
+            # sees) AND blockers. Both flow through the journal/actuate path.
+            # Distinct kinds so a milestone and a blocker with the same title get
+            # separate journal rows.
+            merged.milestones = cls._refine_findings(
+                merged.milestones, "milestone", context, code_blob, provider,
+            )
             merged.blockers = cls._refine_findings(
                 merged.blockers, "blocker", context, code_blob, provider,
             )
@@ -750,19 +769,23 @@ _DISCOVERY_PLAN_SYSTEM = (
     "  • CODE-QUALITY TWEAKS — refactors that reduce duplication or risk "
     "    (extract a shared client, type-narrow returns, replace magic strings).\n"
     "  • BUGS — concrete defects in the actual code paths.\n\n"
-    "Examples of GOOD discoveries (one per bucket — aim for this ratio):\n"
-    "  [FEATURE]      'no /api/repos/{repo}/history endpoint — store past "
-    "                  reports so the dashboard can show readiness over time'\n"
-    "  [IMPROVEMENT]  'analyze flow batches all 4 agents into one HTTP "
-    "                  response — stream per-agent results via SSE so the "
-    "                  AnalysisPage progress bar reflects real backend state'\n"
-    "  [TWEAK]        'api.ts duplicates the Authorization header in every "
-    "                  method — extract an axios client with default headers'\n"
-    "  [BUG]          'analyzer.py uses asyncio.gather without a timeout, "
-    "                  one slow agent can hang the whole request'\n"
-    "  [FEATURE]      'OAuth state is stored in-memory; persist to SQLite or "
-    "                  Redis so users don\\'t lose their session on uvicorn reload'\n\n"
+    "Examples of GOOD discoveries (SHAPE only — judge against THIS repo's code "
+    "AND the ALREADY-EXISTS lists in the user message; NEVER propose something "
+    "those lists show is done):\n"
+    "  [FEATURE]      'function/endpoint X in <file> has no batch variant — "
+    "                  callers loop one-at-a-time; add a bulk path'\n"
+    "  [IMPROVEMENT]  'handler Y in <file> retries on every error incl. 4xx — "
+    "                  only retry 5xx/timeout to stop hammering a failing dep'\n"
+    "  [TWEAK]        'two functions in <file> duplicate the same parse block — "
+    "                  extract a shared helper'\n"
+    "  [BUG]          'coro in <file> calls asyncio.gather without a timeout; "
+    "                  one slow task hangs the whole request'\n\n"
     "Examples of BAD discoveries (DO NOT EMIT):\n"
+    "  - ANYTHING in the ALREADY-EXISTS routes/modules lists given in the user "
+    "message (history endpoints, SSE streaming, axios client, OAuth-state "
+    "persistence, caching, provider factories, etc. may ALREADY be built — "
+    "CHECK the lists first).\n"
+    "  - anything in the DO-NOT-PROPOSE list (already shipped/dismissed/in-flight).\n"
     "  - 'add tests' / 'set up CI/CD' / 'write docs' / 'containerize' — already in heuristic base\n"
     "  - vague advice not tied to specific code\n"
     "  - duplicates of milestones already listed\n"
@@ -772,8 +795,8 @@ _DISCOVERY_PLAN_SYSTEM = (
     "'infra' for product-improvement tweaks, 'docs' only for genuine "
     "developer-facing gaps. Emit blockers ONLY for issues that genuinely "
     "BLOCK shipping (broken paths, severe gaps); features and tweaks should "
-    "be milestones, not blockers. Quality over quantity — fewer balanced "
-    "items beats five bug-only ones."
+    "be milestones, not blockers. Bias toward NOVELTY — fewer balanced, "
+    "not-already-done items beat five obvious ones."
 )
 
 _DISCOVERY_GUARDRAIL_SYSTEM = (
@@ -880,19 +903,32 @@ _DISCOVERY_OPPORTUNITY_SYSTEM = (
 
 def _user_prompt_plan_discovery(
     context: Dict[str, Any], base: PlanForgeOutput, code_blob: str,
+    *, capability_digest: str = "", exclude_titles: Optional[List[str]] = None,
 ) -> str:
     base_titles = [m.title for m in base.milestones]
     base_blocker_titles = [b.title for b in base.blockers]
+    exclude_titles = exclude_titles or []
+    digest_block = f"\n\n# {capability_digest}" if capability_digest else ""
+    exclude_block = ""
+    if exclude_titles:
+        exclude_block = (
+            "\n\n# ALREADY SHIPPED / DISMISSED / IN-FLIGHT milestones — DO NOT "
+            "propose these again or anything overlapping them:\n"
+            + "\n".join(f"- {t}" for t in exclude_titles[:60])
+        )
     return (
-        f"# Repo summary\n{_repo_summary(context)}\n\n"
+        f"# Repo summary\n{_repo_summary(context)}"
+        f"{digest_block}"
+        f"{exclude_block}\n\n"
         f"# Heuristic milestones already covered (DO NOT duplicate)\n"
         + ("\n".join(f"- {t}" for t in base_titles) or "(none)")
         + f"\n\n# Heuristic blockers already covered (DO NOT duplicate)\n"
         + ("\n".join(f"- {t}" for t in base_blocker_titles) or "(none)")
         + f"\n\n# Repo code\n{code_blob[:18000]}\n\n"
         "Now emit up to 5 NEW milestones and up to 3 NEW blockers that the "
-        "heuristic missed. Each item MUST cite a specific file path or code "
-        "construct in its rationale. Skip anything generic. Return ONLY the "
+        "heuristic missed AND that are NOT in the ALREADY-EXISTS / DO-NOT-PROPOSE "
+        "lists above. Each item MUST cite a specific file path or code construct "
+        "in its rationale. Skip anything generic or already done. Return ONLY the "
         "PlanForgeDiscovery schema."
     )
 
@@ -980,6 +1016,34 @@ def _capability_digest(context: Dict[str, Any]) -> str:
                      "(do NOT propose creating these)\n"
                      + "\n".join(f"- {m}" for m in mod_list))
     return "\n\n".join(parts) if parts else "(no capability digest available)"
+
+
+def _journaled_milestone_titles(context: Dict[str, Any]) -> List[str]:
+    """Titles of milestones already in the journal (dismissed / shipped /
+    in_progress) for this repo — fed to the plan-discovery prompt as
+    DO-NOT-PROPOSE. Unlike filter_suppressed (which only HIDES dismissed/shipped
+    from the visible list), this also excludes in_progress so a milestone with an
+    open PR isn't re-proposed while its fix is in flight. Best-effort: [] on any
+    error or missing repo."""
+    repo_full = (context.get("repo_info") or {}).get("full_name", "") or ""
+    if not repo_full:
+        return []
+    try:
+        from app.services import inflight_registry as ir
+        rows = ir.journal_list(repo_full_name=repo_full)
+        titles: List[str] = []
+        for r in rows:
+            sig = str(r.get("finding_sig", ""))
+            # milestone::<title>::<file> — only the milestone namespace.
+            if not sig.startswith("milestone::"):
+                continue
+            parts = sig.split("::")
+            if len(parts) >= 2 and parts[1]:
+                titles.append(parts[1])
+        return titles
+    except Exception as e:  # pragma: no cover - defensive
+        logger.debug("_journaled_milestone_titles failed (%s)", e)
+        return []
 
 
 def _user_prompt_opportunity_discovery(

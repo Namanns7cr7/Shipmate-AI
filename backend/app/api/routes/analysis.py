@@ -120,6 +120,12 @@ async def analyze(request: AnalyzeRequest):
             pr_number=request.pr_number,
             feature_context=request.feature_context or "",
         )
+        # Widen the corpus with route/service/agent source so PlanForge discovery
+        # (and the capability digest) can SEE what already exists — otherwise it
+        # re-proposes built features (history endpoint, SSE, etc.) every run.
+        await RepoAnalysisService.enrich_build_corpus(
+            request.access_token, request.owner, request.repo, repo_context,
+        )
     except Exception as e:
         raise HTTPException(
             status_code=502,
@@ -162,6 +168,9 @@ async def analyze_stream(request: AnalyzeRequest):
             branch=request.branch,
             pr_number=request.pr_number,
             feature_context=request.feature_context or "",
+        )
+        await RepoAnalysisService.enrich_build_corpus(
+            request.access_token, request.owner, request.repo, repo_context,
         )
     except Exception as e:
         raise HTTPException(
