@@ -15,36 +15,84 @@ from typing import Optional
 import httpx
 from fastapi import Header, HTTPException, Query
 
+from app.services import session_store
+
 logger = logging.getLogger("shipmate.deps")
 
 _GH = "https://api.github.com"
 _PERM_TIMEOUT = httpx.Timeout(10.0)
 
 
-# ── Token resolution (header preferred, legacy query fallback) ───────────────
+# ── Credential resolution (session vault → real token) ───────────────────────
+
+def resolve_credential(value: Optional[str]) -> Optional[str]:
+    """Turn an opaque value into a real GitHub token.
+
+    The frontend holds a session id (`shipmate_sess_…`) that references the
+    vaulted token, never the raw token itself. This resolves that id back to
+    the token at the auth boundary so every downstream service keeps receiving
+    a real token (no signature changes anywhere).
+
+    A value that ISN'T a session id passes through untouched — that's the
+    back-compat path for legacy clients (and tests) that still send a raw
+    `ghp_…`/`token` string. Returns None for an empty/unknown/expired session."""
+    if not value:
+        return None
+    if session_store.looks_like_session(value):
+        return session_store.resolve(value)   # None if unknown/expired
+    return value  # raw token — back-compat passthrough
+
+
+def require_body_credential(value: Optional[str]) -> str:
+    """Resolve a credential carried in a request BODY (request.access_token)
+    into a real token, raising 400/401 like the routes already do.
+
+    Body-token routes call this once at the top and overwrite
+    request.access_token with the returned real token, so every downstream
+    service stays unchanged. Raises 400 if nothing was supplied, 401 if a
+    session id was supplied but didn't resolve (expired/unknown)."""
+    if not value:
+        raise HTTPException(status_code=400, detail="access_token is required.")
+    resolved = resolve_credential(value)
+    if not resolved:
+        raise HTTPException(
+            status_code=401,
+            detail="Session expired or invalid. Please sign in again.",
+        )
+    return resolved
+
 
 def resolve_access_token(
     authorization: Optional[str] = Header(default=None),
     access_token: Optional[str] = Query(default=None),
 ) -> str:
     """Resolve the GitHub token from the Authorization header (preferred) or the
-    legacy ?access_token= query param (fallback).
+    legacy ?access_token= query param (fallback). The header/param now carries
+    an opaque SESSION ID which is resolved to the real token via the vault;
+    a raw token is still accepted (back-compat) and passed through.
 
     Passing the token as a query param leaks it into server access logs, the
     Referer header, and browser history (OPP-001). New clients send
-    `Authorization: Bearer <token>`; the query param is still accepted so
+    `Authorization: Bearer <session_id>`; the query param is still accepted so
     in-flight sessions keep working during migration."""
+    candidate: Optional[str] = None
     if authorization:
         parts = authorization.split(" ", 1)
         if len(parts) == 2 and parts[0].lower() in ("bearer", "token"):
             tok = parts[1].strip()
             if tok:
-                return tok
-    if access_token:
-        return access_token
+                candidate = tok
+    if candidate is None and access_token:
+        candidate = access_token
+
+    resolved = resolve_credential(candidate)
+    if resolved:
+        return resolved
+    # A session id that didn't resolve (expired/unknown) is a 401 — distinct
+    # from "nothing supplied" but the same status to the client.
     raise HTTPException(
         status_code=401,
-        detail="Missing access token. Send 'Authorization: Bearer <token>'.",
+        detail="Missing or invalid access credential. Send 'Authorization: Bearer <session_id>'.",
     )
 
 

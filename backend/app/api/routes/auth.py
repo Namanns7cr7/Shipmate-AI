@@ -4,6 +4,7 @@ import os
 from fastapi import APIRouter, Depends, HTTPException, Query
 from app.services.github_auth_service import GitHubAuthService
 from app.services.github_api_service import GitHubAPIService
+from app.services import session_store
 from app.schemas.api_schemas import RepoSummary
 from app.api.deps import resolve_access_token
 
@@ -32,9 +33,18 @@ async def github_callback(code: str = Query(...), state: str = Query(...)):
         if not access_token:
             raise HTTPException(status_code=400, detail="GitHub did not return an access token.")
         user_profile = await GitHubAuthService.get_user_profile(access_token)
+        # Vault the raw token and hand the client an OPAQUE session id instead.
+        # The raw token never crosses the network boundary again — the frontend
+        # stores `session_id`, sends it as the bearer credential, and the auth
+        # boundary resolves it back to the token server-side.
+        session_id = session_store.mint(access_token, scope=token_data.get("scope"))
         return {
             "success": True,
-            "access_token": access_token,
+            "session_id": session_id,
+            # `access_token` retained in the response for one migration window so
+            # an older frontend build still authenticates; new clients use
+            # session_id. Remove after the frontend ships the session_id path.
+            "access_token": session_id,
             "token_type": token_data.get("token_type", "bearer"),
             "scope": token_data.get("scope"),
             "user": user_profile,
@@ -135,7 +145,11 @@ async def get_pulls(owner: str, repo_name: str, access_token: str = Depends(reso
 
 @router.post("/logout")
 async def logout(access_token: str = Depends(resolve_access_token)):
+    # `access_token` here is the resolved real token (the dependency already
+    # turned the session id back into it). Drop both the vault session that
+    # referenced it and the in-memory token entry.
     try:
+        session_store.revoke_token(access_token)
         GitHubAuthService.clear_token(access_token)
         return {"success": True, "message": "Logged out"}
     except Exception as e:

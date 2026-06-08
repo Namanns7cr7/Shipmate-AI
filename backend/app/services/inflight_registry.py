@@ -79,14 +79,15 @@ CREATE TABLE IF NOT EXISTS inflight_paths (
 );
 CREATE INDEX IF NOT EXISTS idx_inflight_paths_expiry ON inflight_paths(expires_at);
 
--- NOTE on access_token: stored so a backend restart (uvicorn --reload fires
--- on every code change in dev) can RESUME watching open PRs. Without it the
--- headline "survives restart" feature can't poll GitHub. Acceptable because:
---   (a) the DB lives in /tmp, wiped on reboot (user's explicit choice);
---   (b) this is a single-dev tool with a burner GitHub token;
---   (c) the token already transits plaintext through request bodies + memory.
--- For a hosted/multi-user deploy, point SHIPMATE_INFLIGHT_DB at an encrypted
--- volume or drop this column and accept that restart abandons in-flight PRs.
+-- NOTE on access_token: this column now stores a VAULT SESSION ID
+-- (shipmate_sess_…), NOT the raw GitHub token. The token lives only in the
+-- session vault (session_store / shipmate_sessions.db); CIWatcher persists the
+-- session ref here so a backend restart (uvicorn --reload fires on every code
+-- change in dev) can resolve it back to a token and RESUME watching open PRs.
+-- Column name kept for back-compat with existing rows (a legacy raw token in
+-- here still works — resume_from_db passes a non-session value straight
+-- through). Storing the ref instead of the token means /tmp no longer holds a
+-- live credential.
 CREATE TABLE IF NOT EXISTS ci_watch_state (
     owner            TEXT NOT NULL,
     repo             TEXT NOT NULL,

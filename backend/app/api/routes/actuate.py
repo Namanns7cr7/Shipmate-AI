@@ -16,7 +16,10 @@ from fastapi.responses import StreamingResponse
 
 from app.schemas.api_schemas import ActuateRequest, ActuateResponse
 from app.services.coder_orchestrator import CoderOrchestrator
-from app.api.deps import verify_repo_write_access as _verify_repo_write_access
+from app.api.deps import (
+    verify_repo_write_access as _verify_repo_write_access,
+    require_body_credential,
+)
 
 router = APIRouter(tags=["actuate"])
 logger = logging.getLogger("shipmate.actuate_route")
@@ -26,8 +29,8 @@ logger = logging.getLogger("shipmate.actuate_route")
 async def actuate(req: ActuateRequest) -> ActuateResponse:
     if not req.owner or not req.repo:
         raise HTTPException(status_code=400, detail="owner and repo are required")
-    if not req.access_token:
-        raise HTTPException(status_code=400, detail="access_token is required")
+    # Resolve the body session id → real token once (vault boundary).
+    req.access_token = require_body_credential(req.access_token)
 
     await _verify_repo_write_access(req.owner, req.repo, req.access_token)
 
@@ -63,6 +66,7 @@ async def actuate_stream(req: ActuateRequest):
             if not req.owner or not req.repo or not req.access_token:
                 await queue.put({"event": "error", "detail": "owner, repo, access_token required"})
                 return
+            req.access_token = require_body_credential(req.access_token)
             await _verify_repo_write_access(req.owner, req.repo, req.access_token)
             await CoderOrchestrator.run_actuation(req, on_event=on_event)
         except HTTPException as e:

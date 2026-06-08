@@ -81,7 +81,17 @@ async def _run_loop(req: AutoFixRequest) -> AsyncIterator[str]:
     # auto-fix is actually used.
     from app.services.repo_analysis_service import RepoAnalysisService
     from app.orchestrator.shipmate_orchestrator import ShipMateOrchestrator
+    from app.api.deps import resolve_credential
     from scripts.coder_loop import _pick_top_per_kind
+
+    # Resolve the body session id → real token once (vault boundary). A session
+    # that doesn't resolve (expired/unknown) ends the stream with an error frame
+    # rather than failing every GitHub call mid-loop.
+    resolved = resolve_credential(req.access_token)
+    if not resolved:
+        yield _sse({"event": "error", "message": "session expired or invalid — sign in again"})
+        return
+    req.access_token = resolved
 
     repo_full = f"{req.owner}/{req.repo}"
     orchestrator = ShipMateOrchestrator()

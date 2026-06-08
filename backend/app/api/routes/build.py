@@ -23,6 +23,7 @@ from app.schemas.agent_schemas import BuildPlanResponse, BuildExecuteResponse
 from app.services.repo_analysis_service import RepoAnalysisService
 from app.services.opportunity_service import OpportunityService
 from app.api.routes.analysis import _verify_repo_write_access
+from app.api.deps import require_body_credential
 
 router = APIRouter(tags=["build"])
 logger = logging.getLogger("shipmate.build_route")
@@ -32,8 +33,7 @@ logger = logging.getLogger("shipmate.build_route")
 async def build_plan(request: BuildPlanRequest) -> BuildPlanResponse:
     if not request.owner or not request.repo:
         raise HTTPException(status_code=400, detail="owner and repo are required.")
-    if not request.access_token:
-        raise HTTPException(status_code=400, detail="access_token is required.")
+    request.access_token = require_body_credential(request.access_token)
 
     # Authorization: write access required, mirroring /analyze.
     await _verify_repo_write_access(
@@ -79,8 +79,7 @@ async def build_execute(request: BuildExecuteRequest) -> BuildExecuteResponse:
     passes CoderOrchestrator's lint/scope/pytest/resolution gates."""
     if not request.owner or not request.repo:
         raise HTTPException(status_code=400, detail="owner and repo are required.")
-    if not request.access_token:
-        raise HTTPException(status_code=400, detail="access_token is required.")
+    request.access_token = require_body_credential(request.access_token)
 
     await _verify_repo_write_access(
         token=request.access_token, owner=request.owner, repo=request.repo,

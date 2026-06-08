@@ -7,7 +7,7 @@ from app.schemas.api_schemas import AnalyzeRequest, AnalyzeResponse
 from app.services.repo_analysis_service import RepoAnalysisService
 from app.services import report_store
 from app.orchestrator.shipmate_orchestrator import ShipMateOrchestrator
-from app.api.deps import verify_repo_write_access
+from app.api.deps import verify_repo_write_access, require_body_credential
 
 logger = logging.getLogger("shipmate.analysis_route")
 
@@ -39,6 +39,10 @@ async def analyze(request: AnalyzeRequest):
     """
     if not request.owner or not request.repo:
         raise HTTPException(status_code=400, detail="owner and repo are required.")
+
+    # Resolve the opaque session id in the body to the real token ONCE, then
+    # carry the real token downstream unchanged (vault boundary).
+    request.access_token = require_body_credential(request.access_token)
 
     # --- Authorization check: token must have write access to the target repo ---
     await _verify_repo_write_access(
@@ -91,6 +95,8 @@ async def analyze_stream(request: AnalyzeRequest):
     streamed. The final report is persisted exactly like the batch route."""
     if not request.owner or not request.repo:
         raise HTTPException(status_code=400, detail="owner and repo are required.")
+
+    request.access_token = require_body_credential(request.access_token)
 
     await _verify_repo_write_access(
         token=request.access_token, owner=request.owner, repo=request.repo,

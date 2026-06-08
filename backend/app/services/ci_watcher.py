@@ -37,6 +37,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from app.agents.coder_agent import CoderAgent, CoderBrief, CoderOutput
 from app.schemas.api_schemas import FindingPayload, RepoLensSummary
 from app.services import inflight_registry as ir
+from app.services import session_store
 from app.services.github_actions_service import (
     CheckRunStatus, GitHubActionsService,
 )
@@ -187,7 +188,17 @@ class CIWatcher:
     @classmethod
     def _persist(cls, entry: WatchEntry) -> None:
         """Mirror the entry's durable facts to sqlite. Best-effort — a
-        persistence failure must never break the watch loop itself."""
+        persistence failure must never break the watch loop itself.
+
+        We persist a VAULT SESSION ID, never the raw token: the ci_watch_state
+        row needs *a way to get* a token after a restart, but the token itself
+        now lives only in the session vault. session_store.ensure() is
+        idempotent, so re-persisting on every poll reuses the same session."""
+        try:
+            session_ref = session_store.ensure(entry.access_token)
+        except Exception as e:  # vault hiccup — persist without a token ref
+            logger.debug("_persist: session ensure failed for %s: %s", entry.key(), e)
+            session_ref = None
         try:
             ir.upsert_ci_watch(
                 entry.owner, entry.repo, entry.pr_number,
@@ -196,7 +207,7 @@ class CIWatcher:
                 base_branch=entry.base_branch,
                 finding=entry.finding,
                 repo_lens=entry.repo_lens,
-                access_token=entry.access_token,
+                access_token=session_ref,   # session id, NOT the raw token
                 status=entry.status,
                 attempts=entry.attempts,
                 last_patch_hash=entry.last_patch_hash,
@@ -245,11 +256,15 @@ class CIWatcher:
             key = (row["owner"], row["repo"], row["pr_number"])
             if key in cls._tasks:
                 continue  # already running in this process
-            token = row.get("access_token")
+            # The stored access_token column holds a vault SESSION ID — resolve
+            # it back to a real token. A raw token (legacy row) passes through.
+            stored = row.get("access_token")
+            token = session_store.resolve(stored) if session_store.looks_like_session(stored) else stored
             if not token:
                 ir.upsert_ci_watch(
                     row["owner"], row["repo"], row["pr_number"],
-                    status="crashed", last_error="no token to resume after restart",
+                    status="crashed",
+                    last_error="session expired/unresolvable — cannot resume after restart",
                 )
                 continue
             try:
