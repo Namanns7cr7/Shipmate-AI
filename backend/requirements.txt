@@ -13,3 +13,10 @@ python-multipart>=0.0.6
 # SDK's AzureOpenAI client drives chat-completions function-calling for forced
 # structured output — the Azure equivalent of Bedrock's Converse toolConfig.
 openai>=1.40,<2
+# Bedrock provider (the DEFAULT LLM provider — SHIPMATE_LLM_PROVIDER=bedrock).
+# bedrock_provider.py calls boto3's bedrock-runtime Converse API. This was
+# missing here, so a clean `pip install -r requirements.txt` (Docker build /
+# Azure deploy) shipped a backend that booted (/health is fine) but crashed on
+# the first /analyze with ModuleNotFoundError: boto3. It only worked locally
+# because the dev venv happened to have boto3. MUST be pinned for any deploy.
+boto3>=1.34,<2

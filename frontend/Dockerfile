@@ -1,4 +1,7 @@
-FROM node:18-alpine AS builder
+# Node 20 to match CI (.github/workflows/ci.yml NODE_VERSION) and the engines
+# pin in package.json. Vite 8 + React 19 want Node 20+; node:18 here while CI
+# verified on 20 meant the image could build differently from what CI checked.
+FROM node:20-alpine AS builder
 
 WORKDIR /app
 
@@ -15,7 +18,7 @@ COPY frontend/ .
 RUN npm run build
 
 # Production stage
-FROM node:18-alpine
+FROM node:20-alpine
 
 WORKDIR /app
 
