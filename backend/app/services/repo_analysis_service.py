@@ -7,6 +7,7 @@ then builds the context dict consumed by the ShipMate orchestrator.
 
 import asyncio
 import logging
+import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -37,6 +38,10 @@ _KEY_FILE_NAMES = [
 
 # Max files to fetch (GitHub API rate: 5000 req/hr for authenticated)
 _MAX_KEY_FILES = 18
+
+# Overall ceiling on the parallel key-file fetch, so a few hung connections
+# can't stall the whole analyze request (the gather had no outer timeout).
+_FILES_FETCH_TIMEOUT_S = float(os.getenv("SHIPMATE_FILES_FETCH_TIMEOUT_S", "60"))
 
 
 class RepoAnalysisService:
@@ -208,7 +213,21 @@ class RepoAnalysisService:
                 content = await GitHubAPIService.get_file_content(token, owner, repo, path)
                 return path, content
 
-        results = await asyncio.gather(*[fetch_one(p) for p in paths], return_exceptions=True)
+        # Overall timeout so a few slow/hung fetches can't stall context-build
+        # (and the whole analyze request) indefinitely. On timeout we keep
+        # whatever returned and proceed with a partial corpus.
+        try:
+            results = await asyncio.wait_for(
+                asyncio.gather(*[fetch_one(p) for p in paths], return_exceptions=True),
+                timeout=_FILES_FETCH_TIMEOUT_S,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "_fetch_files timed out after %ss for %s/%s (%d paths) — "
+                "proceeding with whatever was fetched",
+                _FILES_FETCH_TIMEOUT_S, owner, repo, len(paths),
+            )
+            return {}
 
         key_files: Dict[str, str] = {}
         for result in results:

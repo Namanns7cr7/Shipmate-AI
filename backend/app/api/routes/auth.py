@@ -1,41 +1,15 @@
 import logging
 import os
-from typing import Optional
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from app.services.github_auth_service import GitHubAuthService
 from app.services.github_api_service import GitHubAPIService
 from app.schemas.api_schemas import RepoSummary
+from app.api.deps import resolve_access_token
 
 logger = logging.getLogger("shipmate.auth_route")
 
 router = APIRouter(prefix="/auth/github", tags=["github-auth"])
-
-
-def resolve_access_token(
-    authorization: Optional[str] = Header(default=None),
-    access_token: Optional[str] = Query(default=None),
-) -> str:
-    """Resolve the GitHub token from the Authorization header (preferred) or the
-    legacy ?access_token= query param (fallback).
-
-    OPP-001: passing the token as a query param leaks it into server access
-    logs, the Referer header, and browser history. The frontend now sends
-    `Authorization: Bearer <token>`. We still accept the query param so older
-    clients / in-flight sessions keep working during the migration; new code
-    should always use the header."""
-    if authorization:
-        parts = authorization.split(" ", 1)
-        if len(parts) == 2 and parts[0].lower() in ("bearer", "token"):
-            tok = parts[1].strip()
-            if tok:
-                return tok
-    if access_token:
-        return access_token
-    raise HTTPException(
-        status_code=401,
-        detail="Missing access token. Send 'Authorization: Bearer <token>'.",
-    )
 
 
 @router.get("/login")

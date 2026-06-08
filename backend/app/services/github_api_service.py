@@ -51,6 +51,42 @@ def clear_tree_cache() -> None:
     _tree_cache.clear()
 
 
+# ── Transient-failure retry ──────────────────────────────────────────────────
+# GitHub occasionally returns 5xx or times out under load. Those are TRANSIENT —
+# a short backoff + retry usually succeeds, and previously a single blip failed
+# the whole analyze/actuate. We retry ONLY on 5xx / timeout / network errors
+# (never on 4xx — those are deterministic: a 404 won't become a 200). Bounded
+# attempts + capped backoff so a truly-down GitHub still fails fast-ish.
+_RETRY_ATTEMPTS = int(os.getenv("GITHUB_RETRY_ATTEMPTS", "3"))
+_RETRY_BASE_DELAY_S = float(os.getenv("GITHUB_RETRY_BASE_DELAY_S", "0.5"))
+
+
+async def _get_with_retry(client: "httpx.AsyncClient", url: str, **kwargs) -> "httpx.Response":
+    """GET with bounded retry on transient failures (5xx / timeout / network).
+    4xx responses are returned immediately (caller handles 404 etc.). Raises the
+    last transient error if all attempts are exhausted."""
+    last_exc: Optional[Exception] = None
+    for attempt in range(1, _RETRY_ATTEMPTS + 1):
+        try:
+            resp = await client.get(url, **kwargs)
+        except (httpx.TimeoutException, httpx.TransportError) as e:
+            last_exc = e
+        else:
+            # Retry only on server errors; 2xx/3xx/4xx return as-is.
+            if resp.status_code < 500:
+                return resp
+            last_exc = httpx.HTTPStatusError(
+                f"GitHub {resp.status_code}", request=resp.request, response=resp,
+            )
+        if attempt < _RETRY_ATTEMPTS:
+            # Linear-ish backoff, capped. (No jitter needed — single-client tool.)
+            await asyncio.sleep(min(_RETRY_BASE_DELAY_S * attempt, 3.0))
+    # Exhausted — re-raise the last transient error for the caller's handler.
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("unreachable: retry loop produced no response and no error")
+
+
 def _headers(token: str) -> Dict[str, str]:
     # Delegates to the single shared definition (see github_client.gh_headers).
     from app.services.github_client import gh_headers
@@ -75,7 +111,7 @@ class GitHubAPIService:
     @staticmethod
     async def get_repo_info(token: str, owner: str, repo: str) -> Dict[str, Any]:
         async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
-            resp = await client.get(f"{_BASE}/repos/{owner}/{repo}", headers=_headers(token))
+            resp = await _get_with_retry(client, f"{_BASE}/repos/{owner}/{repo}", headers=_headers(token))
             resp.raise_for_status()
             return resp.json()
 
@@ -105,14 +141,16 @@ class GitHubAPIService:
             return cached
 
         async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
-            resp = await client.get(
+            resp = await _get_with_retry(
+                client,
                 f"{_BASE}/repos/{owner}/{repo}/git/trees/{branch}",
                 headers=_headers(token),
                 params={"recursive": "1"},
             )
             if resp.status_code == 404:
                 # Branch might be "master"
-                resp = await client.get(
+                resp = await _get_with_retry(
+                    client,
                     f"{_BASE}/repos/{owner}/{repo}/git/trees/master",
                     headers=_headers(token),
                     params={"recursive": "1"},
@@ -136,7 +174,8 @@ class GitHubAPIService:
         if ref:
             params["ref"] = ref
         async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
-            resp = await client.get(
+            resp = await _get_with_retry(
+                client,
                 f"{_BASE}/repos/{owner}/{repo}/contents/{path}",
                 headers=_headers(token),
                 params=params,

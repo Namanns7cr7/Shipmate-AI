@@ -51,6 +51,10 @@ logger = logging.getLogger("shipmate.coder_orchestrator")
 # can disable it.
 _PYTEST_GATE_ENABLED = os.getenv("SHIPMATE_PYTEST_GATE", "1") == "1"
 
+# Hard ceiling on the parallel file-content fetch so a hung GitHub connection
+# can't pin the actuate worker thread indefinitely (the gather had no timeout).
+_FETCH_TIMEOUT_S = float(os.getenv("SHIPMATE_FETCH_TIMEOUT_S", "45"))
+
 # The repo this backend checkout corresponds to. The pytest gate only fires
 # when the actuate target matches — otherwise we'd be running ShipMate's own
 # tests against a patch meant for someone else's repo.
@@ -276,7 +280,21 @@ async def _fetch_current_contents(
                 logger.warning("Could not fetch %s: %s — treating as new file", path, e)
                 return path, ""
 
-    pairs = await asyncio.gather(*[fetch(p) for p in paths])
+    # Overall timeout guard: without it a single hung GitHub connection pins this
+    # gather (and the worker thread behind the actuate call) indefinitely. On
+    # timeout we degrade to empty contents — Coder treats missing files as
+    # new-file creations, same as the per-file except above.
+    try:
+        pairs = await asyncio.wait_for(
+            asyncio.gather(*[fetch(p) for p in paths]),
+            timeout=_FETCH_TIMEOUT_S,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "fetch_current_contents timed out after %ss for %s/%s (%d paths) — "
+            "proceeding with empty contents", _FETCH_TIMEOUT_S, owner, repo, len(paths),
+        )
+        return {p: "" for p in paths}
     return {p: c for p, c in pairs}
 
 
