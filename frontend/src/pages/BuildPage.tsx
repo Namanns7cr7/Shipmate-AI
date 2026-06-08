@@ -1,8 +1,8 @@
-import { useState } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { motion } from 'framer-motion';
 import {
   Hammer, Sparkles, Zap, ShieldCheck, ShieldAlert, FileCode2,
-  ChevronRight, ChevronDown, GitPullRequest, AlertTriangle, Check, Loader2,
+  ChevronRight, ChevronDown, GitPullRequest, AlertTriangle, Check, Loader2, XCircle,
 } from 'lucide-react';
 import { api } from '../lib/api';
 import type {
@@ -13,6 +13,28 @@ interface Props {
   selectedRepo: GitHubRepo | null;
   selectedBranch: string;
   accessToken: string | null;
+}
+
+// Persist discovered plans across tab switches / reloads (complaint: switching
+// tabs nuked everything and forced a full re-run). Keyed by repo+branch so a
+// different selection naturally shows its own cached plan (or none). sessionScope
+// (not localStorage) so it clears when the tab closes — plans are ephemeral.
+const SS_PREFIX = 'shipmate.build.plan.';
+function ssKey(repoFullName: string, branch: string) {
+  return `${SS_PREFIX}${repoFullName}@${branch}`;
+}
+function loadCachedPlan(repoFullName: string, branch: string): BuildPlanResponse | null {
+  try {
+    const raw = sessionStorage.getItem(ssKey(repoFullName, branch));
+    return raw ? (JSON.parse(raw) as BuildPlanResponse) : null;
+  } catch { return null; }
+}
+function saveCachedPlan(repoFullName: string, branch: string, plan: BuildPlanResponse | null) {
+  try {
+    const k = ssKey(repoFullName, branch);
+    if (plan) sessionStorage.setItem(k, JSON.stringify(plan));
+    else sessionStorage.removeItem(k);
+  } catch { /* sessionStorage full / unavailable — non-fatal */ }
 }
 
 const CAT_TONE: Record<string, string> = {
@@ -38,11 +60,37 @@ export function BuildPage({ selectedRepo, selectedBranch, accessToken }: Props) 
   // Per-opportunity execute/preview state.
   const [busyId, setBusyId] = useState<string | null>(null);
   const [execResult, setExecResult] = useState<Record<string, BuildExecuteResponse>>({});
+  // Opportunity ids the user dismissed this session (hidden immediately).
+  const [dismissed, setDismissed] = useState<Set<string>>(new Set());
+
+  const repoKey = selectedRepo?.full_name ?? '';
+
+  // Rehydrate the cached plan whenever the repo/branch selection changes (incl.
+  // first mount after a tab switch). This is what makes the plan survive
+  // navigation without re-running discovery.
+  useEffect(() => {
+    if (!repoKey) { setPlan(null); return; }
+    setPlan(loadCachedPlan(repoKey, selectedBranch));
+    setExecResult({});
+    setDismissed(new Set());
+    setExpanded(null);
+    setError(null);
+  }, [repoKey, selectedBranch]);
+
+  // Persist whenever the plan changes (discovery result or cleared).
+  const lastSaved = useRef<string>('');
+  useEffect(() => {
+    if (!repoKey) return;
+    const sig = plan ? plan.generated_at : '';
+    if (sig === lastSaved.current) return;
+    lastSaved.current = sig;
+    saveCachedPlan(repoKey, selectedBranch, plan);
+  }, [plan, repoKey, selectedBranch]);
 
   async function discover() {
     if (!selectedRepo || !accessToken) return;
     const [owner, repo] = selectedRepo.full_name.split('/');
-    setLoading(true); setError(null); setPlan(null); setExecResult({});
+    setLoading(true); setError(null); setPlan(null); setExecResult({}); setDismissed(new Set());
     try {
       const res = await api.buildPlan({
         owner, repo, branch: selectedBranch, access_token: accessToken,
@@ -53,6 +101,22 @@ export function BuildPage({ selectedRepo, selectedBranch, accessToken }: Props) 
       setError(e instanceof Error ? e.message : 'Failed to discover opportunities');
     } finally {
       setLoading(false);
+    }
+  }
+
+  async function dismiss(opp: Opportunity) {
+    if (!selectedRepo || !accessToken) return;
+    const [owner, repo] = selectedRepo.full_name.split('/');
+    // Hide immediately (optimistic) — the journal write makes it stick across runs.
+    setDismissed(prev => new Set(prev).add(opp.id));
+    try {
+      await api.buildDismiss({
+        owner, repo, access_token: accessToken,
+        title: opp.title, file: opp.target_files[0] ?? null,
+      });
+    } catch {
+      // Roll back the optimistic hide on failure.
+      setDismissed(prev => { const n = new Set(prev); n.delete(opp.id); return n; });
     }
   }
 
@@ -168,7 +232,7 @@ export function BuildPage({ selectedRepo, selectedBranch, accessToken }: Props) 
             </div>
           ) : (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-              {plan.opportunities.map(opp => (
+              {plan.opportunities.filter(o => !dismissed.has(o.id)).map(opp => (
                 <OpportunityCard
                   key={opp.id}
                   opp={opp}
@@ -178,8 +242,17 @@ export function BuildPage({ selectedRepo, selectedBranch, accessToken }: Props) 
                   result={execResult[opp.id]}
                   onPlan={() => runOpportunity(opp, false)}
                   onBuild={() => runOpportunity(opp, true)}
+                  onDismiss={() => dismiss(opp)}
                 />
               ))}
+              {plan.opportunities.length > 0 && plan.opportunities.every(o => dismissed.has(o.id)) && (
+                <div className="card" style={{ padding: 24, textAlign: 'center' }}>
+                  <span className="muted" style={{ fontSize: 13 }}>
+                    All opportunities dismissed. Run Discover again for fresh ones —
+                    dismissed items won't come back.
+                  </span>
+                </div>
+              )}
             </div>
           )}
         </>
@@ -199,7 +272,7 @@ function Stat({ label, value, tone = 'slate' }: { label: string; value: number |
 }
 
 function OpportunityCard({
-  opp, open, onToggle, busy, result, onPlan, onBuild,
+  opp, open, onToggle, busy, result, onPlan, onBuild, onDismiss,
 }: {
   opp: Opportunity;
   open: boolean;
@@ -208,6 +281,7 @@ function OpportunityCard({
   result?: BuildExecuteResponse;
   onPlan: () => void;
   onBuild: () => void;
+  onDismiss: () => void;
 }) {
   const sHex = scoreHex(opp.value_score);
   return (
@@ -268,13 +342,18 @@ function OpportunityCard({
           )}
 
           {/* Actions */}
-          <div style={{ display: 'flex', gap: 10, marginTop: 16 }}>
+          <div style={{ display: 'flex', gap: 10, marginTop: 16, alignItems: 'center' }}>
             <button className="btn btn-secondary btn-sm" onClick={onPlan} disabled={busy}>
               {busy ? <Loader2 size={13} className="spin" /> : <Sparkles size={13} />} Preview Plan
             </button>
             <button className="btn btn-primary btn-sm" onClick={onBuild} disabled={busy}
               title="Plan, critique, and — if the critic approves — open a PR per step">
               {busy ? <Loader2 size={13} className="spin" /> : <GitPullRequest size={13} />} Build It
+            </button>
+            <button className="btn btn-ghost btn-sm" onClick={onDismiss} disabled={busy}
+              style={{ marginLeft: 'auto', color: 'var(--ink-3)' }}
+              title="Hide this and never propose it again (recorded in the journal)">
+              <XCircle size={13} /> Dismiss
             </button>
           </div>
 

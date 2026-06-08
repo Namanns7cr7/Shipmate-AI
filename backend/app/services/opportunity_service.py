@@ -72,8 +72,11 @@ class OpportunityService:
             enriched = repo_context
 
         # 1. DISCOVER (LLM) — raw candidates, or [] if the provider is down.
+        # Feed the journal's known titles (shipped/dismissed/in-flight) so the
+        # stateless model stops re-proposing work that's already been surfaced.
+        exclude = critic.journaled_titles(full_name)
         raw: List[Opportunity] = LLMService.discover_opportunities(
-            enriched, max_opportunities=max_opportunities
+            enriched, max_opportunities=max_opportunities, exclude_titles=exclude,
         )
         ai_enhanced = LLMService.is_available()
         total_found = len(raw)
@@ -174,6 +177,11 @@ class OpportunityService:
             executed=False, ai_enhanced=ai_enhanced, generated_at=generated_at,
         )
 
+        full_name = info.get("full_name", "") or (f"{owner}/{name}" if owner and name else "")
+        sig = critic.opportunity_signature(
+            opportunity.title, (opportunity.target_files or [None])[0]
+        )
+
         if not execute:
             base.status = "planned"
             base.summary = f"Plan ready ({len(plan.steps)} steps). Critic: {critique.reason}"
@@ -183,6 +191,10 @@ class OpportunityService:
             base.status = "plan_rejected"
             base.summary = f"Plan rejected by critic, not executed: {critique.reason}"
             return base
+
+        # Mark in_progress as we start actuating — so a concurrent/next plan run
+        # downranks it (and, if we crash mid-build, it isn't re-proposed fresh).
+        cls._journal(full_name, sig, "in_progress")
 
         # 3. EXECUTE — actuate each step sequentially via CoderOrchestrator. Each
         # step is its own focused actuation (own branch/PR) so every gate applies
@@ -221,6 +233,8 @@ class OpportunityService:
             try:
                 resp = await CoderOrchestrator.run_actuation(actuate_req)
             except Exception as e:
+                # Leave it in_progress (not shipped) — a transient failure should
+                # be retryable, not marked done. Stays downranked next run.
                 base.status = "execute_failed"
                 base.executed = True
                 base.pr_url = pr_urls[0] if pr_urls else None
@@ -244,6 +258,8 @@ class OpportunityService:
                 pr_urls.append(resp.pr_url)
             files_changed.extend(f.path for f in resp.files_changed)
 
+        # All steps landed — mark shipped so it's suppressed from future plans.
+        cls._journal(full_name, sig, "shipped", pr_url=pr_urls[0] if pr_urls else None)
         base.status = "executed"
         base.executed = True
         base.pr_url = pr_urls[0] if pr_urls else None
@@ -253,3 +269,26 @@ class OpportunityService:
             f"{len(files_changed)} file(s) changed."
         )
         return base
+
+    # ── Journal helpers ───────────────────────────────────────────────────────
+
+    @staticmethod
+    def _journal(repo_full_name: str, sig: str, state: str, *, pr_url: str = None) -> None:
+        """Best-effort journal write — never let a DB hiccup break the build flow."""
+        if not repo_full_name or not sig:
+            return
+        try:
+            from app.services import inflight_registry as ir
+            ir.journal_set_state(sig, repo_full_name, state, pr_url=pr_url, bump_attempt=True)
+        except Exception as e:  # pragma: no cover - defensive
+            logger.debug("opportunity journal write failed (%s)", e)
+
+    @classmethod
+    def dismiss_opportunity(
+        cls, repo_full_name: str, title: str, file: str = "",
+    ) -> Dict[str, str]:
+        """Mark an opportunity dismissed so it's suppressed from future plans AND
+        excluded from discovery. Returns the signature + state."""
+        sig = critic.opportunity_signature(title, file or None)
+        cls._journal(repo_full_name, sig, "dismissed")
+        return {"signature": sig, "state": "dismissed"}

@@ -57,7 +57,7 @@ def _opp(title, **kw):
 
 def _patch_discovery(monkeypatch, opps, available=True):
     monkeypatch.setattr(LLMService, "discover_opportunities",
-                        classmethod(lambda cls, ctx, max_opportunities=8: list(opps)))
+                        classmethod(lambda cls, ctx, max_opportunities=8, exclude_titles=None: list(opps)))
     monkeypatch.setattr(LLMService, "is_available", classmethod(lambda cls: available))
 
 

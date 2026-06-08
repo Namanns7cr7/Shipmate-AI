@@ -16,7 +16,9 @@ import logging
 import httpx
 from fastapi import APIRouter, HTTPException
 
-from app.schemas.api_schemas import BuildPlanRequest, BuildExecuteRequest
+from app.schemas.api_schemas import (
+    BuildPlanRequest, BuildExecuteRequest, BuildDismissRequest,
+)
 from app.schemas.agent_schemas import BuildPlanResponse, BuildExecuteResponse
 from app.services.repo_analysis_service import RepoAnalysisService
 from app.services.opportunity_service import OpportunityService
@@ -44,6 +46,11 @@ async def build_plan(request: BuildPlanRequest) -> BuildPlanResponse:
             owner=request.owner,
             repo=request.repo,
             branch=request.branch,
+        )
+        # Pull route/service/agent source into the corpus so the planner can SEE
+        # what already exists (otherwise it re-proposes built features every run).
+        await RepoAnalysisService.enrich_build_corpus(
+            request.access_token, request.owner, request.repo, repo_context,
         )
     except Exception as e:
         raise HTTPException(
@@ -86,6 +93,9 @@ async def build_execute(request: BuildExecuteRequest) -> BuildExecuteResponse:
             repo=request.repo,
             branch=request.branch,
         )
+        await RepoAnalysisService.enrich_build_corpus(
+            request.access_token, request.owner, request.repo, repo_context,
+        )
     except Exception as e:
         raise HTTPException(
             status_code=502,
@@ -109,3 +119,16 @@ async def build_execute(request: BuildExecuteRequest) -> BuildExecuteResponse:
     except Exception as e:
         logger.exception("build_execute failed for %s/%s", request.owner, request.repo)
         raise HTTPException(status_code=500, detail=f"Opportunity execution failed: {e}")
+
+
+@router.post("/build/dismiss")
+async def build_dismiss(request: BuildDismissRequest):
+    """Hide an opportunity from future plans and exclude it from discovery.
+    Journal-only (no GitHub mutation), so no write-access check needed — but the
+    repo must be identifiable."""
+    if not request.owner or not request.repo:
+        raise HTTPException(status_code=400, detail="owner and repo are required.")
+    full_name = f"{request.owner}/{request.repo}"
+    return OpportunityService.dismiss_opportunity(
+        full_name, request.title, request.file or "",
+    )

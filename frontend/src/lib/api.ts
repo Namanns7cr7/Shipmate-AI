@@ -245,6 +245,13 @@ export const api = {
     return data;
   },
 
+  async buildDismiss(params: {
+    owner: string; repo: string; access_token: string; title: string; file?: string | null;
+  }): Promise<{ signature: string; state: string }> {
+    const { data } = await gh.post('/build/dismiss', params);
+    return data;
+  },
+
   // ── CI watcher ──────────────────────────────────────────────────────────
 
   async getWatcher(owner: string, repo: string, prNumber: number): Promise<WatcherState | null> {

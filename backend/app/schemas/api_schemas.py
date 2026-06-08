@@ -47,6 +47,17 @@ class BuildExecuteRequest(BaseModel):
     execute: bool = False
 
 
+class BuildDismissRequest(BaseModel):
+    """POST /api/build/dismiss — hide an opportunity from future plans + exclude
+    it from discovery. No auth-sensitive action (journal-only), but we still take
+    the token to keep the surface uniform."""
+    owner: str
+    repo: str
+    access_token: str
+    title: str
+    file: Optional[str] = None
+
+
 class RepoSummary(BaseModel):
     id: int
     name: str

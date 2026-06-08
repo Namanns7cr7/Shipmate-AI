@@ -53,9 +53,15 @@ _PREFER_TOKENS = (
 )
 
 
-def _build_local_context(root: Path, max_files: int = 28) -> Dict:
+def _build_local_context(root: Path, max_files: int = 60) -> Dict:
     """Walk the local tree and build a context dict shaped like
-    RepoAnalysisService.build_context() output (offline equivalent)."""
+    RepoAnalysisService.build_context() output (offline equivalent).
+
+    max_files is generous (60) so the FULL services/routes/agents surface is in
+    the corpus — the capability digest + already-built detector need to SEE
+    github_api_service.py / llm_provider.py / analysis.py to refute proposals
+    that re-create their capabilities. The real /api/build/plan path achieves
+    the same breadth via RepoAnalysisService.enrich_build_corpus."""
     file_tree: List[str] = []
     code_candidates: List[Path] = []
 

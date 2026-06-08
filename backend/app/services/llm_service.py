@@ -32,6 +32,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import threading
 from typing import Any, Dict, List, Optional, Type, TypeVar
 
@@ -518,6 +519,7 @@ class LLMService:
     @classmethod
     def discover_opportunities(
         cls, context: Dict[str, Any], max_opportunities: int = 8,
+        *, exclude_titles: Optional[List[str]] = None,
     ) -> List[Opportunity]:
         """Read the repo's actual code and propose a BALANCED set of
         self-improvement opportunities (features / improvements / tweaks / bugs),
@@ -525,6 +527,10 @@ class LLMService:
         re-aimed at "what should we build next" rather than "what blocks
         shipping". Returns raw (un-ranked, un-suppressed) Opportunity objects;
         the OpportunityService applies the critic + ranker + journal join.
+
+        `exclude_titles`: opportunities already shipped/dismissed/in-flight (from
+        the journal) — fed to the prompt as DO-NOT-PROPOSE so the stateless model
+        stops re-surfacing them every run.
 
         Fail-open: returns [] if the provider is unavailable (callers treat an
         empty list as ai_enhanced=False, never as "repo is perfect")."""
@@ -539,7 +545,12 @@ class LLMService:
 
         try:
             code_blob = cls.opportunity_code_blob(context)
-            user = _user_prompt_opportunity_discovery(context, code_blob, max_opportunities)
+            capability_digest = _capability_digest(context)
+            user = _user_prompt_opportunity_discovery(
+                context, code_blob, max_opportunities,
+                capability_digest=capability_digest,
+                exclude_titles=exclude_titles or [],
+            )
             discovery = provider.invoke_structured_sync(
                 system_prompt=_DISCOVERY_OPPORTUNITY_SYSTEM,
                 user_prompt=user,
@@ -842,24 +853,26 @@ _DISCOVERY_OPPORTUNITY_SYSTEM = (
     "  2. Name `target_files` that EXIST in the repo (the work would touch them).\n"
     "  3. Have a `rationale` that quotes a specific construct/function/gap.\n"
     "  4. Be IMPLEMENTABLE in <=21 days by one engineer — not a rewrite.\n\n"
-    "Examples of GOOD opportunities:\n"
-    "  [improvement] 'Cache the repo file tree per repo+branch — "
-    "repo_analysis_service._fetch_files re-fetches every analyze with no cache; "
-    "a short-TTL LRU cuts GitHub API calls and latency on re-runs.'\n"
-    "  [feature]     'Add a /api/repos/{repo}/history trend endpoint backed by "
-    "report_store so the dashboard can chart readiness over time.'\n"
-    "  [tweak]       'frontend/src/lib/api.ts repeats the auth header in every "
-    "method — extract a configured axios instance with default headers.'\n"
-    "  [bug]         'shipmate_orchestrator.run_stream swallows agent errors into "
-    "a single error event; a failing PlanForge yields no partial report.'\n\n"
+    "Examples of GOOD opportunities (SHAPE only — judge against THIS repo's "
+    "code and its ALREADY-EXISTS lists; never propose something the lists show "
+    "is done):\n"
+    "  [improvement] 'function X in <file> retries on every error including 4xx "
+    "client errors — only retry on 5xx/timeout to avoid hammering a failing "
+    "dependency.'\n"
+    "  [bug]         'handler Y in <file> catches Exception and returns 200, "
+    "masking real failures from the caller.'\n"
+    "  [tweak]       'two functions in <file> duplicate the same 15-line parse "
+    "block — extract a shared helper.'\n\n"
     "Examples of BAD opportunities (DO NOT EMIT):\n"
-    "  - 'add tests' / 'set up CI/CD' / 'write docs' / 'containerize' — generic, "
-    "not grounded in a specific gap.\n"
+    "  - ANYTHING already present in the ALREADY-EXISTS routes/modules lists "
+    "given in the user message (caching, history endpoints, provider factories, "
+    "body sanitization, etc. may ALREADY be done — CHECK the lists first).\n"
+    "  - 'add tests' / 'set up CI/CD' / 'write docs' / 'containerize' — generic.\n"
     "  - vague advice ('improve performance') with no file cited.\n"
     "  - speculative rewrites or future architecture not justified by the code.\n"
     "  - anything you cannot tie to a file in `evidence`.\n\n"
-    "Bias HARD toward grounding and value. Five sharply-grounded opportunities "
-    "beat ten vague ones."
+    "Bias HARD toward grounding, NOVELTY, and value. Five sharply-grounded, "
+    "not-already-done opportunities beat ten obvious ones."
 )
 
 
@@ -919,16 +932,86 @@ def _user_prompt_testpilot_discovery(
     )
 
 
+def _capability_digest(context: Dict[str, Any]) -> str:
+    """A deterministic 'what this repo ALREADY does' digest, built from the full
+    corpus (every fetched file body + the tree). Two parts:
+      • ROUTES — every HTTP route declared via FastAPI/Flask decorators or an
+        axios/fetch call, so the model won't propose adding an endpoint that
+        exists.
+      • MODULES — notable service/agent/component file names, so the model won't
+        propose creating a file/capability that's already present.
+    This is the single biggest lever against recurrence: the model is stateless,
+    so we MUST tell it what's done. Cheap regex, no LLM."""
+    key_files: Dict[str, str] = context.get("key_files") or {}
+    file_tree: List[str] = context.get("file_tree") or []
+
+    routes: set = set()
+    # FastAPI/Flask: @router.get("/path") / @app.post('/path')
+    deco_re = re.compile(r"@\w+\.(?:get|post|put|patch|delete)\(\s*[\"']([^\"']+)[\"']", re.IGNORECASE)
+    # Frontend: gh.get('/path') / axios.post("/path") / fetch(`${BASE}/path`)
+    call_re = re.compile(r"\b(?:get|post|put|patch|delete)\(\s*[`\"']([^`\"']+)[`\"']", re.IGNORECASE)
+    for body in key_files.values():
+        if not body:
+            continue
+        for m in deco_re.finditer(body):
+            routes.add(m.group(1))
+        for m in call_re.finditer(body):
+            p = m.group(1)
+            if p.startswith("/") or "/api/" in p:
+                routes.add(p)
+
+    # Notable modules: service/agent/route/component file basenames from the tree.
+    mod_tokens = ("/services/", "/agents/", "/routes/", "/orchestrator/",
+                  "/components/", "/pages/", "/hooks/")
+    modules: set = set()
+    for p in file_tree:
+        lp = p.lower()
+        if any(t in lp for t in mod_tokens) and lp.endswith((".py", ".ts", ".tsx")):
+            modules.add(p.split("/")[-1])
+
+    route_list = sorted(r for r in routes if len(r) > 3)[:60]
+    mod_list = sorted(modules)[:80]
+    parts = []
+    if route_list:
+        parts.append("## Routes/endpoints that ALREADY EXIST (do NOT propose adding these)\n"
+                     + "\n".join(f"- {r}" for r in route_list))
+    if mod_list:
+        parts.append("## Service/agent/component modules that ALREADY EXIST "
+                     "(do NOT propose creating these)\n"
+                     + "\n".join(f"- {m}" for m in mod_list))
+    return "\n\n".join(parts) if parts else "(no capability digest available)"
+
+
 def _user_prompt_opportunity_discovery(
     context: Dict[str, Any], code_blob: str, max_opportunities: int,
+    *, capability_digest: str = "", exclude_titles: Optional[List[str]] = None,
 ) -> str:
+    exclude_titles = exclude_titles or []
+    exclude_block = ""
+    if exclude_titles:
+        exclude_block = (
+            "\n\n# ALREADY PROPOSED / SHIPPED / DISMISSED — DO NOT propose any of "
+            "these again, or anything that overlaps them:\n"
+            + "\n".join(f"- {t}" for t in exclude_titles[:60])
+        )
+    digest_block = f"\n\n# {capability_digest}" if capability_digest else ""
     return (
-        f"# Repo summary\n{_repo_summary(context)}\n\n"
+        f"# Repo summary\n{_repo_summary(context)}"
+        f"{digest_block}"
+        f"{exclude_block}\n\n"
         f"# Repo code\n{code_blob[:20000]}\n\n"
         f"Propose up to {max_opportunities} self-improvement opportunities for "
-        "THIS repo, balanced across feature / improvement / tweak / bug. Every "
-        "opportunity MUST cite real file paths in `evidence` and name existing "
-        "`target_files`. Skip anything generic or not tied to a specific file. "
+        "THIS repo, balanced across feature / improvement / tweak / bug. HARD "
+        "RULES:\n"
+        "  • Do NOT propose anything in the ALREADY-EXISTS lists above — if a "
+        "route or module is listed, that capability is DONE. Check before "
+        "proposing.\n"
+        "  • Do NOT propose anything overlapping the DO-NOT-PROPOSE list.\n"
+        "  • Every opportunity MUST cite real file paths in `evidence` and name "
+        "existing `target_files`.\n"
+        "  • Skip anything generic or not tied to a specific file.\n"
+        "Prefer DEEPER, less-obvious improvements (specific functions, edge "
+        "cases, perf hotspots, missing error handling) over broad scaffolding. "
         "Return ONLY the OpportunityDiscovery schema."
     )
 

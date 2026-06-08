@@ -279,13 +279,31 @@ def verify_opportunities(
 # philosophy as finding_critic._deterministic_prefilter — don't ask the LLM what
 # code inspection can decide reliably.
 
-# Route paths like /api/repos/{owner}/{repo}/history  or  GET /foo/bar
-_ROUTE_RE = re.compile(r"(?:GET|POST|PUT|PATCH|DELETE\s+)?(/(?:api/)?[a-z][\w\-/]*(?:\{[^}]+\}[\w\-/]*)*)", re.IGNORECASE)
+# HTTP route paths the proposal wants to ADD. We require a real route shape so a
+# plain file path like 'frontend/src/lib/api.ts' is NOT mistaken for a route:
+#   • an explicit METHOD prefix (GET /foo), OR
+#   • a leading /api/ segment, OR
+#   • a path param {…} somewhere (decorator routes almost always have one).
+# A bare '/src/lib/api' (no method, no /api/, no param) is rejected.
+_ROUTE_RE = re.compile(
+    r"(?:(?:GET|POST|PUT|PATCH|DELETE)\s+(/[\w\-/{}]+)"        # METHOD /path
+    r"|(/api/[\w\-/{}]+)"                                       # /api/...
+    r"|(/[\w\-/]*\{[^}]+\}[\w\-/{}]*))",                        # /…/{param}/…
+    re.IGNORECASE,
+)
 # "add a <name>.py" / "create <path>.ts" style new-file proposals.
 _NEW_FILE_RE = re.compile(r"\b([\w./-]+\.(?:py|ts|tsx|js|jsx|go|rs))\b")
-# Verbs that signal the opportunity is proposing to ADD something new (vs improve
-# something that exists). Only then does "it already exists" mean "already built".
-_ADD_VERBS = ("add ", "create ", "introduce ", "implement ", "build ", "new ")
+# Verbs that signal the opportunity is proposing to ADD/INTRODUCE a capability
+# (vs improve an existing one). When the proposed thing already exists, that's
+# "already built". Widened beyond add/create — the recurrence bug showed the
+# model frames built features as "Cache X", "Deduplicate Y", "Centralize Z",
+# "Persist W" too, none of which matched the old narrow list.
+_ADD_VERBS = (
+    "add ", "create ", "introduce ", "implement ", "build ", "new ",
+    "cache ", "caching ", "deduplicate ", "centralize ", "centralise ",
+    "extract ", "persist ", "stream ", "consolidate ", "unify ",
+    "set up ", "expose ", "register ",
+)
 
 
 def _normalize_route(route: str) -> str:
@@ -322,12 +340,15 @@ def already_built(opp: Any, file_tree: List[str], key_files: Dict[str, str]) -> 
 
     # 1. Proposed route already defined somewhere in the code.
     for m in _ROUTE_RE.finditer(text):
-        route = _normalize_route(m.group(1))
+        raw_route = next((g for g in m.groups() if g), None)
+        if not raw_route:
+            continue
+        route = _normalize_route(raw_route)
         # Ignore trivially short/again-generic paths.
         if route.count("/") < 2 or len(route) < 6:
             continue
         if _normalize_route_present(route, corpus):
-            return f"route {m.group(1)!r} already exists in the codebase"
+            return f"route {raw_route!r} already exists in the codebase"
 
     # 2. Proposed NEW file already exists in the tree (only when the text frames
     #    it as creating that file — 'add report_store.py').
@@ -343,7 +364,39 @@ def already_built(opp: Any, file_tree: List[str], key_files: Dict[str, str]) -> 
             if re.search(rf"(?:add|create|new)\b[^.]*\b{re.escape(base)}", text.lower()):
                 return f"file {base!r} already exists in the repo"
 
+    # 3. Capability-construct check: the proposed capability is recognizable by a
+    #    construct that's already in the corpus. Each entry: (trigger phrases in
+    #    the proposal, regex that PROVES it exists in code). Conservative — only
+    #    well-known capabilities with an unambiguous code signature.
+    tl = text.lower()
+    for phrases, proof in _CAPABILITY_PROOFS:
+        if any(ph in tl for ph in phrases) and proof.search(corpus):
+            return f"capability already present in code ({phrases[0]!r} construct found)"
+
     return None
+
+
+# (proposal-phrase set, regex proving the capability already exists in corpus).
+# Targets the exact recurring false-positives the user kept seeing.
+_CAPABILITY_PROOFS = (
+    (("cache the repo file tree", "cache github", "cache the file tree",
+      "file-tree cache", "file tree cache", "cache file tree"),
+     re.compile(r"_tree_cache|ttlcache|tree_cache_get", re.IGNORECASE)),
+    (("provider factory", "deduplicate llm provider", "shared provider",
+      "centralize.*provider", "get_llm_provider", "provider singleton"),
+     re.compile(r"def get_provider|_provider\s*=|provider singleton|get_provider\(", re.IGNORECASE)),
+    (("sanitize.*request body", "body inspection", "skips request body",
+      "sanitize the body", "inspect the request body"),
+     re.compile(r"await request\.body\(\)|body_bytes\s*=\s*await", re.IGNORECASE)),
+    (("stream.*agent error", "swallow.*agent error", "agent error.*stream",
+      "per-agent error event"),
+     re.compile(r'"event":\s*"error"|yield\s*\{\s*"event":\s*"error', re.IGNORECASE)),
+    (("axios interceptor", "shared axios", "extract.*axios", "auth interceptor",
+      "configured axios"),
+     re.compile(r"interceptors\.request|axios\.create", re.IGNORECASE)),
+    (("security headers", "hsts", "x-frame-options", "x-content-type-options"),
+     re.compile(r"security_headers_middleware|strict-transport-security|x-frame-options", re.IGNORECASE)),
+)
 
 
 def _route_skeleton_pattern(segs: List[str]) -> str:
@@ -415,6 +468,31 @@ def suppressed_opportunity_signatures(repo_full_name: str) -> Set[str]:
     except Exception as e:  # pragma: no cover - defensive
         logger.debug("suppressed_opportunity_signatures failed (%s); suppressing nothing", e)
         return set()
+
+
+def journaled_titles(repo_full_name: str) -> List[str]:
+    """Titles of every opportunity in the journal (any state) for this repo,
+    recovered from the `opportunity::title::file` signatures. Fed to the
+    discovery prompt as a DO-NOT-PROPOSE list so shipped/dismissed/in-flight
+    work stops recurring. Best-effort: empty on error."""
+    if not repo_full_name:
+        return []
+    try:
+        from app.services import inflight_registry as ir
+        rows = ir.journal_list(repo_full_name=repo_full_name)
+        titles: List[str] = []
+        for r in rows:
+            sig = str(r.get("finding_sig", ""))
+            if not sig.startswith(OPPORTUNITY_KIND + "::"):
+                continue
+            # sig = opportunity::<title>::<file> — recover the title segment.
+            parts = sig.split("::")
+            if len(parts) >= 2 and parts[1]:
+                titles.append(parts[1])
+        return titles
+    except Exception as e:  # pragma: no cover - defensive
+        logger.debug("journaled_titles failed (%s)", e)
+        return []
 
 
 def journal_states_for(repo_full_name: str) -> Dict[str, str]:

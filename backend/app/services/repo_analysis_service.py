@@ -102,6 +102,74 @@ class RepoAnalysisService:
             "warnings": warnings,
         }
 
+    # Source files worth fetching for the BUILD path specifically. The default
+    # key-file set (~18 config + entry files) is enough for analyze, but the
+    # Opportunity Planner needs to SEE the route/service/agent code so it (a)
+    # doesn't propose adding capabilities that already exist there, and (b) the
+    # already-built detector + LLM critic have the proof-of-existence in hand.
+    # Tokens that mark a path as high-signal app code.
+    _BUILD_SOURCE_TOKENS = (
+        "/routes/", "/api/", "/services/", "/agents/", "/orchestrator/",
+        "/schemas/", "/components/", "/pages/", "/hooks/", "/lib/",
+        "main.py", "app.py", "api.ts", "app.tsx",
+    )
+    _BUILD_SOURCE_EXTS = (".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".rs")
+    _BUILD_SKIP_TOKENS = (
+        "node_modules/", "/dist/", "/build/", "__pycache__/", "/.venv/",
+        "/venv/", "/tests/", "/test/", "/__tests__/", ".test.", ".spec.",
+        "/migrations/", ".min.", "dist-demo/",
+    )
+
+    @classmethod
+    async def enrich_build_corpus(
+        cls, token: str, owner: str, repo: str, context: Dict[str, Any],
+        max_source_files: int = 40,
+    ) -> Dict[str, Any]:
+        """Fetch a broad set of SOURCE files (routes/services/agents/components)
+        into context['key_files'] so the opportunity pipeline can see what the
+        codebase already does. Mutates and returns `context`. Best-effort: a
+        fetch failure just means fewer files, never an error. Files already
+        present in key_files are skipped (no double fetch)."""
+        tree: List[str] = context.get("file_tree") or []
+        already = set((context.get("key_files") or {}).keys())
+
+        def _is_source(p: str) -> bool:
+            lp = p.lower()
+            if any(skip in lp for skip in cls._BUILD_SKIP_TOKENS):
+                return False
+            if not lp.endswith(cls._BUILD_SOURCE_EXTS):
+                return False
+            return any(tok in lp for tok in cls._BUILD_SOURCE_TOKENS)
+
+        # Rank by signal: route/service/agent files first, then by short path
+        # depth (top-level app code over deeply nested helpers).
+        def _rank(p: str) -> int:
+            lp = p.lower()
+            s = 0
+            for w, toks in (
+                (40, ("/routes/", "/api/")),
+                (30, ("/services/", "/orchestrator/", "/agents/")),
+                (20, ("/schemas/", "/pages/", "/components/", "/hooks/", "/lib/")),
+            ):
+                if any(t in lp for t in toks):
+                    s += w
+            s -= lp.count("/")  # prefer shallower paths slightly
+            return s
+
+        candidates = sorted(
+            (p for p in tree if _is_source(p) and p not in already),
+            key=_rank, reverse=True,
+        )[:max_source_files]
+
+        if not candidates:
+            return context
+
+        fetched = await cls._fetch_files(token, owner, repo, candidates)
+        key_files = context.get("key_files") or {}
+        key_files.update(fetched)
+        context["key_files"] = key_files
+        return context
+
     @classmethod
     def _select_key_files(cls, tree: List[str]) -> List[str]:
         """Pick files to fetch: prioritized list + first workflow yaml."""
