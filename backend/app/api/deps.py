@@ -13,7 +13,7 @@ import logging
 from typing import Optional
 
 import httpx
-from fastapi import Header, HTTPException, Query
+from fastapi import Header, HTTPException
 
 from app.services import session_store
 
@@ -64,17 +64,17 @@ def require_body_credential(value: Optional[str]) -> str:
 
 def resolve_access_token(
     authorization: Optional[str] = Header(default=None),
-    access_token: Optional[str] = Query(default=None),
 ) -> str:
-    """Resolve the GitHub token from the Authorization header (preferred) or the
-    legacy ?access_token= query param (fallback). The header/param now carries
-    an opaque SESSION ID which is resolved to the real token via the vault;
-    a raw token is still accepted (back-compat) and passed through.
+    """Resolve the credential from the Authorization header ONLY. The header
+    carries an opaque SESSION ID (shipmate_sess_…) resolved to the real token
+    via the vault; a raw token is still accepted (back-compat) and passed
+    through.
 
-    Passing the token as a query param leaks it into server access logs, the
-    Referer header, and browser history (OPP-001). New clients send
-    `Authorization: Bearer <session_id>`; the query param is still accepted so
-    in-flight sessions keep working during migration."""
+    The legacy `?access_token=` query-param source was REMOVED: a token (even a
+    session id) in the URL leaks into server access logs, the Referer header,
+    and browser history (OPP-001), and GuardRail correctly kept flagging the
+    surface. The frontend has always sent `Authorization: Bearer` via the axios
+    interceptor, so nothing relied on the query path."""
     candidate: Optional[str] = None
     if authorization:
         parts = authorization.split(" ", 1)
@@ -82,8 +82,6 @@ def resolve_access_token(
             tok = parts[1].strip()
             if tok:
                 candidate = tok
-    if candidate is None and access_token:
-        candidate = access_token
 
     resolved = resolve_credential(candidate)
     if resolved:

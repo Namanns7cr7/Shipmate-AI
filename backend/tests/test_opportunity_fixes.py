@@ -15,27 +15,28 @@ from app.api.routes.auth import resolve_access_token
 # ── OPP-001: token resolution ────────────────────────────────────────────────
 
 class TestTokenResolution:
+    # The legacy ?access_token= query-param source was REMOVED (back-compat door
+    # closed): a credential in the URL leaks into logs/Referer/history, which
+    # GuardRail kept (correctly) flagging. resolve_access_token is now
+    # header-only and takes a single `authorization` arg.
     def test_prefers_bearer_header(self):
-        assert resolve_access_token(authorization="Bearer abc123", access_token=None) == "abc123"
+        assert resolve_access_token(authorization="Bearer abc123") == "abc123"
 
     def test_accepts_token_scheme(self):
-        assert resolve_access_token(authorization="token xyz", access_token=None) == "xyz"
+        assert resolve_access_token(authorization="token xyz") == "xyz"
 
-    def test_falls_back_to_query_param(self):
-        assert resolve_access_token(authorization=None, access_token="legacy") == "legacy"
-
-    def test_header_wins_over_query(self):
-        assert resolve_access_token(authorization="Bearer hdr", access_token="qry") == "hdr"
-
-    def test_missing_both_raises_401(self):
+    def test_missing_header_raises_401(self):
         from fastapi import HTTPException
         with pytest.raises(HTTPException) as ei:
-            resolve_access_token(authorization=None, access_token=None)
+            resolve_access_token(authorization=None)
         assert ei.value.status_code == 401
 
-    def test_malformed_header_falls_back_to_query(self):
-        # No scheme -> ignore header, use query.
-        assert resolve_access_token(authorization="garbage", access_token="q") == "q"
+    def test_malformed_header_raises_401(self):
+        # No scheme -> nothing usable, and there's no query fallback anymore.
+        from fastapi import HTTPException
+        with pytest.raises(HTTPException) as ei:
+            resolve_access_token(authorization="garbage")
+        assert ei.value.status_code == 401
 
 
 # ── OPP-003: file-tree TTL cache ─────────────────────────────────────────────

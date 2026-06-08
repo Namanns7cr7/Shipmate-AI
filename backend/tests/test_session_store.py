@@ -153,5 +153,8 @@ def test_oauth_callback_returns_session_id_not_raw_token(monkeypatch):
     assert body["session_id"].startswith("shipmate_sess_")
     assert body["session_id"] != "ghp_THE_REAL_TOKEN"
     assert "ghp_THE_REAL_TOKEN" not in resp.text
+    # Door (B) closed: the `access_token` mirror was dropped — the response must
+    # carry ONLY the opaque session id, no token alias of any kind.
+    assert "access_token" not in body
     # And that session must resolve back to the real token server-side.
     assert ss.resolve(body["session_id"]) == "ghp_THE_REAL_TOKEN"

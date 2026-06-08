@@ -36,15 +36,13 @@ async def github_callback(code: str = Query(...), state: str = Query(...)):
         # Vault the raw token and hand the client an OPAQUE session id instead.
         # The raw token never crosses the network boundary again — the frontend
         # stores `session_id`, sends it as the bearer credential, and the auth
-        # boundary resolves it back to the token server-side.
+        # boundary resolves it back to the token server-side. We deliberately do
+        # NOT echo the raw token (nor an `access_token` alias) — the migration
+        # window is over; the frontend reads `session_id`.
         session_id = session_store.mint(access_token, scope=token_data.get("scope"))
         return {
             "success": True,
             "session_id": session_id,
-            # `access_token` retained in the response for one migration window so
-            # an older frontend build still authenticates; new clients use
-            # session_id. Remove after the frontend ships the session_id path.
-            "access_token": session_id,
             "token_type": token_data.get("token_type", "bearer"),
             "scope": token_data.get("scope"),
             "user": user_profile,

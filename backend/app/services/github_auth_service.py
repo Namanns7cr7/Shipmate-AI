@@ -114,8 +114,11 @@ class GitHubAuthService:
     GITHUB_TOKEN_URL = "https://github.com/login/oauth/access_token"
     GITHUB_API_URL = "https://api.github.com"
 
-    # In-memory token cache (access tokens only — not used for CSRF)
-    _tokens: Dict[str, Dict[str, Any]] = {}
+    # NOTE: the in-memory `_tokens` dict was RETIRED. It was a fourth place the
+    # raw token lived (alongside localStorage, request bodies, and the
+    # ci_watch_state column) — the exact scatter the session vault removed. The
+    # vault (session_store) is now the single source of truth for token lifecycle
+    # and validity; this class no longer caches raw tokens at all.
 
     @classmethod
     def get_auth_url(cls, redirect_uri: str) -> str:
@@ -212,15 +215,10 @@ class GitHubAuthService:
                 f"GitHub OAuth error: {token_data.get('error_description', token_data.get('error'))}"
             )
 
-        # Store token in memory for session
-        access_token = token_data.get("access_token")
-        if access_token:
-            cls._tokens[access_token] = {
-                "created_at": datetime.now(),
-                "scope": token_data.get("scope"),
-                "token_type": token_data.get("token_type", "bearer"),
-            }
-
+        # The raw token is NOT cached here — the callback route vaults it via
+        # session_store and hands the client an opaque session id. Returning the
+        # token_data (incl. the raw token) to the immediate caller is fine: it's
+        # the OAuth-exchange boundary, where the token is minted into the vault.
         return token_data
 
     @classmethod
@@ -512,25 +510,9 @@ class GitHubAuthService:
         return formatted_issues
 
     @classmethod
-    def is_token_valid(cls, access_token: str) -> bool:
-        """
-        Check if access token is stored and valid
-
-        Args:
-            access_token: Token to validate
-
-        Returns:
-            True if token exists in session
-        """
-        return access_token in cls._tokens
-
-    @classmethod
     def clear_token(cls, access_token: str) -> None:
-        """
-        Clear/logout token from session
-
-        Args:
-            access_token: Token to remove
-        """
-        if access_token in cls._tokens:
-            del cls._tokens[access_token]
+        """Logout hook. The in-memory token cache is gone — the vault owns token
+        lifecycle now, and the logout route already calls
+        session_store.revoke_token(). Kept as a no-op so the route's call site
+        doesn't need to change and any external caller stays compatible."""
+        return None

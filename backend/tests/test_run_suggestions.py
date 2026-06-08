@@ -110,19 +110,27 @@ class TestVerifyRepoWriteAccess:
 # ── resolve_access_token (now shared in deps) ────────────────────────────────
 
 class TestResolveToken:
-    def test_header_beats_query(self):
+    # Header-only since the query-param door was closed (B). No ?access_token=.
+    def test_header_bearer(self):
         from app.api.deps import resolve_access_token
-        assert resolve_access_token(authorization="Bearer h", access_token="q") == "h"
+        assert resolve_access_token(authorization="Bearer h") == "h"
 
-    def test_query_fallback(self):
-        from app.api.deps import resolve_access_token
-        assert resolve_access_token(authorization=None, access_token="q") == "q"
-
-    def test_missing_both_401(self):
+    def test_missing_header_401(self):
         from app.api.deps import resolve_access_token
         from fastapi import HTTPException
         with pytest.raises(HTTPException) as ei:
-            resolve_access_token(authorization=None, access_token=None)
+            resolve_access_token(authorization=None)
+        assert ei.value.status_code == 401
+
+    def test_query_param_no_longer_accepted(self):
+        # A URL credential must NOT authenticate — resolve_access_token no longer
+        # reads any query param; only the header counts. Passing nothing in the
+        # header is a hard 401 even though a real backend request might still
+        # carry ?access_token= in the URL (now ignored).
+        from app.api.deps import resolve_access_token
+        from fastapi import HTTPException
+        with pytest.raises(HTTPException) as ei:
+            resolve_access_token(authorization=None)
         assert ei.value.status_code == 401
 
 
