@@ -131,6 +131,15 @@ class ShipMateOrchestrator:
         key_blockers = ReportService.extract_blockers(plan_forge_out, guardrail_out)
         next_actions = ReportService.extract_next_actions(plan_forge_out, guardrail_out, testpilot_out)
 
+        # Was the LLM discovery/enhancement path live this run? If not, the
+        # outputs are pure heuristics (generic milestones, template tests) and
+        # the UI should say so rather than present them as AI findings.
+        try:
+            from app.services.llm_service import LLMService
+            ai_enhanced = LLMService.is_available()
+        except Exception:
+            ai_enhanced = False
+
         return ShipMateReport(
             repo=repo_info,
             readiness_score=final_score,
@@ -145,4 +154,5 @@ class ShipMateOrchestrator:
             key_blockers=key_blockers,
             next_actions=next_actions,
             generated_at=datetime.now(timezone.utc).isoformat(),
+            ai_enhanced=ai_enhanced,
         )

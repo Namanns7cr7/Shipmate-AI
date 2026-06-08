@@ -191,6 +191,10 @@ export interface ShipMateReport {
   key_blockers: string[];
   next_actions: string[];
   generated_at: string;
+  /** False when the run degraded to pure heuristics (LLM provider
+   *  unavailable) — the UI shows a heuristic-only banner. Optional for
+   *  back-compat with older payloads. */
+  ai_enhanced?: boolean;
 }
 
 export interface AnalyzeResponse {

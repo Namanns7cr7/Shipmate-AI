@@ -278,13 +278,14 @@ _MERGERS = {
 class LLMService:
     """Static helpers that 3 agents call after their heuristic compute."""
 
-    _enabled: Optional[bool] = None
-
     @classmethod
     def is_available(cls) -> bool:
-        if cls._enabled is None:
-            cls._enabled = _get_provider() is not None
-        return cls._enabled
+        """Whether the LLM provider is currently constructible. Reflects the
+        LIVE provider state (not a one-time cache) so that after a transient
+        auth failure invalidates the provider — or after creds are refreshed —
+        the answer is current. _get_provider() does its own per-process caching,
+        so this stays cheap."""
+        return _get_provider() is not None
 
     @classmethod
     def enhance(cls, agent_name: str, context: Dict[str, Any], base_output: T) -> T:

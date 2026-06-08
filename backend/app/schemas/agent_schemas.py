@@ -163,3 +163,9 @@ class ShipMateReport(BaseModel):
     key_blockers: List[str]
     next_actions: List[str]
     generated_at: str
+    # True when the LLM discovery/enhancement path was live for this run; False
+    # when it silently degraded to pure heuristics (expired creds / unreachable
+    # provider). Lets the UI show a "heuristic-only" banner instead of leaving
+    # the user wondering why findings look generic. Defaults True for back-compat
+    # with any stored/older report that predates this field.
+    ai_enhanced: bool = True

@@ -139,11 +139,20 @@ function useAgentSimulation(analyzing: boolean) {
     setOverallPct(100);
   }
 
+  // Snap a single agent to complete when its REAL SSE agent.done event fires,
+  // keeping the progress bars in sync with the live Activity Log instead of the
+  // fixed 32s timer. The ticker still drives smooth in-between motion and the
+  // overall %; real completion events are authoritative for per-agent state.
+  function markAgentComplete(id: AgentProgress['id']) {
+    setAgents(prev => prev.map(a => a.id === id ? { ...a, status: 'complete' } : a));
+    setProgressByAgent(prev => ({ ...prev, [id]: 100 }));
+  }
+
   function markAllError() {
     setAgents(prev => prev.map(a => ({ ...a, status: a.status === 'running' ? 'error' : a.status })));
   }
 
-  return { agents, progressByAgent, overallPct, markAllComplete, markAllError };
+  return { agents, progressByAgent, overallPct, markAllComplete, markAgentComplete, markAllError };
 }
 
 export default function App() {
@@ -161,7 +170,7 @@ export default function App() {
   // Real per-agent activity-log lines from the SSE stream (empty until events arrive).
   const [liveLines, setLiveLines]           = useState<LogLine[]>([]);
 
-  const { agents, progressByAgent, overallPct, markAllComplete, markAllError } = useAgentSimulation(analyzing);
+  const { agents, progressByAgent, overallPct, markAllComplete, markAgentComplete, markAllError } = useAgentSimulation(analyzing);
 
   useEffect(() => {
     if (!auth.isAuthenticated || !auth.accessToken) return;
@@ -210,6 +219,9 @@ export default function App() {
         if (evt.event === 'agent.done' && evt.agent) {
           const meta = AGENT_LOG_META[evt.agent] ?? { label: evt.agent, tone: 'slate' };
           pushLine({ agent: meta.label, text: 'analysis complete ✓', tone: meta.tone, time: _nowHMS() });
+          // Snap this agent's progress bar to complete — keeps bars in sync
+          // with the log (issue: bars were on a fixed timer, decoupled).
+          markAgentComplete(evt.agent as AgentProgress['id']);
         } else if (evt.event === 'report.done') {
           pushLine({ agent: 'system', text: '✓ Readiness score computed — shipping report', tone: 'emerald', time: _nowHMS() });
         } else if (evt.event === 'error') {
@@ -236,7 +248,7 @@ export default function App() {
         setPage('repos');
       }
     }
-  }, [selectedRepo, selectedBranch, selectedPull, auth.accessToken, markAllComplete, markAllError, handleSelectRepo]);
+  }, [selectedRepo, selectedBranch, selectedPull, auth.accessToken, markAllComplete, markAgentComplete, markAllError, handleSelectRepo]);
 
   if (!auth.isAuthenticated) {
     return <LandingPage onLogin={auth.login} loading={auth.loading} error={auth.error} />;

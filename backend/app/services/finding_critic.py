@@ -105,22 +105,69 @@ class _CriticReport(BaseModel):
 
 _CRITIC_SYSTEM = (
     "You are a skeptical senior security/code reviewer acting as a VERIFIER for "
-    "an automated analysis tool. You are given (a) the exact source code that "
-    "was analyzed and (b) a list of candidate findings the tool produced. Your "
-    "job is to catch FALSE POSITIVES.\n\n"
-    "For each finding, decide is_real=true ONLY if the code shown genuinely "
-    "exhibits the problem. Mark is_real=false when the finding is:\n"
-    "  - flagging a DETECTION pattern as the vulnerability itself (e.g. a regex "
-    "    literal or denylist string that BLOCKS eval/exec is NOT dynamic code "
-    "    execution),\n"
-    "  - describing a control that actually EXISTS in the code shown (e.g. "
-    "    claiming 'no auth check' when an auth check is present),\n"
-    "  - generic boilerplate not grounded in the shown code,\n"
-    "  - referencing a file/line/symbol that does not appear in the code shown.\n"
-    "Default to is_real=true ONLY when you can point to concrete offending code. "
-    "When the evidence is absent, prefer is_real=false. Always emit one verdict "
-    "per finding, echoing the title verbatim."
+    "an automated analysis tool that is KNOWN to produce false positives. You "
+    "are given (a) the exact source code that was analyzed and (b) candidate "
+    "findings. Your ONE job is to catch false positives. Be aggressive about it.\n\n"
+    "Mark is_real=FALSE (the finding is bogus) when ANY of these hold:\n"
+    "  1. DETECTION/DEFENSIVE CODE: the flagged token only appears inside a "
+    "regex literal, a denylist/blocklist, a sanitiser, a comment, a docstring, "
+    "a string constant, or a SECURITY CHECK. Code that BLOCKS or DETECTS a "
+    "pattern is the OPPOSITE of being vulnerable to it.\n"
+    "  2. The control the finding says is MISSING actually EXISTS in the code "
+    "shown (e.g. 'no body sanitization' but a sanitize middleware is present; "
+    "'OAuth state in-memory' but a sqlite/db store is present; 'no auth check' "
+    "but a verify_*_access call is present).\n"
+    "  3. Generic boilerplate not grounded in the specific code shown.\n"
+    "  4. References a file/line/symbol that does not appear in the code shown.\n\n"
+    "WORKED EXAMPLE (critical — this exact case recurs):\n"
+    "  Finding: 'Dynamic code execution detected — eval()/exec()/__import__()'.\n"
+    "  Code shown contains only:  _DANGEROUS_PATTERNS = [re.compile(r\"eval\\\\s*\\\\(\"), "
+    "re.compile(r\"exec\\\\s*\\\\(\"), re.compile(r\"__import__\\\\s*\\\\(\")] used by a "
+    "middleware that returns HTTP 400 on a match.\n"
+    "  CORRECT VERDICT: is_real=FALSE. These are detection regexes that BLOCK "
+    "eval/exec; there is no actual eval()/exec() CALL. Flagging them is the "
+    "tool flagging its own defense. Only is_real=TRUE if you can point to a "
+    "real call like `result = eval(user_input)` at a code (non-string, "
+    "non-comment, non-regex) position.\n\n"
+    "Set is_real=TRUE only when you can quote the concrete offending line and it "
+    "is genuine executable code, not a pattern/string/comment. When in doubt "
+    "about whether it's defensive code, prefer is_real=FALSE. Emit exactly one "
+    "verdict per finding, echoing the title verbatim."
 )
+
+
+def _is_injection_finding(f: Any) -> bool:
+    cat = (getattr(f, "category", "") or "").lower()
+    title = (getattr(f, "title", "") or "").lower()
+    return cat == "injection" or "dynamic code execution" in title or "eval" in title
+
+
+def _deterministic_prefilter(findings: List[Any], code_blob: str) -> List[Any]:
+    """Drop findings we can refute WITHOUT an LLM. Currently: a dynamic-code-
+    execution / injection finding is refuted when the code-aware detector finds
+    no genuine eval/exec/__import__ CALL in the analyzed code (i.e. the matches
+    are only regex literals / denylist strings / comments). This is the reliable
+    fix for the recurring false positive; the LLM critic is too conservative to
+    drop a security finding on its own. Fail-open: if we can't decide, keep it."""
+    if not code_blob:
+        return findings
+    try:
+        # Lazy import to avoid a cycle (guardrail_agent imports llm_service which
+        # could import this module).
+        from app.agents.guardrail_agent import _has_real_dynamic_exec
+    except Exception:
+        return findings
+    real_exec = _has_real_dynamic_exec(code_blob)
+    kept = []
+    for f in findings:
+        if _is_injection_finding(f) and not real_exec:
+            logger.info(
+                "deterministic prefilter refuted injection finding (no real "
+                "eval/exec call in analyzed code): %s", getattr(f, "title", ""),
+            )
+            continue
+        kept.append(f)
+    return kept
 
 
 def verify_findings(
@@ -136,6 +183,17 @@ def verify_findings(
     evidence). `provider` is an LLM provider (or None). Fail-open: on any error
     or if the critic is disabled / provider missing, return findings unchanged
     — never silently drop a finding because the critic couldn't run."""
+    if not findings:
+        return findings
+
+    # Deterministic pre-filter (runs even with no LLM): for the categories we
+    # can verify programmatically, drop a finding when the code-aware detector
+    # says the pattern is NOT genuinely present. This is what reliably kills the
+    # recurring "dynamic code execution" false positive that the LLM critic is
+    # too conservative to refute — main.py's eval/exec regex LITERALS are not a
+    # real call, and _has_real_dynamic_exec() returns False for them.
+    findings = _deterministic_prefilter(findings, code_blob)
+
     if not _CRITIC_ENABLED or provider is None or not findings:
         return findings
 

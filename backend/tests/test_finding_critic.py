@@ -9,7 +9,10 @@ from app.services import finding_critic as fc
 from app.schemas.agent_schemas import SecurityFinding, Severity
 
 
-def _finding(title, category="injection", file="x.py"):
+def _finding(title, category="secrets", file="x.py"):
+    # Default category is NON-injection so the deterministic prefilter (which
+    # only refutes injection findings) doesn't interfere with tests exercising
+    # the LLM critic path. Injection-specific behavior is tested explicitly.
     return SecurityFinding(
         id="SEC-001", title=title, severity=Severity.HIGH,
         category=category, description="d", recommendation="r", file=file,
@@ -100,6 +103,28 @@ class TestCriticPass:
     def test_no_provider_is_failopen(self):
         findings = [_finding("anything")]
         assert fc.verify_findings(findings, "code", None) == findings
+
+
+class TestDeterministicPrefilter:
+    def test_injection_refuted_when_no_real_exec_in_blob(self):
+        # blob has only a detection regex (no real eval call) -> injection
+        # finding is refuted deterministically, even with no LLM provider.
+        fp = _finding("Dynamic code execution detected", category="injection")
+        blob = '_DANGEROUS = [re.compile(r"eval\\s*\\(")]\n'
+        out = fc.verify_findings([fp], blob, None)
+        assert out == []
+
+    def test_injection_kept_when_real_exec_present(self):
+        fp = _finding("Dynamic code execution detected", category="injection")
+        blob = "def h(x):\n    return eval(x)\n"
+        out = fc.verify_findings([fp], blob, None)
+        assert len(out) == 1
+
+    def test_non_injection_not_prefiltered(self):
+        f = _finding("Hardcoded secret", category="secrets")
+        blob = '_DANGEROUS = [re.compile(r"eval\\s*\\(")]\n'
+        # secrets finding is untouched by the injection prefilter
+        assert fc.verify_findings([f], blob, None) == [f]
 
 
 # ── Fix-resolution check ──────────────────────────────────────────────────────
