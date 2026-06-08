@@ -73,6 +73,51 @@ def test_already_resolved_keeps_unrelated_finding():
     assert len(kept) == 1
 
 
+def test_already_resolved_drops_oauth_state_and_token_vault_variants():
+    """The exact recurring loop titles (after the back-compat doors closed) must
+    drop against a corpus that proves the controls exist."""
+    from app.services import finding_critic as fc
+    key_files = {
+        "auth.py": "access_token: str = Depends(resolve_access_token)",
+        "github_auth_service.py": "def _consume_state(state): ... oauth_states ...",
+        "session_store.py": "def mint(access_token): return 'shipmate_sess_' + x",
+    }
+    titles = [
+        "GitHub Access Token Leaked in Query Parameters",
+        "Persist OAuth Token Server-Side via DB Session",
+        "OAuth State Validated In-Memory, Bypass on Restart",
+    ]
+    findings = [_F(t) for t in titles]
+    kept = fc.filter_already_resolved(findings, [], key_files, kind="blocker")
+    assert kept == [], f"all three should drop, kept: {[f.title for f in kept]}"
+
+
+# ── branch-pinned corpus fetch (the staleness bug) ───────────────────────────
+
+def test_fetch_files_pins_to_branch_ref(monkeypatch):
+    """_fetch_files MUST pass ref=branch to get_file_content. Without it GitHub
+    served the DEFAULT branch, so analyzing a feature branch saw stale code and
+    re-flagged already-fixed issues (the root cause of the recurrence)."""
+    import asyncio
+    from app.services.repo_analysis_service import RepoAnalysisService
+    from app.services import github_api_service as gh
+
+    seen_refs = []
+
+    async def fake_get_content(token, owner, repo, path, ref=None):
+        seen_refs.append(ref)
+        return f"# {path}\nresolve_access_token\n"
+
+    monkeypatch.setattr(gh.GitHubAPIService, "get_file_content", staticmethod(fake_get_content))
+
+    asyncio.run(RepoAnalysisService._fetch_files(
+        "t", "o", "r", ["app/api/routes/auth.py", "app/api/deps.py"], ref="feat/x",
+    ))
+    assert seen_refs, "expected fetches"
+    assert all(r == "feat/x" for r in seen_refs), \
+        f"every fetch must pin ref=feat/x, saw: {seen_refs}"
+
+
 # ── name-keyed suppression (TestPilot) ───────────────────────────────────────
 
 def test_filter_suppressed_by_name():

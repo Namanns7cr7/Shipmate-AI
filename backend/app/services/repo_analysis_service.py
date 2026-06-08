@@ -69,8 +69,9 @@ class RepoAnalysisService:
         # Determine which files to fetch
         files_to_fetch = cls._select_key_files(file_tree)
 
-        # Fetch key file contents in parallel (bounded concurrency)
-        key_files = await cls._fetch_files(token, owner, repo, files_to_fetch)
+        # Fetch key file contents in parallel (bounded concurrency), pinned to
+        # the analyzed branch so the corpus reflects THIS branch, not default.
+        key_files = await cls._fetch_files(token, owner, repo, files_to_fetch, ref=branch)
 
         # Optional PR context. A missing PR (404) is an expected, benign case —
         # we proceed with pr_info=None. But a transient/server error (429/5xx,
@@ -169,7 +170,10 @@ class RepoAnalysisService:
         if not candidates:
             return context
 
-        fetched = await cls._fetch_files(token, owner, repo, candidates)
+        # Pin to the analyzed branch (from context) — same staleness fix as
+        # build_context; without it the enriched source is default-branch.
+        branch = context.get("branch") or "main"
+        fetched = await cls._fetch_files(token, owner, repo, candidates, ref=branch)
         key_files = context.get("key_files") or {}
         key_files.update(fetched)
         context["key_files"] = key_files
@@ -203,14 +207,24 @@ class RepoAnalysisService:
 
     @classmethod
     async def _fetch_files(
-        cls, token: str, owner: str, repo: str, paths: List[str]
+        cls, token: str, owner: str, repo: str, paths: List[str],
+        ref: Optional[str] = None,
     ) -> Dict[str, str]:
-        """Fetch files with bounded concurrency (max 6 parallel requests)."""
+        """Fetch files with bounded concurrency (max 6 parallel requests).
+
+        `ref` pins the fetch to a specific branch/sha. CRITICAL: without it,
+        GitHub serves the repo's DEFAULT branch, so analyzing a feature branch
+        returned stale default-branch content — the agents then flagged issues
+        already fixed on the analyzed branch (and the deterministic
+        already-resolved gate couldn't find its proof files because they didn't
+        exist on default yet). Pinning to the analyzed branch fixes that."""
         sem = asyncio.Semaphore(6)
 
         async def fetch_one(path: str):
             async with sem:
-                content = await GitHubAPIService.get_file_content(token, owner, repo, path)
+                content = await GitHubAPIService.get_file_content(
+                    token, owner, repo, path, ref=ref,
+                )
                 return path, content
 
         # Overall timeout so a few slow/hung fetches can't stall context-build

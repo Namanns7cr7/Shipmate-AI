@@ -133,14 +133,23 @@ _RESOLVED_PROOFS = (
     (("token leaked in query", "access token leaked", "token in query param",
       "token via query", "access_token query param", "query parameter on /"),
      _re2.compile(r"Depends\(\s*resolve_access_token\s*\)|resolve_access_token", _re2.IGNORECASE)),
-    # OAuth state in-memory: refuted once a sqlite/db-backed state store exists.
+    # OAuth state in-memory / lost on restart: refuted once a sqlite/db-backed
+    # state store exists (oauth_states table + _consume_state survive restart).
     (("oauth state in-memory", "state not validated", "state in memory",
-      "csrf state not persisted", "oauth state stored in memory"),
+      "csrf state not persisted", "oauth state stored in memory",
+      "state validated in-memory", "bypass on restart", "bypass on server restart",
+      "state lost on restart", "csrf bypass on"),
      _re2.compile(r"oauth_states|_consume_state|_store_state", _re2.IGNORECASE)),
     # results not persisted: refuted once report_store.save_report is wired in.
     (("persist analysis result", "persist analysis results", "results not persisted",
       "persist results to sqlite", "store analysis results", "no analysis history"),
      _re2.compile(r"save_report\(|report_store\.", _re2.IGNORECASE)),
+    # token client-exposed / not server-side: refuted once the session vault
+    # exists (frontend holds an opaque session id, token lives server-side).
+    (("persist oauth token server-side", "persist github token server-side",
+      "persist token server-side", "token client-exposed", "token not server-side",
+      "store token server-side", "server-side token", "token in localstorage"),
+     _re2.compile(r"session_store|mint\(\s*access_token|shipmate_sess_|def mint\(", _re2.IGNORECASE)),
     # body sanitization missing: refuted once the body is actually read+scanned.
     (("request body not sanitized", "body sanitization", "skips request body",
       "no body sanitization", "body not validated"),
