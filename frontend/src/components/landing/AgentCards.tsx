@@ -12,12 +12,13 @@ export function AgentCards() {
     <section style={{ maxWidth: 1160, margin: '0 auto', padding: '70px 28px' }}>
       <Reveal>
         <div style={{ textAlign: 'center', marginBottom: 44 }}>
-          <span className="eyebrow" style={{ display: 'block', marginBottom: 12 }}>Five specialists · one crew</span>
+          <span className="eyebrow" style={{ display: 'block', marginBottom: 12 }}>Four specialists · one readiness verdict</span>
           <h2 style={{ fontSize: 38, fontWeight: 820, letterSpacing: '-0.03em', margin: 0 }}>
             A crew of agents for your codebase
           </h2>
-          <p className="muted" style={{ fontSize: 16, maxWidth: 540, margin: '12px auto 0' }}>
-            Each agent owns one slice of readiness. Together they turn a repo into a deployment decision.
+          <p className="muted" style={{ fontSize: 16, maxWidth: 560, margin: '12px auto 0' }}>
+            Four agents each own one slice of readiness; the Ship Report folds them into a single
+            score — then the Coder agent turns the findings into pull requests.
           </p>
         </div>
       </Reveal>
