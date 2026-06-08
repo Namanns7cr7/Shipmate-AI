@@ -1035,6 +1035,7 @@ def _capability_digest(context: Dict[str, Any]) -> str:
 
     route_list = sorted(r for r in routes if len(r) > 3)[:60]
     mod_list = sorted(modules)[:80]
+    controls = _detect_security_controls(key_files, file_tree)
     parts = []
     if route_list:
         parts.append("## Routes/endpoints that ALREADY EXIST (do NOT propose adding these)\n"
@@ -1043,7 +1044,56 @@ def _capability_digest(context: Dict[str, Any]) -> str:
         parts.append("## Service/agent/component modules that ALREADY EXIST "
                      "(do NOT propose creating these)\n"
                      + "\n".join(f"- {m}" for m in mod_list))
+    if controls:
+        parts.append("## Security controls ALREADY IMPLEMENTED — do NOT flag these "
+                     "as missing (the proof is in the codebase, even if it's in a "
+                     "file outside the snippet you were shown):\n"
+                     + "\n".join(f"- {c}" for c in controls))
     return "\n\n".join(parts) if parts else "(no capability digest available)"
+
+
+# (human-readable control statement, regex proving it exists in the full corpus).
+# This is the generation-time fix for the GuardRail recurrence: the LLM only
+# sees ~6 files in its discovery blob, so a control whose proof lives elsewhere
+# (e.g. _consume_state in github_auth_service.py) looks "missing" to it. We scan
+# the WHOLE corpus deterministically and TELL the model the control exists, so
+# it never invents the finding — no matter how it would have phrased it.
+_SECURITY_CONTROL_PROOFS = (
+    ("OAuth `state` is validated server-side via a persistent (sqlite) single-use "
+     "store — CSRF state survives restarts, NOT in-memory-only",
+     re.compile(r"oauth_states|_consume_state|_store_state", re.IGNORECASE)),
+    ("GitHub tokens are vaulted server-side (session_store): the client holds an "
+     "opaque session id, never the raw token — no client-exposed token",
+     re.compile(r"session_store|shipmate_sess_|def mint\(", re.IGNORECASE)),
+    ("Auth credential is taken from the Authorization header only "
+     "(resolve_access_token) — NOT from a URL query parameter",
+     re.compile(r"resolve_access_token", re.IGNORECASE)),
+    ("Repo write-access is verified before any mutating GitHub call "
+     "(verify_repo_write_access)",
+     re.compile(r"verify_repo_write_access", re.IGNORECASE)),
+    ("Request bodies are sanitized for injection patterns by a middleware",
+     re.compile(r"sanitize_input_middleware|_contains_dangerous_pattern", re.IGNORECASE)),
+    ("CORS uses an explicit, validated origin allowlist (no wildcard with credentials)",
+     re.compile(r"_validate_origin|_is_origin_allowed", re.IGNORECASE)),
+    ("Security response headers (HSTS/X-Frame-Options/nosniff) are set by a middleware",
+     re.compile(r"security_headers_middleware|x-frame-options|strict-transport-security", re.IGNORECASE)),
+    ("Incoming GitHub webhooks are authenticated via HMAC signature verification",
+     re.compile(r"_verify_github_webhook_signature|x-hub-signature|hmac\.compare_digest", re.IGNORECASE)),
+    ("Analysis results are persisted to a sqlite store (report_store.save_report)",
+     re.compile(r"save_report\(|report_store\.", re.IGNORECASE)),
+)
+
+
+def _detect_security_controls(key_files: Dict[str, str], file_tree: List[str]) -> List[str]:
+    """Return plain-English statements for every security control whose proof is
+    present anywhere in the full corpus. Fed to the discovery digest so GuardRail
+    stops re-proposing already-implemented controls (the soft recurrence)."""
+    blob_parts: List[str] = list(file_tree or [])
+    blob_parts.extend(v for v in (key_files or {}).values() if v)
+    blob = "\n".join(blob_parts)
+    if not blob:
+        return []
+    return [statement for statement, proof in _SECURITY_CONTROL_PROOFS if proof.search(blob)]
 
 
 def _journaled_titles(context: Dict[str, Any], namespaces: tuple) -> List[str]:

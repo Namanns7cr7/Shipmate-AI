@@ -209,3 +209,58 @@ def test_orchestrator_filter_drops_resolved_guardrail_finding(monkeypatch):
     assert "Access Token Leaked in Query Parameter on /auth/github/me" not in titles, \
         "resolved finding must be dropped by the orchestrator filter"
     assert "Real novel finding" in titles, "genuine finding must survive"
+
+
+# ── security-controls digest (stops GuardRail re-inventing fixed controls) ───
+
+def test_capability_digest_lists_implemented_security_controls():
+    """The digest fed to GuardRail discovery must assert which controls already
+    exist, so the LLM (which only sees ~6 files) never re-proposes them — the
+    generation-time fix for the soft recurrence, no matter how it'd phrase it."""
+    from app.services.llm_service import _detect_security_controls, _capability_digest
+    key_files = {
+        "github_auth_service.py": "def _consume_state(s): ... oauth_states ...",
+        "session_store.py": "def mint(access_token): return 'shipmate_sess_'+x",
+        "deps.py": "def resolve_access_token(authorization): ...",
+        "deps2.py": "async def verify_repo_write_access(o,r,t): ...",
+    }
+    controls = _detect_security_controls(key_files, [])
+    joined = " ".join(controls).lower()
+    assert "oauth" in joined and "server-side" in joined
+    assert "session" in joined or "vault" in joined
+    assert "authorization header" in joined
+    # And the full digest surfaces them under the do-NOT-flag header.
+    digest = _capability_digest({"key_files": key_files, "file_tree": []})
+    assert "ALREADY IMPLEMENTED" in digest
+
+
+def test_security_controls_empty_when_absent():
+    from app.services.llm_service import _detect_security_controls
+    # A repo with none of the control signatures → no false assertions.
+    assert _detect_security_controls({"x.py": "def hello(): pass"}, []) == []
+
+
+# ── RepoIndexService failure surfaces as a 502 (suggested test #3) ───────────
+
+def test_analyze_raises_502_when_repo_index_service_throws(monkeypatch):
+    """When the repo-index/context build fails, /analyze must return a clean 502
+    (bad upstream), not a 500. Mirrors the build/plan 502 guard."""
+    from fastapi.testclient import TestClient
+    from app.main import app
+    import app.api.routes.analysis as analysis_mod
+    from app.services.repo_index_service import RepoIndexService
+
+    # Write-access check passes; the index build is what blows up.
+    async def ok_auth(token, owner, repo):
+        return None
+    monkeypatch.setattr(analysis_mod, "_verify_repo_write_access", ok_auth)
+
+    async def boom(*a, **k):
+        raise RuntimeError("github exploded")
+    monkeypatch.setattr(RepoIndexService, "get_or_build", classmethod(lambda cls, **k: boom()))
+
+    client = TestClient(app)
+    resp = client.post("/api/analyze", json={
+        "owner": "o", "repo": "r", "branch": "main", "access_token": "t",
+    })
+    assert resp.status_code == 502

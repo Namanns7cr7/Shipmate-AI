@@ -9,7 +9,6 @@ import hmac
 import hashlib
 import logging
 import unicodedata
-from collections import defaultdict
 from io import BytesIO
 from typing import Any, Callable
 from urllib.parse import urlparse
@@ -88,7 +87,11 @@ class _RateLimiter:
         """
         self.capacity = capacity
         self.refill_rate = refill_rate
-        self.buckets: dict[str, _TokenBucket] = defaultdict()
+        # Plain dict — is_allowed() creates buckets on demand via an explicit
+        # key check below. The old `defaultdict()` (no factory) was misleading:
+        # with no factory it behaves exactly like {} but signals auto-vivify
+        # that never happens.
+        self.buckets: dict[str, _TokenBucket] = {}
     
     def is_allowed(self, client_ip: str) -> bool:
         """Check if a request from client_ip is allowed.
