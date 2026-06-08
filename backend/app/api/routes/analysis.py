@@ -5,6 +5,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from app.schemas.api_schemas import AnalyzeRequest, AnalyzeResponse
 from app.services.repo_analysis_service import RepoAnalysisService
+from app.services.repo_index_service import RepoIndexService
 from app.services import report_store
 from app.orchestrator.shipmate_orchestrator import ShipMateOrchestrator
 from app.api.deps import verify_repo_write_access, require_body_credential
@@ -52,20 +53,20 @@ async def analyze(request: AnalyzeRequest):
     )
 
     try:
-        repo_context = await RepoAnalysisService.build_context(
-            token=request.access_token,
-            owner=request.owner,
-            repo=request.repo,
-            branch=request.branch,
-            pr_number=request.pr_number,
-            feature_context=request.feature_context or "",
+        # Single front door — build_context + enrich + RepoLens, cached per
+        # (owner, repo, branch, pr_number). Widens the corpus with route/
+        # service/agent source so PlanForge discovery (and the capability
+        # digest) SEE what already exists — else it re-proposes built features
+        # (history endpoint, SSE, etc.) every run. The RepoLens result rides on
+        # the context so the orchestrator reuses it instead of re-running.
+        index = await RepoIndexService.get_or_build(
+            token=request.access_token, owner=request.owner, repo=request.repo,
+            branch=request.branch, include_source_corpus=True, run_repo_lens=True,
+            pr_number=request.pr_number, feature_context=request.feature_context or "",
         )
-        # Widen the corpus with route/service/agent source so PlanForge discovery
-        # (and the capability digest) can SEE what already exists — otherwise it
-        # re-proposes built features (history endpoint, SSE, etc.) every run.
-        await RepoAnalysisService.enrich_build_corpus(
-            request.access_token, request.owner, request.repo, repo_context,
-        )
+        repo_context = index.repo_context
+        if index.repo_lens is not None:
+            repo_context["repo_lens"] = index.repo_lens
     except Exception as e:
         raise HTTPException(
             status_code=502,
@@ -103,17 +104,14 @@ async def analyze_stream(request: AnalyzeRequest):
     )
 
     try:
-        repo_context = await RepoAnalysisService.build_context(
-            token=request.access_token,
-            owner=request.owner,
-            repo=request.repo,
-            branch=request.branch,
-            pr_number=request.pr_number,
-            feature_context=request.feature_context or "",
+        index = await RepoIndexService.get_or_build(
+            token=request.access_token, owner=request.owner, repo=request.repo,
+            branch=request.branch, include_source_corpus=True, run_repo_lens=True,
+            pr_number=request.pr_number, feature_context=request.feature_context or "",
         )
-        await RepoAnalysisService.enrich_build_corpus(
-            request.access_token, request.owner, request.repo, repo_context,
-        )
+        repo_context = index.repo_context
+        if index.repo_lens is not None:
+            repo_context["repo_lens"] = index.repo_lens
     except Exception as e:
         raise HTTPException(
             status_code=502,

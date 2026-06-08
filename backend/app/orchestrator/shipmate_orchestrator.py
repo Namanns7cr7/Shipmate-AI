@@ -44,7 +44,10 @@ class ShipMateOrchestrator:
             ShipMateReport
         """
         # ── Step 1: RepoLens (must run first — other agents need its output) ──
-        repo_lens_out = self.repo_lens.run(repo_context)
+        # Reuse a RepoLens output already attached to the context (e.g. by
+        # RepoIndexService, which analyzes the repo once and shares the result)
+        # instead of re-running the pass. Falls back to running it when absent.
+        repo_lens_out = repo_context.get("repo_lens") or self.repo_lens.run(repo_context)
 
         # Enrich context with RepoLens output
         enriched = {**repo_context, "repo_lens": repo_lens_out}
@@ -76,7 +79,9 @@ class ShipMateOrchestrator:
         while the SSE connection streams. run() stays the synchronous source of
         truth used by auto_fix and the non-streaming /analyze route."""
         try:
-            repo_lens_out = await asyncio.to_thread(self.repo_lens.run, repo_context)
+            # Reuse a context-supplied RepoLens (RepoIndexService) if present.
+            repo_lens_out = repo_context.get("repo_lens") or \
+                await asyncio.to_thread(self.repo_lens.run, repo_context)
             yield {"event": "agent.done", "agent": "repo_lens",
                    "output": repo_lens_out.model_dump()}
 

@@ -45,12 +45,15 @@ class OpportunityService:
         *,
         max_opportunities: int = 8,
         include_ungrounded: bool = False,
+        repo_lens: Any = None,
     ) -> BuildPlanResponse:
         """Run discover → ground → suppress → rank against an already-built
         repo context and return a ranked, grounded BuildPlanResponse.
 
         `repo_context` is the same dict RepoAnalysisService.build_context()
-        produces (repo_info, file_tree, key_files, branch, …)."""
+        produces (repo_info, file_tree, key_files, branch, …). `repo_lens`, if
+        passed by the caller (e.g. the route already ran it via RepoIndexService),
+        is reused instead of running RepoLens again — avoiding a duplicate pass."""
         info = repo_context.get("repo_info") or {}
         owner = (
             info.get("owner", {}).get("login", "")
@@ -64,9 +67,15 @@ class OpportunityService:
 
         # RepoLens output enriches the code-blob's entry-point scoring (same as
         # the other discovery passes, which run after RepoLens in the pipeline).
+        # Reuse a caller-supplied RepoLens (from RepoIndexService) when present;
+        # otherwise run it here. This is what collapses the duplicate RepoLens
+        # pass /build/* used to incur.
+        if repo_lens is None:
+            repo_lens = repo_context.get("repo_lens")
         try:
-            repo_lens_out = cls._repo_lens.run(repo_context)
-            enriched = {**repo_context, "repo_lens": repo_lens_out}
+            if repo_lens is None:
+                repo_lens = cls._repo_lens.run(repo_context)
+            enriched = {**repo_context, "repo_lens": repo_lens}
         except Exception as e:  # pragma: no cover - defensive
             logger.warning("RepoLens failed in opportunity pipeline (%s); proceeding without it", e)
             enriched = repo_context

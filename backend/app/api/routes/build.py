@@ -21,6 +21,7 @@ from app.schemas.api_schemas import (
 )
 from app.schemas.agent_schemas import BuildPlanResponse, BuildExecuteResponse
 from app.services.repo_analysis_service import RepoAnalysisService
+from app.services.repo_index_service import RepoIndexService
 from app.services.opportunity_service import OpportunityService
 from app.api.routes.analysis import _verify_repo_write_access
 from app.api.deps import require_body_credential
@@ -41,17 +42,15 @@ async def build_plan(request: BuildPlanRequest) -> BuildPlanResponse:
     )
 
     try:
-        repo_context = await RepoAnalysisService.build_context(
-            token=request.access_token,
-            owner=request.owner,
-            repo=request.repo,
-            branch=request.branch,
+        # One front door: build_context + enrich + RepoLens, cached per
+        # (owner, repo, branch, source-enriched). The planner needs the fat
+        # corpus so it SEES what already exists (else it re-proposes built
+        # features every run).
+        index = await RepoIndexService.get_or_build(
+            token=request.access_token, owner=request.owner, repo=request.repo,
+            branch=request.branch, include_source_corpus=True, run_repo_lens=True,
         )
-        # Pull route/service/agent source into the corpus so the planner can SEE
-        # what already exists (otherwise it re-proposes built features every run).
-        await RepoAnalysisService.enrich_build_corpus(
-            request.access_token, request.owner, request.repo, repo_context,
-        )
+        repo_context = index.repo_context
     except Exception as e:
         raise HTTPException(
             status_code=502,
@@ -63,6 +62,7 @@ async def build_plan(request: BuildPlanRequest) -> BuildPlanResponse:
             repo_context,
             max_opportunities=request.max_opportunities,
             include_ungrounded=request.include_ungrounded,
+            repo_lens=index.repo_lens,
         )
     except Exception as e:
         logger.exception("build_plan failed for %s/%s", request.owner, request.repo)
@@ -86,27 +86,22 @@ async def build_execute(request: BuildExecuteRequest) -> BuildExecuteResponse:
     )
 
     try:
-        repo_context = await RepoAnalysisService.build_context(
-            token=request.access_token,
-            owner=request.owner,
-            repo=request.repo,
-            branch=request.branch,
+        # Single front door — build_context + enrich + RepoLens, cached. This
+        # collapses the previous THREE RepoLens runs per execute (here +
+        # OpportunityService.build_plan) into one. RepoLens enriches the
+        # execute context (entry points for the Coder).
+        index = await RepoIndexService.get_or_build(
+            token=request.access_token, owner=request.owner, repo=request.repo,
+            branch=request.branch, include_source_corpus=True, run_repo_lens=True,
         )
-        await RepoAnalysisService.enrich_build_corpus(
-            request.access_token, request.owner, request.repo, repo_context,
-        )
+        repo_context = index.repo_context
+        if index.repo_lens is not None:
+            repo_context["repo_lens"] = index.repo_lens
     except Exception as e:
         raise HTTPException(
             status_code=502,
             detail=f"Failed to fetch repository data from GitHub: {e}",
         )
-
-    # RepoLens enriches the plan/execute context (entry points for the Coder).
-    try:
-        from app.agents.repo_lens_agent import RepoLensAgent
-        repo_context["repo_lens"] = RepoLensAgent().run(repo_context)
-    except Exception as e:
-        logger.warning("RepoLens failed in execute path (%s); proceeding", e)
 
     try:
         return await OpportunityService.execute_opportunity(
