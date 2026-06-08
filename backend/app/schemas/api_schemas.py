@@ -17,6 +17,19 @@ class AnalyzeResponse(BaseModel):
     report: ShipMateReport
 
 
+class BuildPlanRequest(BaseModel):
+    """POST /api/build/plan — discover ranked, grounded self-improvement
+    opportunities for a repo (plan-only; no PRs, no Coder)."""
+    owner: str
+    repo: str
+    branch: str = "main"
+    access_token: str
+    max_opportunities: int = 8
+    # When True, ungrounded opportunities are kept (flagged grounded=False)
+    # instead of dropped — useful for debugging the discovery quality.
+    include_ungrounded: bool = False
+
+
 class RepoSummary(BaseModel):
     id: int
     name: str

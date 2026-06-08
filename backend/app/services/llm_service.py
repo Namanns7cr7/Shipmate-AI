@@ -37,7 +37,7 @@ from typing import Any, Dict, List, Optional, Type, TypeVar
 from pydantic import BaseModel, Field
 
 from app.schemas.agent_schemas import (
-    Blocker, GuardRailOutput, Milestone, PlanForgeOutput,
+    Blocker, GuardRailOutput, Milestone, Opportunity, PlanForgeOutput,
     SecurityFinding, Severity, SuggestedTest, TestPilotOutput,
 )
 
@@ -474,6 +474,49 @@ class LLMService:
             _maybe_invalidate_provider(e)
             return base
 
+    # ── Opportunity discovery (Phase 1A — self-improvement work for the repo) ──
+
+    @classmethod
+    def discover_opportunities(
+        cls, context: Dict[str, Any], max_opportunities: int = 8,
+    ) -> List[Opportunity]:
+        """Read the repo's actual code and propose a BALANCED set of
+        self-improvement opportunities (features / improvements / tweaks / bugs),
+        each grounded in cited files. This is the PlanForge-enrichment pass
+        re-aimed at "what should we build next" rather than "what blocks
+        shipping". Returns raw (un-ranked, un-suppressed) Opportunity objects;
+        the OpportunityService applies the critic + ranker + journal join.
+
+        Fail-open: returns [] if the provider is unavailable (callers treat an
+        empty list as ai_enhanced=False, never as "repo is perfect")."""
+        provider = _get_provider()
+        if provider is None:
+            logger.warning(
+                "Opportunity discovery skipped: LLM provider unavailable "
+                "(LLM_PROVIDER=%r). Refresh ADA + restart the backend.",
+                os.getenv("LLM_PROVIDER", "(unset)"),
+            )
+            return []
+
+        try:
+            code_blob = _repo_code_blob(
+                context, max_files=8, max_chars_per_file=3500,
+                prefer=("routes", "main", "api", "service", "agent",
+                        "orchestrator", "components", "pages", "hooks", "lib"),
+            )
+            user = _user_prompt_opportunity_discovery(context, code_blob, max_opportunities)
+            discovery = provider.invoke_structured_sync(
+                system_prompt=_DISCOVERY_OPPORTUNITY_SYSTEM,
+                user_prompt=user,
+                schema_class=OpportunityDiscovery,
+                deployment_hint="smart",
+            )
+            return _coerce_opportunities(discovery, max_opportunities)
+        except Exception as e:
+            logger.warning("Opportunity discovery failed (%s); returning none", e)
+            _maybe_invalidate_provider(e)
+            return []
+
 
 # ─── Discovery — schemas ─────────────────────────────────────────────────────
 # These are what Bedrock fills in. They're separate from PlanForgeOutput etc.
@@ -546,6 +589,27 @@ class TestPilotDiscovery(BaseModel):
     missing_coverage_areas: List[str] = Field(
         default_factory=list,
         description="Up to 3 specific code regions (file path + function/concern) currently uncovered. e.g. 'backend/app/orchestrator/shipmate_orchestrator.py — RepoLens enrichment merge logic'.",
+    )
+
+
+class _DiscoveredOpportunity(BaseModel):
+    title: str = Field(..., description="Concise opportunity title — 4-9 words. e.g. 'Cache repo file tree across analyze runs'.")
+    category: str = Field(..., description="One of: feature, improvement, tweak, bug.")
+    description: str = Field(..., description="2-3 sentences: what this opportunity is, concretely, for THIS repo.")
+    impact: str = Field(..., description="One sentence: what measurably gets better (UX, perf, reliability, coverage) if shipped.")
+    effort: str = Field(..., description="Rough t-shirt size: one of S, M, L.")
+    estimated_days: int = Field(..., ge=1, le=21, description="Realistic effort in working days.")
+    target_files: List[str] = Field(default_factory=list, description="1-4 EXISTING file paths this work would touch. Use paths visible in the file tree / code shown.")
+    suggested_approach: List[str] = Field(default_factory=list, description="2-4 high-level steps (NOT a full plan). e.g. ['add an in-memory LRU keyed by repo+branch', 'invalidate on push webhook'].")
+    evidence: List[str] = Field(default_factory=list, description="1-3 SPECIFIC file paths or code constructs from the repo that prove this opportunity is real (e.g. 'backend/app/services/repo_analysis_service.py:_fetch_files — no caching').")
+    rationale: str = Field(..., description="WHY this matters for THIS repo, citing at least one real file/construct from the code shown.")
+
+
+class OpportunityDiscovery(BaseModel):
+    """LLM-discovered self-improvement opportunities, grounded in real code."""
+    opportunities: List[_DiscoveredOpportunity] = Field(
+        default_factory=list,
+        description="A BALANCED mix across feature/improvement/tweak/bug. Each MUST cite real files in evidence. Quality over quantity.",
     )
 
 
@@ -721,6 +785,48 @@ _DISCOVERY_TESTPILOT_SYSTEM = (
     "tests entirely — those are heuristic territory."
 )
 
+_DISCOVERY_OPPORTUNITY_SYSTEM = (
+    "You are a senior staff engineer and product-minded tech lead doing a "
+    "'what should we build next' review of a repo. You are given the file tree "
+    "and the contents of the most important files. Your job: propose concrete, "
+    "high-VALUE self-improvement opportunities that a coding agent could then "
+    "implement.\n\n"
+    "Produce a BALANCED mix across these four categories — do NOT emit only "
+    "bugs or only features:\n"
+    "  • feature      — a genuinely new capability the product is missing "
+    "(new endpoint, new page, new agent pass, integration, batch flow).\n"
+    "  • improvement  — make an EXISTING feature better (streaming where it "
+    "batches, persistence where it's in-memory, caching, retry/timeout, "
+    "smarter defaults, better error UX).\n"
+    "  • tweak        — a focused code-quality refactor that reduces real risk "
+    "or duplication (extract a shared client, type-narrow, kill magic strings).\n"
+    "  • bug          — a concrete defect in an actual code path you can point to.\n\n"
+    "Every opportunity MUST:\n"
+    "  1. Cite REAL files in `evidence` — paths that appear in the tree/code "
+    "shown. An opportunity with no real evidence is worthless; do not emit it.\n"
+    "  2. Name `target_files` that EXIST in the repo (the work would touch them).\n"
+    "  3. Have a `rationale` that quotes a specific construct/function/gap.\n"
+    "  4. Be IMPLEMENTABLE in <=21 days by one engineer — not a rewrite.\n\n"
+    "Examples of GOOD opportunities:\n"
+    "  [improvement] 'Cache the repo file tree per repo+branch — "
+    "repo_analysis_service._fetch_files re-fetches every analyze with no cache; "
+    "a short-TTL LRU cuts GitHub API calls and latency on re-runs.'\n"
+    "  [feature]     'Add a /api/repos/{repo}/history trend endpoint backed by "
+    "report_store so the dashboard can chart readiness over time.'\n"
+    "  [tweak]       'frontend/src/lib/api.ts repeats the auth header in every "
+    "method — extract a configured axios instance with default headers.'\n"
+    "  [bug]         'shipmate_orchestrator.run_stream swallows agent errors into "
+    "a single error event; a failing PlanForge yields no partial report.'\n\n"
+    "Examples of BAD opportunities (DO NOT EMIT):\n"
+    "  - 'add tests' / 'set up CI/CD' / 'write docs' / 'containerize' — generic, "
+    "not grounded in a specific gap.\n"
+    "  - vague advice ('improve performance') with no file cited.\n"
+    "  - speculative rewrites or future architecture not justified by the code.\n"
+    "  - anything you cannot tie to a file in `evidence`.\n\n"
+    "Bias HARD toward grounding and value. Five sharply-grounded opportunities "
+    "beat ten vague ones."
+)
+
 
 # ─── Discovery — user prompt builders ────────────────────────────────────────
 
@@ -775,6 +881,20 @@ def _user_prompt_testpilot_discovery(
         "a target_file and rationale citing a real construct in this repo. "
         "Also emit up to 3 missing_coverage_areas naming concrete code regions. "
         "Return ONLY the TestPilotDiscovery schema."
+    )
+
+
+def _user_prompt_opportunity_discovery(
+    context: Dict[str, Any], code_blob: str, max_opportunities: int,
+) -> str:
+    return (
+        f"# Repo summary\n{_repo_summary(context)}\n\n"
+        f"# Repo code\n{code_blob[:20000]}\n\n"
+        f"Propose up to {max_opportunities} self-improvement opportunities for "
+        "THIS repo, balanced across feature / improvement / tweak / bug. Every "
+        "opportunity MUST cite real file paths in `evidence` and name existing "
+        "`target_files`. Skip anything generic or not tied to a specific file. "
+        "Return ONLY the OpportunityDiscovery schema."
     )
 
 
@@ -955,3 +1075,56 @@ def _merge_testpilot_discovery(
         "suggested_tests": list(base.suggested_tests) + new_tests,
         "missing_coverage_areas": list(base.missing_coverage_areas) + new_gaps,
     })
+
+
+# ─── Opportunity — coerce / sanitize ─────────────────────────────────────────
+
+_VALID_OPP_CATEGORY = {"feature", "improvement", "tweak", "bug"}
+_VALID_OPP_EFFORT = {"S", "M", "L"}
+
+
+def _coerce_opportunities(
+    disc: "OpportunityDiscovery", max_opportunities: int,
+) -> List[Opportunity]:
+    """Turn the LLM discovery payload into validated Opportunity objects.
+    Sanitizes enums, clamps numbers, assigns ids, dedups by normalized title.
+    Ranking/grounding/journal-join happen later in OpportunityService — this
+    only produces clean candidates. Malformed items are skipped, not fatal."""
+    out: List[Opportunity] = []
+    seen_titles: set = set()
+    next_id = 1
+    for d in (disc.opportunities or [])[: max_opportunities * 2]:  # room before dedup
+        title = (d.title or "").strip()
+        if not title:
+            continue
+        norm = _norm_title(title)
+        if norm in seen_titles:
+            continue
+        cat = (d.category or "").strip().lower()
+        if cat not in _VALID_OPP_CATEGORY:
+            cat = "improvement"
+        eff = (d.effort or "").strip().upper()
+        if eff not in _VALID_OPP_EFFORT:
+            eff = "M"
+        try:
+            out.append(Opportunity(
+                id=f"OPP-{next_id:03d}",
+                title=title[:120],
+                category=cat,
+                description=(d.description or "").strip(),
+                impact=(d.impact or "").strip(),
+                effort=eff,
+                estimated_days=max(1, min(21, d.estimated_days)),
+                target_files=[t.strip() for t in (d.target_files or []) if t.strip()][:4],
+                suggested_approach=[s.strip() for s in (d.suggested_approach or []) if s.strip()][:4],
+                evidence=[e.strip() for e in (d.evidence or []) if e.strip()][:3],
+                rationale=(d.rationale or "").strip()[:600],
+                source="discovery",
+            ))
+            seen_titles.add(norm)
+            next_id += 1
+        except Exception as e:
+            logger.warning("Skipping malformed discovered opportunity (%s)", e)
+        if len(out) >= max_opportunities:
+            break
+    return out

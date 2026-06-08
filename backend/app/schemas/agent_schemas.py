@@ -169,3 +169,45 @@ class ShipMateReport(BaseModel):
     # the user wondering why findings look generic. Defaults True for back-compat
     # with any stored/older report that predates this field.
     ai_enhanced: bool = True
+
+
+# ── Opportunity Planner (Phase 1A) ────────────────────────────────────────────
+# An "opportunity" is a piece of self-improvement work ShipMate identifies for
+# the repo: a new feature, an improvement to an existing one, a code-quality
+# tweak, or a bug. It is the candidate input to the (Phase 1B) PlannerAgent and,
+# later, the CoderOrchestrator. Phase 1A's job is ONLY to prove these are GOOD:
+# grounded in real code, ranked by value, deduped against the journal — no
+# planning or execution yet. The schema is intentionally "semi-plan-shaped"
+# (target_files + suggested_approach) so the UI can show something actionable
+# without committing to the full step-by-step plan that 1B will produce.
+
+class Opportunity(BaseModel):
+    id: str                                    # "OPP-001"
+    title: str
+    category: str                              # "feature" | "improvement" | "tweak" | "bug"
+    description: str
+    impact: str                                # what concretely gets better if shipped
+    effort: str                                # "S" | "M" | "L" (rough t-shirt size)
+    estimated_days: int                        # 1-21, mirrors Milestone
+    target_files: List[str] = []               # semi-plan: files this would touch
+    suggested_approach: List[str] = []         # semi-plan: 2-4 high-level steps (NOT a full plan)
+    evidence: List[str] = []                   # grounding: file paths / constructs cited from THIS repo
+    rationale: str = ""                        # WHY it matters here, citing real code
+    value_score: int = 0                       # ranker output 0-100 (higher = ship sooner)
+    priority: str = "medium"                   # derived from value_score: critical|high|medium|low
+    grounded: bool = True                      # critic verdict: evidence verified against the repo
+    journal_state: Optional[str] = None        # in_progress|shipped|dismissed|parked|None(fresh)
+    source: str = "discovery"
+
+
+class BuildPlanResponse(BaseModel):
+    """Response of POST /api/build/plan — a ranked, grounded list of
+    self-improvement opportunities for the repo. Plan-only: no PRs, no Coder."""
+    owner: str
+    repo: str
+    branch: str = "main"
+    opportunities: List[Opportunity] = []
+    total_found: int = 0                       # before suppression/ranking truncation
+    grounded_count: int = 0                    # how many passed deterministic grounding
+    ai_enhanced: bool = True                   # False ⇒ LLM unavailable, list is empty/degraded
+    generated_at: str = ""
