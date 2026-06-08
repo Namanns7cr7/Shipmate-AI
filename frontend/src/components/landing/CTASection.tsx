@@ -8,7 +8,7 @@ interface CTASectionProps { onLogin: () => void; loading?: boolean; }
 
 export function CTASection({ onLogin, loading }: CTASectionProps) {
   return (
-    <section style={{ position: 'relative', padding: '0 28px 90px' }}>
+    <section id="get-started" style={{ position: 'relative', padding: '0 28px 90px', scrollMarginTop: 84 }}>
       <div style={{ maxWidth: 1000, margin: '0 auto' }}>
         <Reveal>
           <div className="card glow-border" style={{ position: 'relative', overflow: 'hidden', padding: '60px 40px', textAlign: 'center' }}>

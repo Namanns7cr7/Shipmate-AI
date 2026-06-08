@@ -11,7 +11,7 @@ const ITEMS = [
 
 export function ValueBadges() {
   return (
-    <section style={{ maxWidth: 1100, margin: '0 auto', padding: '8px 28px 20px' }}>
+    <section id="product" style={{ maxWidth: 1100, margin: '0 auto', padding: '8px 28px 20px', scrollMarginTop: 84 }}>
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', flexWrap: 'wrap', gap: 10 }}>
         {ITEMS.map((it, i) => (
           <Reveal key={it.label} delay={i * 60}>

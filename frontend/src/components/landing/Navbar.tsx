@@ -5,7 +5,20 @@ import { GitHubConnectButton } from '../ui/GitHubConnectButton';
 
 interface NavbarProps { onLogin: () => void; loading?: boolean; }
 
-const NAV_LINKS = ['Product', 'Agents', 'Why ShipMate', 'Pricing'];
+// Each link targets a section id rendered on the landing page (see the
+// scroll-margin-top'd sections in ValueBadges/AgentCards/WhySection/CTASection).
+// 'Pricing' is intentionally absent — there's no pricing surface (free to try),
+// so the last link is 'Get Started' pointing at the CTA.
+const NAV_LINKS: { label: string; id: string }[] = [
+  { label: 'Product',      id: 'product'     },
+  { label: 'Agents',       id: 'agents'      },
+  { label: 'Why ShipMate', id: 'why'         },
+  { label: 'Get Started',  id: 'get-started' },
+];
+
+function scrollToSection(id: string) {
+  document.getElementById(id)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
 
 export function Navbar({ onLogin, loading }: NavbarProps) {
   const [scrolled, setScrolled] = useState(false);
@@ -37,10 +50,10 @@ export function Navbar({ onLogin, loading }: NavbarProps) {
         <nav style={{ position: 'absolute', left: '50%', transform: 'translateX(-50%)', display: 'flex', gap: 4 }}
           className="hidden md:flex">
           {NAV_LINKS.map(l => (
-            <button key={l} style={{ padding: '8px 13px', borderRadius: 9, fontSize: 13.5, fontWeight: 550, color: 'var(--ink-3)', background: 'none', border: 'none', cursor: 'pointer', transition: 'color .15s' }}
+            <button key={l.id} onClick={() => scrollToSection(l.id)} style={{ padding: '8px 13px', borderRadius: 9, fontSize: 13.5, fontWeight: 550, color: 'var(--ink-3)', background: 'none', border: 'none', cursor: 'pointer', transition: 'color .15s' }}
               onMouseEnter={e => (e.currentTarget.style.color = '#fff')}
               onMouseLeave={e => (e.currentTarget.style.color = 'var(--ink-3)')}>
-              {l}
+              {l.label}
             </button>
           ))}
         </nav>
@@ -68,9 +81,9 @@ export function Navbar({ onLogin, loading }: NavbarProps) {
         <motion.div initial={{ opacity: 0, y: -8 }} animate={{ opacity: 1, y: 0 }}
           style={{ background: 'rgba(7,12,24,0.95)', backdropFilter: 'blur(16px)', borderTop: '1px solid var(--line)', padding: '12px 16px', display: 'flex', flexDirection: 'column', gap: 4 }}>
           {NAV_LINKS.map(l => (
-            <button key={l} onClick={() => setMenuOpen(false)}
+            <button key={l.id} onClick={() => { setMenuOpen(false); scrollToSection(l.id); }}
               style={{ width: '100%', textAlign: 'left', padding: '10px 16px', borderRadius: 8, fontSize: 14, color: 'var(--ink-2)', background: 'none', border: 'none', cursor: 'pointer' }}>
-              {l}
+              {l.label}
             </button>
           ))}
           <div style={{ marginTop: 8 }}>

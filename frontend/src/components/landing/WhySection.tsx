@@ -24,7 +24,7 @@ const CARDS: WhyCard[] = [
 
 export function WhySection() {
   return (
-    <section style={{ position: 'relative', padding: '40px 0 80px' }}>
+    <section id="why" style={{ position: 'relative', padding: '40px 0 80px', scrollMarginTop: 84 }}>
       <div style={{ maxWidth: 1160, margin: '0 auto', padding: '0 28px' }}>
         <Reveal>
           <div style={{ textAlign: 'center', marginBottom: 44 }}>

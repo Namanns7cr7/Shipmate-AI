@@ -9,7 +9,7 @@ const ALL_CARDS = [
 
 export function AgentCards() {
   return (
-    <section style={{ maxWidth: 1160, margin: '0 auto', padding: '70px 28px' }}>
+    <section id="agents" style={{ maxWidth: 1160, margin: '0 auto', padding: '70px 28px', scrollMarginTop: 84 }}>
       <Reveal>
         <div style={{ textAlign: 'center', marginBottom: 44 }}>
           <span className="eyebrow" style={{ display: 'block', marginBottom: 12 }}>Four specialists · one readiness verdict</span>
