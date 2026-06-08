@@ -150,6 +150,7 @@ class OpportunityService:
         produced (cheap, safe). Steps are only actuated when execute=True AND the
         critic approves. Each step runs through the existing CoderOrchestrator,
         so every step still passes lint/scope/pytest/resolution gates."""
+        import uuid
         from datetime import datetime, timezone
         from app.agents.planner_agent import PlannerAgent
 
@@ -164,11 +165,25 @@ class OpportunityService:
         generated_at = datetime.now(timezone.utc).isoformat()
         ai_enhanced = LLMService.is_available()
 
+        # Durable BuildRun: a UUID-keyed row tracks this run independent of the
+        # HTTP request, so a crash/restart mid-build leaves an observable record
+        # (status='actuating', steps_completed=N) instead of nothing. run_id is
+        # surfaced on the response so the UI can poll /build/runs/{run_id}.
+        full_name = info.get("full_name", "") or (f"{owner}/{name}" if owner and name else "")
+        sig = critic.opportunity_signature(
+            opportunity.title, (opportunity.target_files or [None])[0]
+        )
+        run_id = uuid.uuid4().hex
+        cls._build_run_create(run_id, owner, name, branch, sig, opportunity.title)
+
         # 1. PLAN.
         plan: ExecutionPlan = PlannerAgent().plan(opportunity, file_tree)
+        cls._build_run_update(run_id, status="critiquing", plan=plan,
+                              step_count=len(plan.steps))
 
         # 2. CRITIQUE (deterministic + LLM, fail-open on the LLM axis).
         critique = pc.critique_plan(plan, opportunity, LLMService.provider())
+        cls._build_run_update(run_id, critique=critique)
 
         base = BuildExecuteResponse(
             owner=owner, repo=name, branch=branch,
@@ -176,25 +191,25 @@ class OpportunityService:
             plan=plan, critique=critique,
             executed=False, ai_enhanced=ai_enhanced, generated_at=generated_at,
         )
-
-        full_name = info.get("full_name", "") or (f"{owner}/{name}" if owner and name else "")
-        sig = critic.opportunity_signature(
-            opportunity.title, (opportunity.target_files or [None])[0]
-        )
+        base.run_id = run_id
 
         if not execute:
             base.status = "planned"
             base.summary = f"Plan ready ({len(plan.steps)} steps). Critic: {critique.reason}"
+            # Plan-only preview is a terminal state for this run row.
+            cls._build_run_update(run_id, status="done", result=base)
             return base
 
         if not critique.approved:
             base.status = "plan_rejected"
             base.summary = f"Plan rejected by critic, not executed: {critique.reason}"
+            cls._build_run_update(run_id, status="plan_rejected", result=base)
             return base
 
         # Mark in_progress as we start actuating — so a concurrent/next plan run
         # downranks it (and, if we crash mid-build, it isn't re-proposed fresh).
         cls._journal(full_name, sig, "in_progress")
+        cls._build_run_update(run_id, status="actuating")
 
         # 3. EXECUTE — actuate each step sequentially via CoderOrchestrator. Each
         # step is its own focused actuation (own branch/PR) so every gate applies
@@ -243,6 +258,10 @@ class OpportunityService:
                     f"Executed {len(pr_urls)}/{len(plan.steps)} step(s); "
                     f"step {step.index} ('{step.title}') raised: {e}"
                 )
+                cls._build_run_update(
+                    run_id, status="failed", result=base, pr_urls=pr_urls,
+                    steps_completed=len(pr_urls), error=f"step {step.index}: {e}",
+                )
                 return base
             if resp.status != "complete":
                 base.status = "execute_failed"
@@ -253,10 +272,20 @@ class OpportunityService:
                     f"Executed {len(pr_urls)}/{len(plan.steps)} step(s); "
                     f"step {step.index} ('{step.title}') returned {resp.status}: {resp.summary[:200]}"
                 )
+                cls._build_run_update(
+                    run_id, status="failed", result=base, pr_urls=pr_urls,
+                    steps_completed=len(pr_urls),
+                    error=f"step {step.index} returned {resp.status}",
+                )
                 return base
             if resp.pr_url:
                 pr_urls.append(resp.pr_url)
             files_changed.extend(f.path for f in resp.files_changed)
+            # Checkpoint after each landed step so a crash leaves an accurate
+            # steps_completed/pr_urls trail on disk.
+            cls._build_run_update(
+                run_id, pr_urls=pr_urls, steps_completed=len(pr_urls),
+            )
 
         # All steps landed — mark shipped so it's suppressed from future plans.
         cls._journal(full_name, sig, "shipped", pr_url=pr_urls[0] if pr_urls else None)
@@ -267,6 +296,10 @@ class OpportunityService:
         base.summary = (
             f"Executed all {len(plan.steps)} step(s) — {len(pr_urls)} PR(s), "
             f"{len(files_changed)} file(s) changed."
+        )
+        cls._build_run_update(
+            run_id, status="done", result=base, pr_urls=pr_urls,
+            steps_completed=len(pr_urls),
         )
         return base
 
@@ -282,6 +315,25 @@ class OpportunityService:
             ir.journal_set_state(sig, repo_full_name, state, pr_url=pr_url, bump_attempt=True)
         except Exception as e:  # pragma: no cover - defensive
             logger.debug("opportunity journal write failed (%s)", e)
+
+    # ── BuildRun durability helpers (best-effort, never break the flow) ────────
+
+    @staticmethod
+    def _build_run_create(run_id, owner, repo, branch, sig, title) -> None:
+        try:
+            from app.services import inflight_registry as ir
+            ir.create_build_run(run_id, owner, repo, branch, sig,
+                                opportunity_title=title, status="planning")
+        except Exception as e:  # pragma: no cover - defensive
+            logger.debug("build_run create failed (%s)", e)
+
+    @staticmethod
+    def _build_run_update(run_id, **fields) -> None:
+        try:
+            from app.services import inflight_registry as ir
+            ir.update_build_run(run_id, **fields)
+        except Exception as e:  # pragma: no cover - defensive
+            logger.debug("build_run update failed (%s)", e)
 
     @classmethod
     def dismiss_opportunity(

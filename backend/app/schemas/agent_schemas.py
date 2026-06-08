@@ -268,3 +268,6 @@ class BuildExecuteResponse(BaseModel):
     summary: str = ""
     ai_enhanced: bool = True
     generated_at: str = ""
+    # Durable BuildRun id — poll GET /api/build/runs/{run_id} for live/terminal
+    # state independent of this request (a crash mid-build leaves the record).
+    run_id: Optional[str] = None

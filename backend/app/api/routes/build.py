@@ -120,6 +120,32 @@ async def build_execute(request: BuildExecuteRequest) -> BuildExecuteResponse:
         raise HTTPException(status_code=500, detail=f"Opportunity execution failed: {e}")
 
 
+@router.get("/build/runs")
+async def list_build_runs(
+    owner: str | None = None, repo: str | None = None,
+    status: str | None = None, limit: int = 50,
+):
+    """List BuildRun records (newest first), filterable by owner/repo/status.
+    Read-only observability over the durable build state machine — a run is
+    visible here whether it's still actuating, finished, or crashed mid-build."""
+    from app.services import inflight_registry as ir
+    status_in = [s.strip() for s in status.split(",")] if status else None
+    runs = ir.list_build_runs(owner=owner, repo=repo, status_in=status_in, limit=limit)
+    return {"count": len(runs), "runs": runs}
+
+
+@router.get("/build/runs/{run_id}")
+async def get_build_run(run_id: str):
+    """Fetch one BuildRun by id — its status, plan, critique, accumulated PRs,
+    and (when terminal) the final result. This is what survives a backend
+    restart that would otherwise lose an in-flight /build/execute."""
+    from app.services import inflight_registry as ir
+    run = ir.get_build_run(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail=f"No build run with id {run_id}.")
+    return run
+
+
 @router.post("/build/dismiss")
 async def build_dismiss(request: BuildDismissRequest):
     """Hide an opportunity from future plans and exclude it from discovery.

@@ -137,6 +137,43 @@ CREATE TABLE IF NOT EXISTS meta_kv (
     value            TEXT,
     updated_at       INTEGER NOT NULL
 );
+
+-- Durable BuildRun state machine. /build/execute used to run the whole
+-- plan→critique→actuate loop inside a single HTTP request, holding all state
+-- in local variables — a dropped connection or backend restart mid-build lost
+-- the run entirely (only the CIWatcher survived, because IT got persisted).
+-- This table makes a build observable + resumable independent of the request
+-- that started it, mirroring the ci_watch_state pattern.
+--   run_id    : UUID PK so the SAME opportunity can have >1 run over time
+--               (re-runs after a fix) without clobbering history.
+--   status    : planning | critiquing | actuating | done | failed | plan_rejected
+--   *_json    : the ExecutionPlan / PlanCritique / final BuildExecuteResponse,
+--               so a status query can reconstruct the full picture.
+--   pr_urls   : JSON array (the loop opens one PR per step).
+-- finding_journal stays the suppress-source-of-truth (dismissed/shipped); this
+-- table is the run RECORD — they're updated together at each boundary.
+CREATE TABLE IF NOT EXISTS build_runs (
+    run_id           TEXT PRIMARY KEY,
+    owner            TEXT NOT NULL,
+    repo             TEXT NOT NULL,
+    branch           TEXT NOT NULL,
+    opportunity_sig  TEXT NOT NULL,
+    opportunity_title TEXT,
+    status           TEXT NOT NULL,
+    plan_json        TEXT,
+    critique_json    TEXT,
+    result_json      TEXT,
+    pr_urls          TEXT,
+    step_count       INTEGER NOT NULL DEFAULT 0,
+    steps_completed  INTEGER NOT NULL DEFAULT 0,
+    error            TEXT,
+    started_at       INTEGER NOT NULL,
+    last_event_at    INTEGER NOT NULL,
+    completed_at     INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_build_runs_repo ON build_runs(owner, repo, started_at);
+CREATE INDEX IF NOT EXISTS idx_build_runs_status ON build_runs(status);
+CREATE INDEX IF NOT EXISTS idx_build_runs_sig ON build_runs(opportunity_sig);
 """
 
 
@@ -572,6 +609,138 @@ def meta_set(key: str, value: Optional[str]) -> None:
     c.commit()
 
 
+# ── build_runs (durable BuildRun state machine) ─────────────────────────────
+
+# Terminal + non-terminal statuses. Strings (not an Enum) to keep sqlite simple
+# and mirror finding_journal's convention.
+_BUILD_RUN_STATES = {
+    "planning", "critiquing", "actuating",
+    "done", "failed", "plan_rejected",
+}
+_BUILD_RUN_TERMINAL = {"done", "failed", "plan_rejected"}
+
+
+def create_build_run(
+    run_id: str,
+    owner: str,
+    repo: str,
+    branch: str,
+    opportunity_sig: str,
+    *,
+    opportunity_title: Optional[str] = None,
+    status: str = "planning",
+    step_count: int = 0,
+) -> None:
+    """Insert a fresh build_run row at the start of an execute. `run_id` is a
+    caller-supplied UUID so the same opportunity can run more than once."""
+    if status not in _BUILD_RUN_STATES:
+        raise ValueError(f"unknown build_run status: {status!r}")
+    now = int(time.time())
+    c = _conn()
+    c.execute(
+        "INSERT OR REPLACE INTO build_runs "
+        "(run_id, owner, repo, branch, opportunity_sig, opportunity_title, "
+        " status, step_count, steps_completed, started_at, last_event_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
+        (run_id, owner, repo, branch, opportunity_sig, opportunity_title,
+         status, step_count, now, now),
+    )
+    c.commit()
+
+
+def update_build_run(
+    run_id: str,
+    *,
+    status: Optional[str] = None,
+    plan: Optional[Any] = None,
+    critique: Optional[Any] = None,
+    result: Optional[Any] = None,
+    pr_urls: Optional[List[str]] = None,
+    step_count: Optional[int] = None,
+    steps_completed: Optional[int] = None,
+    error: Optional[str] = None,
+) -> None:
+    """PATCH-style update — only the fields you pass are touched. Sets
+    completed_at automatically when status becomes terminal. Best-effort
+    semantics like upsert_ci_watch."""
+    if status is not None and status not in _BUILD_RUN_STATES:
+        raise ValueError(f"unknown build_run status: {status!r}")
+    now = int(time.time())
+    sets: List[str] = ["last_event_at=?"]
+    vals: List[Any] = [now]
+    for col, val in [
+        ("status", status),
+        ("plan_json", _to_json(plan) if plan is not None else None),
+        ("critique_json", _to_json(critique) if critique is not None else None),
+        ("result_json", _to_json(result) if result is not None else None),
+        ("pr_urls", json.dumps(pr_urls) if pr_urls is not None else None),
+        ("step_count", step_count),
+        ("steps_completed", steps_completed),
+        ("error", error),
+    ]:
+        if val is not None:
+            sets.append(f"{col}=?")
+            vals.append(val)
+    if status in _BUILD_RUN_TERMINAL:
+        sets.append("completed_at=?")
+        vals.append(now)
+    vals.append(run_id)
+    c = _conn()
+    c.execute(f"UPDATE build_runs SET {', '.join(sets)} WHERE run_id=?", vals)
+    c.commit()
+
+
+def get_build_run(run_id: str) -> Optional[Dict[str, Any]]:
+    row = _conn().execute(
+        "SELECT * FROM build_runs WHERE run_id=?", (run_id,),
+    ).fetchone()
+    if not row:
+        return None
+    return _build_run_row_to_dict(row)
+
+
+def list_build_runs(
+    *,
+    owner: Optional[str] = None,
+    repo: Optional[str] = None,
+    status_in: Optional[List[str]] = None,
+    limit: int = 50,
+) -> List[Dict[str, Any]]:
+    sql = "SELECT * FROM build_runs"
+    where: List[str] = []
+    args: List[Any] = []
+    if owner:
+        where.append("owner=?"); args.append(owner)
+    if repo:
+        where.append("repo=?"); args.append(repo)
+    if status_in:
+        ph = ",".join("?" * len(status_in))
+        where.append(f"status IN ({ph})"); args.extend(status_in)
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY started_at DESC LIMIT ?"
+    args.append(max(1, min(int(limit), 200)))
+    rows = _conn().execute(sql, args).fetchall()
+    return [_build_run_row_to_dict(r) for r in rows]
+
+
+def delete_build_run(run_id: str) -> bool:
+    c = _conn()
+    cur = c.execute("DELETE FROM build_runs WHERE run_id=?", (run_id,))
+    c.commit()
+    return cur.rowcount > 0
+
+
+def _build_run_row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
+    d = dict(row)
+    d["plan"] = _from_json(d.pop("plan_json", None))
+    d["critique"] = _from_json(d.pop("critique_json", None))
+    d["result"] = _from_json(d.pop("result_json", None))
+    raw_urls = d.pop("pr_urls", None)
+    d["pr_urls"] = _from_json(raw_urls) if raw_urls else []
+    return d
+
+
 # ── Test/debug helpers ──────────────────────────────────────────────────────
 
 def reset_all() -> None:
@@ -579,7 +748,7 @@ def reset_all() -> None:
     production paths."""
     c = _conn()
     for table in ("inflight_paths", "ci_watch_state", "ci_watch_log",
-                  "finding_journal", "meta_kv"):
+                  "finding_journal", "build_runs", "meta_kv"):
         c.execute(f"DELETE FROM {table}")
     c.commit()
 
@@ -592,4 +761,5 @@ def stats() -> Dict[str, int]:
         "ci_watch_state":    c.execute("SELECT COUNT(*) FROM ci_watch_state").fetchone()[0],
         "ci_watch_log":      c.execute("SELECT COUNT(*) FROM ci_watch_log").fetchone()[0],
         "finding_journal":   c.execute("SELECT COUNT(*) FROM finding_journal").fetchone()[0],
+        "build_runs":        c.execute("SELECT COUNT(*) FROM build_runs").fetchone()[0],
     }
