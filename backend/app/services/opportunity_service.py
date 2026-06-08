@@ -22,8 +22,11 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List
 
 from app.agents.repo_lens_agent import RepoLensAgent
-from app.schemas.agent_schemas import BuildPlanResponse, Opportunity
+from app.schemas.agent_schemas import (
+    BuildExecuteResponse, BuildPlanResponse, ExecutionPlan, Opportunity,
+)
 from app.services import opportunity_critic as critic
+from app.services import plan_critic as pc
 from app.services.llm_service import LLMService
 
 logger = logging.getLogger("shipmate.opportunity_service")
@@ -88,10 +91,33 @@ class OpportunityService:
         grounded = critic.ground_opportunities(raw, file_tree, key_files)
         grounded_count = sum(1 for o in grounded if getattr(o, "grounded", False))
 
-        # 3. SUPPRESS (journal) — drop dismissed/shipped (opportunity namespace).
-        kept = critic.filter_suppressed(grounded, full_name)
+        # 3a. ALREADY-BUILT prefilter (deterministic, FULL corpus) — the smoke
+        # run showed the LLM critic can't refute "add X" when X's proof-of-
+        # existence lives outside its ~8-file window. This scans every key_file
+        # body + the tree for proposed routes/files that already exist and drops
+        # them WITHOUT an LLM. Same lesson as finding_critic's prefilter.
+        candidates = grounded if include_ungrounded else [o for o in grounded if getattr(o, "grounded", True)]
+        candidates = critic.filter_already_built(candidates, file_tree, key_files)
 
-        # 4. RANK (fold-in) — score, downrank in_progress, sort, derive priority.
+        # 3b. VERIFY (Phase 1B — LLM critic) — catches the softer cases the
+        # deterministic pass can't (duplicate intent, not-an-improvement),
+        # judged against the SAME code blob the discoverer saw. Fail-open.
+        provider = LLMService.provider()
+        code_blob = LLMService.opportunity_code_blob(enriched) if provider else ""
+        verified = critic.verify_opportunities(candidates, code_blob, provider)
+        verified_sigs = {id(o) for o in verified}
+        # Preserve any ungrounded items only when include_ungrounded (so the
+        # debug view still shows them); otherwise the survivors are `verified`.
+        if include_ungrounded:
+            surviving = [o for o in grounded if (id(o) in verified_sigs or not getattr(o, "grounded", True))]
+        else:
+            surviving = verified
+        verified_count = len(verified)
+
+        # 4. SUPPRESS (journal) — drop dismissed/shipped (opportunity namespace).
+        kept = critic.filter_suppressed(surviving, full_name)
+
+        # 5. RANK (fold-in) — score, downrank in_progress, sort, derive priority.
         ranked = critic.rank_opportunities(
             kept, full_name, drop_ungrounded=not include_ungrounded
         )
@@ -101,6 +127,129 @@ class OpportunityService:
             opportunities=ranked,
             total_found=total_found,
             grounded_count=grounded_count,
+            verified_count=verified_count,
             ai_enhanced=ai_enhanced,
             generated_at=generated_at,
         )
+
+    # ── Phase 1B — plan a chosen opportunity, critique it, optionally execute ──
+
+    @classmethod
+    async def execute_opportunity(
+        cls,
+        repo_context: Dict[str, Any],
+        opportunity: Opportunity,
+        access_token: str,
+        *,
+        execute: bool = False,
+    ) -> BuildExecuteResponse:
+        """Plan → critique → (optionally) actuate. The plan + critique are always
+        produced (cheap, safe). Steps are only actuated when execute=True AND the
+        critic approves. Each step runs through the existing CoderOrchestrator,
+        so every step still passes lint/scope/pytest/resolution gates."""
+        from datetime import datetime, timezone
+        from app.agents.planner_agent import PlannerAgent
+
+        info = repo_context.get("repo_info") or {}
+        owner = (
+            info.get("owner", {}).get("login", "")
+            if isinstance(info.get("owner"), dict) else info.get("owner", "")
+        )
+        name = info.get("name", "")
+        branch = repo_context.get("branch", "main")
+        file_tree = repo_context.get("file_tree") or []
+        generated_at = datetime.now(timezone.utc).isoformat()
+        ai_enhanced = LLMService.is_available()
+
+        # 1. PLAN.
+        plan: ExecutionPlan = PlannerAgent().plan(opportunity, file_tree)
+
+        # 2. CRITIQUE (deterministic + LLM, fail-open on the LLM axis).
+        critique = pc.critique_plan(plan, opportunity, LLMService.provider())
+
+        base = BuildExecuteResponse(
+            owner=owner, repo=name, branch=branch,
+            opportunity_id=opportunity.id,
+            plan=plan, critique=critique,
+            executed=False, ai_enhanced=ai_enhanced, generated_at=generated_at,
+        )
+
+        if not execute:
+            base.status = "planned"
+            base.summary = f"Plan ready ({len(plan.steps)} steps). Critic: {critique.reason}"
+            return base
+
+        if not critique.approved:
+            base.status = "plan_rejected"
+            base.summary = f"Plan rejected by critic, not executed: {critique.reason}"
+            return base
+
+        # 3. EXECUTE — actuate each step sequentially via CoderOrchestrator. Each
+        # step is its own focused actuation (own branch/PR) so every gate applies
+        # and a mid-plan failure leaves prior steps' PRs intact. Stops at the
+        # first non-success so we don't pile bad steps on a broken base.
+        from app.schemas.api_schemas import (
+            ActuateRequest, FindingPayload, RepoLensSummary,
+        )
+        repo_lens = repo_context.get("repo_lens")
+        ctx_summary = RepoLensSummary(
+            primary_language=getattr(repo_lens, "primary_language", "Unknown") if repo_lens else "Unknown",
+            tech_stack=list(getattr(repo_lens, "tech_stack", []) or []) if repo_lens else [],
+            entry_points=list(getattr(repo_lens, "entry_points", []) or []) if repo_lens else [],
+            has_ci_cd=getattr(repo_lens, "has_ci_cd", False) if repo_lens else False,
+            has_tests=getattr(repo_lens, "has_tests", False) if repo_lens else False,
+        )
+
+        from app.services.coder_orchestrator import CoderOrchestrator
+        pr_urls: List[str] = []
+        files_changed: List[str] = []
+        for step in plan.steps:
+            finding = FindingPayload(
+                kind=step.kind if step.kind in
+                {"guardrail", "milestone", "blocker", "test", "next_action"} else "milestone",
+                id=f"{opportunity.id}-S{step.index}",
+                title=step.title,
+                description=step.description,
+                recommendation="; ".join(step.target_files),
+                file=step.target_files[0] if step.target_files else None,
+                category=opportunity.category,
+            )
+            actuate_req = ActuateRequest(
+                owner=owner, repo=name, branch=branch, access_token=access_token,
+                finding=finding, context=ctx_summary, open_pr=True,
+            )
+            try:
+                resp = await CoderOrchestrator.run_actuation(actuate_req)
+            except Exception as e:
+                base.status = "execute_failed"
+                base.executed = True
+                base.pr_url = pr_urls[0] if pr_urls else None
+                base.files_changed = files_changed
+                base.summary = (
+                    f"Executed {len(pr_urls)}/{len(plan.steps)} step(s); "
+                    f"step {step.index} ('{step.title}') raised: {e}"
+                )
+                return base
+            if resp.status != "complete":
+                base.status = "execute_failed"
+                base.executed = True
+                base.pr_url = pr_urls[0] if pr_urls else (resp.pr_url or None)
+                base.files_changed = files_changed
+                base.summary = (
+                    f"Executed {len(pr_urls)}/{len(plan.steps)} step(s); "
+                    f"step {step.index} ('{step.title}') returned {resp.status}: {resp.summary[:200]}"
+                )
+                return base
+            if resp.pr_url:
+                pr_urls.append(resp.pr_url)
+            files_changed.extend(f.path for f in resp.files_changed)
+
+        base.status = "executed"
+        base.executed = True
+        base.pr_url = pr_urls[0] if pr_urls else None
+        base.files_changed = files_changed
+        base.summary = (
+            f"Executed all {len(plan.steps)} step(s) — {len(pr_urls)} PR(s), "
+            f"{len(files_changed)} file(s) changed."
+        )
+        return base

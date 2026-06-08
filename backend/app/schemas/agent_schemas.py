@@ -195,7 +195,9 @@ class Opportunity(BaseModel):
     rationale: str = ""                        # WHY it matters here, citing real code
     value_score: int = 0                       # ranker output 0-100 (higher = ship sooner)
     priority: str = "medium"                   # derived from value_score: critical|high|medium|low
-    grounded: bool = True                      # critic verdict: evidence verified against the repo
+    grounded: bool = True                      # deterministic: evidence verified against the repo
+    worth_doing: bool = True                   # 1B LLM critic: not already-built / duplicate / no-op
+    verify_reason: Optional[str] = None        # 1B critic's one-line justification (when refuted upstream)
     journal_state: Optional[str] = None        # in_progress|shipped|dismissed|parked|None(fresh)
     source: str = "discovery"
 
@@ -209,5 +211,60 @@ class BuildPlanResponse(BaseModel):
     opportunities: List[Opportunity] = []
     total_found: int = 0                       # before suppression/ranking truncation
     grounded_count: int = 0                    # how many passed deterministic grounding
+    verified_count: int = 0                    # how many survived the 1B LLM critic (worth_doing)
     ai_enhanced: bool = True                   # False ⇒ LLM unavailable, list is empty/degraded
+    generated_at: str = ""
+
+
+# ── Phase 1B — Planner (opportunity → ordered, executable steps) ──────────────
+# A BuildStep is one focused unit of work a Coder can actuate. An ExecutionPlan
+# is the ordered, dependency-aware decomposition of a single Opportunity into
+# such steps. PlanCritique is the PlanCritic's verdict on whether that plan is
+# coherent, complete, and in-scope before any code is written.
+
+class BuildStep(BaseModel):
+    index: int                                 # 1-based order
+    title: str
+    description: str                           # what this step does, concretely
+    target_files: List[str] = []              # existing/new files the step touches
+    depends_on: List[int] = []                # indices of steps that must land first
+    kind: str = "milestone"                    # maps to a CoderOrchestrator finding kind
+    rationale: str = ""                        # why this step, citing code
+
+
+class ExecutionPlan(BaseModel):
+    opportunity_id: str
+    opportunity_title: str
+    summary: str                               # one-paragraph plan overview
+    steps: List[BuildStep] = []
+    estimated_days: int = 0                    # rolled up from the source opportunity
+    grounded: bool = True                      # all step target_files exist or are plausible new files
+    notes: List[str] = []                      # planner caveats / assumptions
+
+
+class PlanCritique(BaseModel):
+    """PlanCritic verdict on an ExecutionPlan."""
+    approved: bool = True
+    coherent: bool = True                      # steps form a sensible ordered whole
+    complete: bool = True                      # nothing obviously missing to ship the opportunity
+    in_scope: bool = True                      # no scope creep beyond the opportunity
+    issues: List[str] = []                     # specific problems (empty ⇒ clean)
+    reason: str = ""                           # one-line summary verdict
+
+
+class BuildExecuteResponse(BaseModel):
+    """Response of POST /api/build/execute — plan a chosen opportunity, critique
+    the plan, and (when execute=true) actuate each step into ONE branch/PR."""
+    owner: str
+    repo: str
+    branch: str = "main"
+    opportunity_id: str = ""
+    plan: Optional[ExecutionPlan] = None
+    critique: Optional[PlanCritique] = None
+    executed: bool = False                     # whether steps were actuated (vs plan-only)
+    pr_url: Optional[str] = None
+    files_changed: List[str] = []
+    status: str = "planned"                    # planned|plan_rejected|executed|execute_failed|degraded
+    summary: str = ""
+    ai_enhanced: bool = True
     generated_at: str = ""

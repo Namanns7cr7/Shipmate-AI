@@ -1,6 +1,6 @@
 from pydantic import BaseModel, Field
 from typing import Optional, List, Literal
-from .agent_schemas import ShipMateReport
+from .agent_schemas import ShipMateReport, Opportunity
 
 
 class AnalyzeRequest(BaseModel):
@@ -28,6 +28,23 @@ class BuildPlanRequest(BaseModel):
     # When True, ungrounded opportunities are kept (flagged grounded=False)
     # instead of dropped — useful for debugging the discovery quality.
     include_ungrounded: bool = False
+
+
+class BuildExecuteRequest(BaseModel):
+    """POST /api/build/execute — plan a single chosen opportunity, critique the
+    plan, and (when execute=true) actuate each step into one branch/PR.
+
+    The client sends the chosen Opportunity inline (the same object it received
+    from /api/build/plan) so the backend keeps no opportunity state between
+    calls — mirrors how /actuate takes the finding inline."""
+    owner: str
+    repo: str
+    branch: str = "main"
+    access_token: str
+    opportunity: "Opportunity"
+    # False (default) = plan + critique only, no PRs (safe to call freely).
+    # True = if the critic approves, actuate each step into one branch/PR.
+    execute: bool = False
 
 
 class RepoSummary(BaseModel):

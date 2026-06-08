@@ -36,7 +36,14 @@ import os
 import re
 from typing import Any, Dict, List, Optional, Set
 
+from pydantic import BaseModel, Field
+
 logger = logging.getLogger("shipmate.opportunity_critic")
+
+# The LLM verify pass (Phase 1B) is on by default but killable via env, exactly
+# like finding_critic's _CRITIC_ENABLED. The deterministic grounding/suppression
+# /ranking passes are always on (free + local).
+_VERIFY_ENABLED = os.getenv("SHIPMATE_OPPORTUNITY_VERIFY", "1").strip().lower() not in ("0", "false", "no")
 
 # The journal `kind` for opportunities. Keeping it a distinct namespace from
 # guardrail/blocker/test sigs is what prevents cross-suppression.
@@ -150,6 +157,242 @@ def ground_opportunities(
                 getattr(opp, "title", ""),
             )
     return opportunities
+
+
+# ── Verification (the LLM critic pass — catches "already built") ─────────────
+# Phase 1B. The smoke run proved deterministic grounding is necessary but not
+# sufficient: an opportunity can cite REAL files (grounded=True) yet propose
+# work that's ALREADY DONE — e.g. "persist reports for history" when
+# report_store.py + the /history endpoint already exist. Grounding can't catch
+# that; only reading the code can. This is the direct analogue of
+# finding_critic's "the control the finding says is MISSING actually EXISTS"
+# rule, applied to build opportunities.
+
+class _OppVerdict(BaseModel):
+    title: str = Field(..., description="The opportunity title being judged, verbatim.")
+    worth_doing: bool = Field(..., description="False if the work already exists, is a duplicate, or is not actually an improvement given the code shown.")
+    reason: str = Field(..., description="One sentence citing specific evidence (the existing implementation, or why it's still worth doing).")
+
+
+class _OppCriticReport(BaseModel):
+    verdicts: List[_OppVerdict] = Field(default_factory=list)
+
+
+_VERIFY_SYSTEM = (
+    "You are a skeptical staff engineer acting as a VERIFIER for an automated "
+    "tool that proposes 'self-improvement opportunities' for a codebase. The "
+    "tool is KNOWN to propose work that is ALREADY DONE because it pattern-"
+    "matches on file names without checking whether the capability exists. Your "
+    "ONE job: mark worth_doing=FALSE for opportunities that aren't actually "
+    "worth doing given the EXACT code shown.\n\n"
+    "Mark worth_doing=FALSE when ANY of these hold:\n"
+    "  1. ALREADY IMPLEMENTED: the proposed capability already exists in the "
+    "code shown. e.g. 'add a /history endpoint to persist reports' when a "
+    "report_store + a /history route are already present. This is the most "
+    "important and most common case — be aggressive about it.\n"
+    "  2. DUPLICATE: it restates something the code already does under a "
+    "different name.\n"
+    "  3. NOT AN IMPROVEMENT: it would add complexity with no real benefit, or "
+    "contradicts how the code already works.\n"
+    "  4. UNGROUNDED CLAIM: the rationale references code/behavior that does NOT "
+    "appear in what's shown.\n\n"
+    "Mark worth_doing=TRUE only when the opportunity targets a genuine gap you "
+    "can confirm is absent from the code shown. When the code shown is partial "
+    "and you genuinely cannot tell, default to worth_doing=TRUE (fail-open — we "
+    "would rather show a borderline opportunity than hide a real one). Emit "
+    "exactly one verdict per opportunity, echoing the title verbatim."
+)
+
+
+def verify_opportunities(
+    opportunities: List[Any],
+    code_blob: str,
+    provider: Any,
+    deployment_hint: str = "smart",
+) -> List[Any]:
+    """Run the LLM critic: drop opportunities the verifier says aren't worth
+    doing (already built / duplicate / not an improvement), judged against the
+    SAME code that was shown to the discoverer.
+
+    Sets `.worth_doing` + `.verify_reason` on each survivor for transparency.
+    Fail-open on every axis: critic disabled, no provider, no code, empty list,
+    or any exception ⇒ return the input unchanged (a noisy opportunity is
+    annoying; silently hiding a real one is worse)."""
+    if not opportunities or not _VERIFY_ENABLED or provider is None or not code_blob:
+        return opportunities
+    try:
+        listing = "\n".join(
+            f"{i + 1}. [{getattr(o, 'category', '')}] {getattr(o, 'title', '')}: "
+            f"{(getattr(o, 'description', '') or '')[:200]} "
+            f"(evidence: {'; '.join(getattr(o, 'evidence', None) or [])[:1] or ['none']})"
+            for i, o in enumerate(opportunities)
+        )
+        user = (
+            "## Source code that was analyzed\n"
+            f"{code_blob[:24000]}\n\n"
+            "## Candidate opportunities to verify\n"
+            f"{listing}\n\n"
+            "For EACH opportunity decide worth_doing. Be especially aggressive "
+            "about marking FALSE anything ALREADY IMPLEMENTED in the code above. "
+            "Echo each title verbatim."
+        )
+        report = provider.invoke_structured_sync(
+            system_prompt=_VERIFY_SYSTEM,
+            user_prompt=user,
+            schema_class=_OppCriticReport,
+            deployment_hint=deployment_hint,
+        )
+        refuted = {
+            (v.title or "").strip().lower(): (v.reason or "")
+            for v in report.verdicts
+            if v.worth_doing is False
+        }
+        kept = []
+        for o in opportunities:
+            title_l = (getattr(o, "title", "") or "").strip().lower()
+            if title_l in refuted:
+                logger.info(
+                    "opportunity critic refuted (not worth doing): %s — %s",
+                    getattr(o, "title", ""), refuted[title_l],
+                )
+                continue
+            # Annotate survivors so the UI can show the critic agreed.
+            try:
+                o.worth_doing = True
+            except Exception:
+                pass
+            kept.append(o)
+        return kept
+    except Exception as e:  # pragma: no cover - defensive
+        logger.warning("opportunity verify pass failed (%s); keeping all", e)
+        return opportunities
+
+
+# ── Deterministic "already-built" prefilter ─────────────────────────────────
+# The smoke run exposed the LLM critic's blind spot: it only sees the same
+# ~8-file code blob the discoverer saw, so when an opportunity proposes adding a
+# capability whose proof-of-existence lives in a file OUTSIDE that window (e.g.
+# "add a /history endpoint" when the route is defined in analysis.py, not in the
+# blob), the model can't refute it. This deterministic pass scans the FULL repo
+# corpus (every key_files body + the file tree) for the routes / new files the
+# opportunity proposes creating, and refutes when they already exist. Same
+# philosophy as finding_critic._deterministic_prefilter — don't ask the LLM what
+# code inspection can decide reliably.
+
+# Route paths like /api/repos/{owner}/{repo}/history  or  GET /foo/bar
+_ROUTE_RE = re.compile(r"(?:GET|POST|PUT|PATCH|DELETE\s+)?(/(?:api/)?[a-z][\w\-/]*(?:\{[^}]+\}[\w\-/]*)*)", re.IGNORECASE)
+# "add a <name>.py" / "create <path>.ts" style new-file proposals.
+_NEW_FILE_RE = re.compile(r"\b([\w./-]+\.(?:py|ts|tsx|js|jsx|go|rs))\b")
+# Verbs that signal the opportunity is proposing to ADD something new (vs improve
+# something that exists). Only then does "it already exists" mean "already built".
+_ADD_VERBS = ("add ", "create ", "introduce ", "implement ", "build ", "new ")
+
+
+def _normalize_route(route: str) -> str:
+    """Collapse path params so /repos/{owner}/{repo}/history ~= /repos/{x}/{y}/history."""
+    r = re.sub(r"\{[^}]+\}", "{}", route.strip().lower().rstrip("/"))
+    return r
+
+
+def _corpus(file_tree: List[str], key_files: Dict[str, str]) -> str:
+    """Lowercased concatenation of every file body + the tree — the full search
+    surface for already-built detection (NOT the truncated LLM blob)."""
+    parts = list(file_tree or [])
+    parts.extend((key_files or {}).values())
+    return "\n".join(parts).lower()
+
+
+def _proposes_adding(text: str) -> bool:
+    t = (text or "").lower()
+    return any(v in t for v in _ADD_VERBS)
+
+
+def already_built(opp: Any, file_tree: List[str], key_files: Dict[str, str]) -> Optional[str]:
+    """Return a reason string if the opportunity proposes adding something that
+    ALREADY exists in the repo, else None. Conservative: only fires for clear
+    'add X' proposals where X (a route or a new file) is already present."""
+    title = getattr(opp, "title", "") or ""
+    desc = getattr(opp, "description", "") or ""
+    text = f"{title}\n{desc}"
+    if not _proposes_adding(text):
+        return None
+
+    corpus = _corpus(file_tree, key_files)
+    tree_lower = {p.lower() for p in (file_tree or [])}
+
+    # 1. Proposed route already defined somewhere in the code.
+    for m in _ROUTE_RE.finditer(text):
+        route = _normalize_route(m.group(1))
+        # Ignore trivially short/again-generic paths.
+        if route.count("/") < 2 or len(route) < 6:
+            continue
+        if _normalize_route_present(route, corpus):
+            return f"route {m.group(1)!r} already exists in the codebase"
+
+    # 2. Proposed NEW file already exists in the tree (only when the text frames
+    #    it as creating that file — 'add report_store.py').
+    for m in _NEW_FILE_RE.finditer(text):
+        cand = m.group(1).lower()
+        base = cand.split("/")[-1]
+        # Must be framed as a new file, and not just a target_file it will edit.
+        if base in {p.split("/")[-1] for p in tree_lower} or any(
+            p.endswith("/" + base) or p == base for p in tree_lower
+        ):
+            # Guard: if the SAME path is in target_files, the opp intends to EDIT
+            # it (legit) — only refute when the text says add/create it.
+            if re.search(rf"(?:add|create|new)\b[^.]*\b{re.escape(base)}", text.lower()):
+                return f"file {base!r} already exists in the repo"
+
+    return None
+
+
+def _route_skeleton_pattern(segs: List[str]) -> str:
+    """Regex matching a route's segments, `{}` params as wildcards."""
+    pat_parts = []
+    for s in segs:
+        pat_parts.append(r"\{[^}/]+\}" if s == "{}" else re.escape(s))
+    return r"/" + r"/".join(pat_parts)
+
+
+def _normalize_route_present(route: str, corpus: str) -> bool:
+    """Is a route equivalent to `route` present in the corpus? Params are
+    wildcards. CRUCIAL: FastAPI route decorators OMIT the router's mount prefix
+    (a route mounted at /api shows up as `@router.get("/repos/...")` in source),
+    so a proposed `/api/repos/.../history` must also match a decorator that only
+    says `/repos/.../history`. We therefore try the route as-is AND with a
+    leading `api` segment stripped."""
+    segs = route.strip("/").split("/")
+    candidates = [segs]
+    if segs and segs[0] == "api" and len(segs) > 1:
+        candidates.append(segs[1:])  # prefix-stripped variant
+    for cand in candidates:
+        if re.search(_route_skeleton_pattern(cand), corpus):
+            return True
+    return False
+
+
+def filter_already_built(
+    opportunities: List[Any],
+    file_tree: List[str],
+    key_files: Dict[str, str],
+) -> List[Any]:
+    """Drop opportunities that propose adding something already present. Sets
+    .worth_doing=False + .verify_reason on the dropped ones (for debug views)
+    and returns only the survivors. Fully deterministic — runs even with no LLM."""
+    kept = []
+    for opp in opportunities:
+        reason = already_built(opp, file_tree, key_files)
+        if reason:
+            logger.info("already-built prefilter refuted: %s — %s",
+                        getattr(opp, "title", ""), reason)
+            try:
+                opp.worth_doing = False
+                opp.verify_reason = f"already built: {reason}"
+            except Exception:
+                pass
+            continue
+        kept.append(opp)
+    return kept
 
 
 # ── Suppression (journal-aware, opportunity-namespaced) ──────────────────────

@@ -120,7 +120,8 @@ def _print_plan(plan: BuildPlanResponse, show_ungrounded: bool) -> None:
     print(f"\n{bar}")
     print(f" OPPORTUNITY PLAN — {plan.owner}/{plan.repo} @ {plan.branch}")
     print(f" ai_enhanced={plan.ai_enhanced}  total_found={plan.total_found}  "
-          f"grounded={plan.grounded_count}  returned={len(plan.opportunities)}")
+          f"grounded={plan.grounded_count}  verified={plan.verified_count}  "
+          f"returned={len(plan.opportunities)}")
     print(bar)
 
     if not plan.opportunities:

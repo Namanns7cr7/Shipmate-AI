@@ -308,6 +308,13 @@ class LLMService:
         return _get_provider() is not None
 
     @classmethod
+    def provider(cls):
+        """The live LLM provider singleton (or None). Public accessor for
+        callers outside this module that need to pass the provider into a critic
+        pass (e.g. opportunity_critic.verify_opportunities). None-tolerant."""
+        return _get_provider()
+
+    @classmethod
     def enhance(cls, agent_name: str, context: Dict[str, Any], base_output: T) -> T:
         """
         Optionally rewrite prose fields on `base_output` using the configured
@@ -496,6 +503,18 @@ class LLMService:
 
     # ── Opportunity discovery (Phase 1A — self-improvement work for the repo) ──
 
+    @staticmethod
+    def opportunity_code_blob(context: Dict[str, Any]) -> str:
+        """The exact code blob shown to the opportunity discoverer. Exposed so
+        the 1B critic (verify_opportunities) can judge against the SAME evidence
+        the discoverer saw — same contract as finding_critic using the agent's
+        code_blob."""
+        return _repo_code_blob(
+            context, max_files=8, max_chars_per_file=3500,
+            prefer=("routes", "main", "api", "service", "agent",
+                    "orchestrator", "components", "pages", "hooks", "lib"),
+        )
+
     @classmethod
     def discover_opportunities(
         cls, context: Dict[str, Any], max_opportunities: int = 8,
@@ -519,11 +538,7 @@ class LLMService:
             return []
 
         try:
-            code_blob = _repo_code_blob(
-                context, max_files=8, max_chars_per_file=3500,
-                prefer=("routes", "main", "api", "service", "agent",
-                        "orchestrator", "components", "pages", "hooks", "lib"),
-            )
+            code_blob = cls.opportunity_code_blob(context)
             user = _user_prompt_opportunity_discovery(context, code_blob, max_opportunities)
             discovery = provider.invoke_structured_sync(
                 system_prompt=_DISCOVERY_OPPORTUNITY_SYSTEM,
