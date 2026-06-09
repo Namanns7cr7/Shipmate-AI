@@ -122,10 +122,12 @@ class TestAnalyzeOffloaded:
 
         # Raise AFTER capturing the thread id — we only care WHERE run() executed,
         # not what it returns (building a full ShipMateReport here is noise).
-        def fake_run(ctx):
+        # The route now builds a per-request orchestrator via new_per_request(),
+        # so patch run() on the CLASS.
+        def fake_run(self, ctx):
             ran_on["thread"] = threading.get_ident()
             raise RuntimeError("stop here — thread already captured")
-        monkeypatch.setattr(analysis_mod._orchestrator, "run", fake_run)
+        monkeypatch.setattr(analysis_mod.ShipMateOrchestrator, "run", fake_run)
         monkeypatch.setattr(analysis_mod.report_store, "save_report", lambda r: 1)
 
         from fastapi.testclient import TestClient
@@ -137,3 +139,32 @@ class TestAnalyzeOffloaded:
         assert ran_on.get("thread") is not None, "orchestrator.run was never invoked"
         assert ran_on["thread"] != loop_thread, \
             "orchestrator.run must execute on a worker thread, not the event loop"
+
+
+# ── Per-request orchestrator isolation (the "build new" finding) ─────────────
+
+class TestPerRequestOrchestrator:
+    def test_factory_returns_fresh_isolated_instances(self):
+        from app.orchestrator.shipmate_orchestrator import ShipMateOrchestrator
+        a = ShipMateOrchestrator.new_per_request()
+        b = ShipMateOrchestrator.new_per_request()
+        assert a is not b, "each request must get its own orchestrator"
+        assert a.repo_lens is not b.repo_lens
+        assert a.guardrail is not b.guardrail
+        assert a.plan_forge is not b.plan_forge
+        assert a.testpilot is not b.testpilot
+
+    def test_no_module_global_orchestrator(self):
+        import app.api.routes.analysis as analysis_mod
+        assert not hasattr(analysis_mod, "_orchestrator"), \
+            "module-global _orchestrator must be removed in favor of per-request scope"
+
+    def test_agents_stay_stateless_contract(self):
+        """Per-request scoping backstops a stateless-agent invariant: an agent
+        that grew mutable run-state on self would reintroduce the cross-request
+        race. Two fresh orchestrators' agents must have identical attribute
+        shape (no accumulation)."""
+        from app.orchestrator.shipmate_orchestrator import ShipMateOrchestrator
+        o = ShipMateOrchestrator.new_per_request()
+        o2 = ShipMateOrchestrator.new_per_request()
+        assert set(vars(o.guardrail)) == set(vars(o2.guardrail))

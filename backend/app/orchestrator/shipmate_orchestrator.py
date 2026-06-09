@@ -24,11 +24,30 @@ class ShipMateOrchestrator:
       4. ReportService   — final report assembly
     """
 
+    # ── Concurrency contract ────────────────────────────────────────────────
+    # /analyze now offloads run() to a worker thread (asyncio.to_thread), so
+    # multiple analyses can execute CONCURRENTLY. To keep that safe, construct
+    # one orchestrator PER REQUEST (see new_per_request() / the route) rather
+    # than sharing a module-global instance. The agents are currently stateless
+    # (no self.* mutation outside __init__) and cheap to build, so per-request
+    # construction is ~free and removes the latent risk that a future agent
+    # caching something on self would bleed across concurrent requests.
+    # INVARIANT: agents must stay stateless across run(); per-request scoping is
+    # the backstop, not a license to add request state to a shared agent.
+
     def __init__(self):
         self.repo_lens = RepoLensAgent()
         self.plan_forge = PlanForgeAgent()
         self.guardrail = GuardRailAgent()
         self.testpilot = TestPilotAgent()
+
+    @classmethod
+    def new_per_request(cls) -> "ShipMateOrchestrator":
+        """Factory for a fresh, request-scoped orchestrator with its own agent
+        instances. Use this in request handlers instead of a shared global so
+        concurrent analyses never share mutable agent state. Cheap — the agents
+        do no I/O or heavy work in __init__."""
+        return cls()
 
     def run(self, repo_context: Dict[str, Any]) -> ShipMateReport:
         """
