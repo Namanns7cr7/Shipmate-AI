@@ -422,6 +422,22 @@ def _lint_coder_output(
     return issues
 
 
+def _build_repo_map(
+    file_tree: List[str],
+    target_files: Dict[str, str],
+    target_paths: List[str],
+) -> str:
+    """Build the Coder repo map (real modules + exported symbols) for the brief.
+    Fail-open: any error returns "" so a malformed tree can never break an
+    actuate — the Coder just runs without the map section, as it did before."""
+    try:
+        from app.services import repo_map as rm
+        return rm.build_repo_map(file_tree or [], target_files or {}, target_paths or [])
+    except Exception as e:  # pragma: no cover - fail-open
+        logger.debug("repo_map build skipped (%s)", e)
+        return ""
+
+
 def _build_task(finding: FindingPayload, repo_full_name: str = "") -> str:
     """The instruction string that becomes the Coder agent's `task`.
 
@@ -530,6 +546,12 @@ class CoderOrchestrator:
                 tech_stack=ctx.tech_stack,
                 entry_points=ctx.entry_points,
                 target_files=step_targets,
+                # Map built from working_files (originals + prior steps' output),
+                # so step N sees the REAL symbols step N-1 just defined — the
+                # same ground truth the merged target_files carry.
+                repo_map=_build_repo_map(
+                    file_tree, working_files, list(step.target_paths),
+                ),
                 finding_kind=req.finding.kind,
                 finding_id=f"{req.finding.id}-step{idx + 1}",
                 finding_severity=req.finding.severity,
@@ -605,6 +627,9 @@ class CoderOrchestrator:
             tech_stack=ctx.tech_stack,
             entry_points=ctx.entry_points,
             target_files=target_files,
+            # Real module/symbol map so Coder imports only what exists — the
+            # prevention half of the hallucinated-import defense ast_lint cures.
+            repo_map=_build_repo_map(file_tree, target_files, target_paths),
             finding_kind=req.finding.kind,
             finding_id=req.finding.id,
             finding_severity=req.finding.severity,
