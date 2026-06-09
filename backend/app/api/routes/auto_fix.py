@@ -94,7 +94,7 @@ async def _run_loop(req: AutoFixRequest) -> AsyncIterator[str]:
     req.access_token = resolved
 
     repo_full = f"{req.owner}/{req.repo}"
-    orchestrator = ShipMateOrchestrator()
+    orchestrator = ShipMateOrchestrator.new_per_request()
     seen_signatures: set = set()
     cooled_paths: set = set()
 
