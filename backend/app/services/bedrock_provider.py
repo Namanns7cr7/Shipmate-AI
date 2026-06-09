@@ -30,64 +30,15 @@ from typing import Any, Literal, Type
 
 from pydantic import BaseModel
 
+from app.services import run_trace
+from app.services.provider_coercion import (
+    MIN_CODER_SUMMARY_CHARS as _MIN_CODER_SUMMARY_CHARS,
+    coerce_to_schema as _coerce_to_schema,
+    is_short_summary_coder_output as _is_short_summary,
+    shrink_oversized_file_blocks as _shrink_oversized_file_blocks,
+)
+
 logger = logging.getLogger("shipmate.bedrock_provider")
-
-# A CoderOutput with files but a near-empty summary is a known flaky-output
-# signature (the model emitted a patch but truncated its reasoning). We retry
-# once with a tighter prompt. 30 chars ≈ "Fixes the bug." — anything shorter
-# alongside a real patch is suspect.
-_MIN_CODER_SUMMARY_CHARS = 30
-
-
-def _coerce_stringified_json(value: Any) -> Any:
-    """
-    Recursively walk a payload and parse any string that looks like JSON.
-
-    Bedrock's Converse toolUse blocks occasionally return nested arrays/objects
-    as serialized JSON strings instead of native types — even when the tool
-    inputSchema clearly types them as arrays/objects. This walks the structure
-    and best-effort decodes those strings so Pydantic can validate normally.
-
-    A string is treated as "looks like JSON" iff its first non-whitespace
-    character is `[` or `{` — narrow enough to avoid corrupting freeform text
-    fields (descriptions, summaries) that happen to start with other chars.
-    """
-    if isinstance(value, str):
-        stripped = value.lstrip()
-        if stripped[:1] in ("[", "{"):
-            try:
-                return _coerce_stringified_json(json.loads(value))
-            except json.JSONDecodeError:
-                return value
-        return value
-    if isinstance(value, list):
-        return [_coerce_stringified_json(v) for v in value]
-    if isinstance(value, dict):
-        return {k: _coerce_stringified_json(v) for k, v in value.items()}
-    return value
-
-
-def _shrink_oversized_file_blocks(user_prompt: str, threshold: int = 8_000) -> str:
-    """Halve the size of any single oversized region in the prompt to free
-    token budget for the model's own output on a short-summary retry.
-
-    We don't parse the prompt structure (it's built by coder_agent), we just
-    cap total length: if the prompt exceeds 2*threshold, keep the head (task +
-    early files) and the tail, dropping the middle with a marker. This biases
-    toward preserving the task framing and the most-recently-listed file,
-    which is usually the edit target.
-    """
-    if len(user_prompt) <= 2 * threshold:
-        return user_prompt
-    head = user_prompt[:threshold]
-    tail = user_prompt[-threshold:]
-    dropped = len(user_prompt) - 2 * threshold
-    return (
-        head
-        + f"\n\n# ... [ShipMate retry: dropped {dropped} chars of file context "
-        "to free output budget; focus on the task and the file content shown] ...\n\n"
-        + tail
-    )
 
 
 class BedrockProvider:
@@ -149,88 +100,96 @@ class BedrockProvider:
         schema = schema_class.model_json_schema()
         max_tokens = 8192
 
-        try:
-            payload = self._call_converse(
-                model_id, tool_name, schema, system_prompt, user_prompt, max_tokens
-            )
-            coerced = _coerce_stringified_json(payload)
-            result = schema_class.model_validate(coerced)
-            # Flaky-output guard: a CoderOutput that has files but an almost
-            # empty summary is a sign the model truncated. Retry once with a
-            # shrunk context (drop the back half of oversized target-file
-            # blocks so the model has more budget for its reasoning).
-            result = self._maybe_retry_short_summary(
-                result, schema_class, model_id, tool_name, schema,
-                system_prompt, user_prompt, max_tokens,
-            )
-            return result
-        except Exception as first_err:
-            from pydantic import ValidationError as _VE
-            err_str = str(first_err)
-            # Auto-recover from expired creds: rebuild the boto3 client on
-            # auth-class errors so the next call picks up freshly-refreshed
-            # ADA creds without needing a process restart. The default
-            # session caches credential providers, so simply discarding the
-            # client and rebuilding it is what triggers the refresh.
-            if any(m in err_str for m in (
-                "ExpiredToken", "ExpiredTokenException",
-                "InvalidSignatureException", "UnrecognizedClientException",
-                "Signature expired",
-            )):
-                logger.warning(
-                    "BedrockProvider: auth failure (%s) — rebuilding boto3 "
-                    "client to pick up refreshed credentials, then retrying once",
-                    type(first_err).__name__,
-                )
-                import boto3
-                from botocore.config import Config
-                self.client = boto3.client(
-                    "bedrock-runtime",
-                    region_name=os.getenv("AWS_REGION", "us-west-2"),
-                    config=Config(read_timeout=300, connect_timeout=10,
-                                  retries={"max_attempts": 1}),
-                )
+        # One trace span per logical structured call. Retries inside this method
+        # bump the span's counter, so a row with retries>0 is the validation /
+        # auth / short-summary waste that used to be invisible in the logs.
+        with run_trace.span(
+            component=f"llm:bedrock:{deployment_hint}",
+            op=f"invoke:{schema_class.__name__}",
+            model=model_id, prompt=system_prompt + user_prompt,
+        ) as _sp:
+            try:
                 payload = self._call_converse(
                     model_id, tool_name, schema, system_prompt, user_prompt, max_tokens
                 )
-                coerced = _coerce_stringified_json(payload)
+                # Schema-aware coercion repairs the common Bedrock quirk (a nested
+                # array/object returned as a JSON STRING) deterministically up
+                # front, so the LLM validation-retry below only fires for
+                # genuinely malformed output, not for every stringified array.
+                coerced = _coerce_to_schema(payload, schema_class)
                 result = schema_class.model_validate(coerced)
-                return self._maybe_retry_short_summary(
+                # Flaky-output guard: a CoderOutput that has files but an almost
+                # empty summary is a sign the model truncated. Retry once with a
+                # shrunk context (drop the back half of oversized target-file
+                # blocks so the model has more budget for its reasoning).
+                result = self._maybe_retry_short_summary(
                     result, schema_class, model_id, tool_name, schema,
-                    system_prompt, user_prompt, max_tokens,
+                    system_prompt, user_prompt, max_tokens, span=_sp,
                 )
+                _sp.set_output(result.model_dump_json() if hasattr(result, "model_dump_json") else result)
+                return result
+            except Exception as first_err:
+                from pydantic import ValidationError as _VE
+                err_str = str(first_err)
+                # Auto-recover from expired creds: rebuild the boto3 client on
+                # auth-class errors so the next call picks up freshly-refreshed
+                # ADA creds without needing a process restart. The default
+                # session caches credential providers, so simply discarding the
+                # client and rebuilding it is what triggers the refresh.
+                if any(m in err_str for m in (
+                    "ExpiredToken", "ExpiredTokenException",
+                    "InvalidSignatureException", "UnrecognizedClientException",
+                    "Signature expired",
+                )):
+                    logger.warning(
+                        "BedrockProvider: auth failure (%s) — rebuilding boto3 "
+                        "client to pick up refreshed credentials, then retrying once",
+                        type(first_err).__name__,
+                    )
+                    _sp.bump_retry()
+                    import boto3
+                    from botocore.config import Config
+                    self.client = boto3.client(
+                        "bedrock-runtime",
+                        region_name=os.getenv("AWS_REGION", "us-west-2"),
+                        config=Config(read_timeout=300, connect_timeout=10,
+                                      retries={"max_attempts": 1}),
+                    )
+                    payload = self._call_converse(
+                        model_id, tool_name, schema, system_prompt, user_prompt, max_tokens
+                    )
+                    coerced = _coerce_to_schema(payload, schema_class)
+                    result = schema_class.model_validate(coerced)
+                    return self._maybe_retry_short_summary(
+                        result, schema_class, model_id, tool_name, schema,
+                        system_prompt, user_prompt, max_tokens, span=_sp,
+                    )
 
-            is_validation = isinstance(first_err, _VE) or "validation error" in err_str.lower()
-            if not is_validation:
-                raise
-            logger.warning(
-                "BedrockProvider: structured-output validation failed (%s); "
-                "retrying once with explicit array-not-string reminder",
-                err_str[:200],
-            )
-            retry_user = (
-                user_prompt
-                + "\n\n# RETRY NOTICE\nA prior attempt returned the `files` field "
-                "as a JSON-encoded STRING instead of a native JSON array, which "
-                "broke parsing. Return `files` as a native JSON array of objects "
-                "matching the tool schema exactly (each object's fields as "
-                "native values). Do not stringify the array or any nested object."
-            )
-            payload = self._call_converse(
-                model_id, tool_name, schema, system_prompt, retry_user, max_tokens
-            )
-            coerced = _coerce_stringified_json(payload)
-            return schema_class.model_validate(coerced)
+                is_validation = isinstance(first_err, _VE) or "validation error" in err_str.lower()
+                if not is_validation:
+                    raise
+                logger.warning(
+                    "BedrockProvider: structured-output validation failed (%s); "
+                    "retrying once with explicit array-not-string reminder",
+                    err_str[:200],
+                )
+                _sp.bump_retry()
+                retry_user = (
+                    user_prompt
+                    + "\n\n# RETRY NOTICE\nA prior attempt returned the `files` field "
+                    "as a JSON-encoded STRING instead of a native JSON array, which "
+                    "broke parsing. Return `files` as a native JSON array of objects "
+                    "matching the tool schema exactly (each object's fields as "
+                    "native values). Do not stringify the array or any nested object."
+                )
+                payload = self._call_converse(
+                    model_id, tool_name, schema, system_prompt, retry_user, max_tokens
+                )
+                coerced = _coerce_to_schema(payload, schema_class)
+                return schema_class.model_validate(coerced)
 
-    @staticmethod
-    def _is_short_summary_coder_output(result: BaseModel) -> bool:
-        """True when *result* is a CoderOutput carrying a patch but an
-        implausibly short summary (a flaky-truncation signature)."""
-        if type(result).__name__ != "CoderOutput":
-            return False
-        files = getattr(result, "files", None) or []
-        summary = getattr(result, "summary", "") or ""
-        return len(files) > 0 and len(summary.strip()) < _MIN_CODER_SUMMARY_CHARS
+    # Thin back-compat shim — the real predicate lives in provider_coercion.
+    _is_short_summary_coder_output = staticmethod(_is_short_summary)
 
     def _maybe_retry_short_summary(
         self,
@@ -242,13 +201,16 @@ class BedrockProvider:
         system_prompt: str,
         user_prompt: str,
         max_tokens: int,
+        span: Any = None,
     ) -> BaseModel:
         """One-shot retry when a CoderOutput came back with files but a
         near-empty summary. Shrinks oversized target-file blocks in the
         prompt to free token budget, then re-invokes once. If the retry is
         ALSO short, keep whichever has the longer summary (never worse)."""
-        if not self._is_short_summary_coder_output(result):
+        if not _is_short_summary(result):
             return result
+        if span is not None:
+            span.bump_retry()
         logger.warning(
             "BedrockProvider: CoderOutput summary suspiciously short "
             "(%d chars, %d files) — retrying once with shrunk context",
@@ -260,7 +222,7 @@ class BedrockProvider:
             payload = self._call_converse(
                 model_id, tool_name, schema, system_prompt, shrunk_user, max_tokens
             )
-            coerced = _coerce_stringified_json(payload)
+            coerced = _coerce_to_schema(payload, schema_class)
             retried = schema_class.model_validate(coerced)
         except Exception as e:
             logger.info("short-summary retry failed (%s); keeping first result", e)

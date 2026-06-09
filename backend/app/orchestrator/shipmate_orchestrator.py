@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from datetime import datetime, timezone
 from typing import Any, AsyncGenerator, Dict
 
@@ -6,11 +7,14 @@ from ..agents.repo_lens_agent import RepoLensAgent
 from ..agents.plan_forge_agent import PlanForgeAgent
 from ..agents.guardrail_agent import GuardRailAgent
 from ..agents.testpilot_agent import TestPilotAgent
+from ..services import run_trace
 from ..services.scoring_service import ScoringService
 from ..services.report_service import ReportService
 from ..schemas.agent_schemas import (
     AgentOutputs, ShipMateReport, RepoInfo, ShipRecommendation
 )
+
+logger = logging.getLogger("shipmate.orchestrator")
 
 
 class ShipMateOrchestrator:
@@ -62,24 +66,71 @@ class ShipMateOrchestrator:
         Returns:
             ShipMateReport
         """
-        # ── Step 1: RepoLens (must run first — other agents need its output) ──
-        # Reuse a RepoLens output already attached to the context (e.g. by
-        # RepoIndexService, which analyzes the repo once and shares the result)
-        # instead of re-running the pass. Falls back to running it when absent.
-        repo_lens_out = repo_context.get("repo_lens") or self.repo_lens.run(repo_context)
+        # Establish a trace run so every nested LLM call (provider-level spans)
+        # attributes to one run_id — the structured record that makes retry
+        # waste / latency / errors queryable instead of log-archaeology.
+        with run_trace.run(prefix="analyze") as run_id:
+            # ── Step 1: RepoLens (must run first — other agents need its output) ──
+            # Reuse a RepoLens output already attached to the context (e.g. by
+            # RepoIndexService, which analyzes the repo once and shares the result)
+            # instead of re-running the pass. Falls back to running it when absent.
+            repo_lens_out = repo_context.get("repo_lens") or self.repo_lens.run(repo_context)
 
-        # Enrich context with RepoLens output
-        enriched = {**repo_context, "repo_lens": repo_lens_out}
+            # Enrich context with RepoLens output
+            enriched = {**repo_context, "repo_lens": repo_lens_out}
 
-        # ── Step 2: Run remaining agents (all consume enriched context) ──
-        plan_forge_out = self.plan_forge.run(enriched)
-        guardrail_out = self.guardrail.run(enriched)
-        testpilot_out = self.testpilot.run(enriched)
+            # ── Step 2: Run the 3 independent agents CONCURRENTLY ──
+            # PlanForge / GuardRail / TestPilot each depend only on RepoLens, not
+            # on each other, so they run in parallel on worker threads. This is
+            # safe BECAUSE each request builds its own orchestrator (per-request
+            # scope) and the agents are stateless — the documented invariant.
+            plan_forge_out, guardrail_out, testpilot_out = self._run_independent_agents_sync(enriched)
 
-        # ── Steps 3+4: Score + assemble (shared with run_stream) ──
-        return self._assemble_report(
-            repo_context, repo_lens_out, plan_forge_out, guardrail_out, testpilot_out
+            # ── Steps 3+4: Score + assemble (shared with run_stream) ──
+            report = self._assemble_report(
+                repo_context, repo_lens_out, plan_forge_out, guardrail_out, testpilot_out
+            )
+            try:
+                logger.info("analyze run %s: %s", run_id, run_trace.run_summary(run_id))
+            except Exception:
+                pass
+            return report
+
+    def _run_independent_agents_sync(self, enriched: Dict[str, Any]):
+        """Run PlanForge / GuardRail / TestPilot concurrently from a synchronous
+        caller. Each agent's .run() is blocking (heuristics + LLM calls), so we
+        fan them out onto threads and join. Falls back to sequential execution if
+        no event loop machinery is available. Returns (plan, guardrail, testpilot)
+        in fixed order regardless of completion order.
+
+        Concurrency safety: the three agents share no mutable state (stateless
+        invariant + per-request orchestrator), and they only READ `enriched`.
+        Each LLM call is independently traced at the provider layer."""
+        import concurrent.futures as _cf
+        import contextvars
+
+        agents = (
+            ("plan_forge", self.plan_forge),
+            ("guardrail", self.guardrail),
+            ("testpilot", self.testpilot),
         )
+
+        def _run_in_ctx(agent):
+            # Each worker runs the agent inside a FRESH copy of the current
+            # context so the active run_id (a ContextVar) propagates into the
+            # thread — provider spans then attribute to this analyze run.
+            return contextvars.copy_context().run(agent.run, enriched)
+
+        results: Dict[str, Any] = {}
+        with _cf.ThreadPoolExecutor(max_workers=3, thread_name_prefix="agent") as pool:
+            futures = {
+                pool.submit(_run_in_ctx, agent): name
+                for name, agent in agents
+            }
+            for fut in _cf.as_completed(futures):
+                name = futures[fut]
+                results[name] = fut.result()
+        return results["plan_forge"], results["guardrail"], results["testpilot"]
 
     async def run_stream(
         self, repo_context: Dict[str, Any]
@@ -95,35 +146,61 @@ class ShipMateOrchestrator:
 
         The agents' .run() methods are blocking (heuristics + one LLM call each),
         so each is dispatched via asyncio.to_thread to keep the event loop free
-        while the SSE connection streams. run() stays the synchronous source of
-        truth used by auto_fix and the non-streaming /analyze route."""
-        try:
-            # Reuse a context-supplied RepoLens (RepoIndexService) if present.
-            repo_lens_out = repo_context.get("repo_lens") or \
-                await asyncio.to_thread(self.repo_lens.run, repo_context)
-            yield {"event": "agent.done", "agent": "repo_lens",
-                   "output": repo_lens_out.model_dump()}
+        while the SSE connection streams. The 3 independent agents (PlanForge /
+        GuardRail / TestPilot) now run CONCURRENTLY — events are emitted in
+        completion order, so the UI fills in whichever agent finishes first
+        instead of waiting on a fixed sequential chain. run() stays the
+        synchronous source of truth used by auto_fix and the non-streaming
+        /analyze route."""
+        # asyncio.to_thread propagates the current contextvars.Context into the
+        # worker thread, so the run_id we set here reaches the provider spans.
+        with run_trace.run(prefix="analyze-stream") as run_id:
+            try:
+                # Reuse a context-supplied RepoLens (RepoIndexService) if present.
+                repo_lens_out = repo_context.get("repo_lens") or \
+                    await asyncio.to_thread(self.repo_lens.run, repo_context)
+                yield {"event": "agent.done", "agent": "repo_lens",
+                       "output": repo_lens_out.model_dump()}
 
-            enriched = {**repo_context, "repo_lens": repo_lens_out}
+                enriched = {**repo_context, "repo_lens": repo_lens_out}
 
-            plan_forge_out = await asyncio.to_thread(self.plan_forge.run, enriched)
-            yield {"event": "agent.done", "agent": "plan_forge",
-                   "output": plan_forge_out.model_dump()}
+                # Fan the 3 independent agents out concurrently; yield each as it
+                # completes (not in a fixed order). Each task carries its OWN name
+                # back (no fragile result-type matching) so an agent can never be
+                # silently lost, and the contextvar context propagates run_id into
+                # the worker thread.
+                async def _named(agent_name, fn):
+                    return agent_name, await asyncio.to_thread(fn, enriched)
 
-            guardrail_out = await asyncio.to_thread(self.guardrail.run, enriched)
-            yield {"event": "agent.done", "agent": "guardrail",
-                   "output": guardrail_out.model_dump()}
+                tasks = [
+                    asyncio.create_task(_named("plan_forge", self.plan_forge.run)),
+                    asyncio.create_task(_named("guardrail", self.guardrail.run)),
+                    asyncio.create_task(_named("testpilot", self.testpilot.run)),
+                ]
+                outputs: Dict[str, Any] = {}
+                for coro in asyncio.as_completed(tasks):
+                    name, done = await coro
+                    outputs[name] = done
+                    yield {"event": "agent.done", "agent": name,
+                           "output": done.model_dump()}
 
-            testpilot_out = await asyncio.to_thread(self.testpilot.run, enriched)
-            yield {"event": "agent.done", "agent": "testpilot",
-                   "output": testpilot_out.model_dump()}
+                # Guard: every independent agent must have produced output before
+                # we assemble. (as_completed surfaces any task exception above, so
+                # a crashed agent already routed to the error frame; this catches
+                # the should-never-happen partial case explicitly rather than
+                # KeyError-ing.)
+                missing = [k for k in ("plan_forge", "guardrail", "testpilot")
+                           if k not in outputs]
+                if missing:
+                    raise RuntimeError(f"agent(s) produced no output: {missing}")
 
-            report = self._assemble_report(
-                repo_context, repo_lens_out, plan_forge_out, guardrail_out, testpilot_out
-            )
-            yield {"event": "report.done", "report": report.model_dump()}
-        except Exception as e:  # pragma: no cover - defensive stream guard
-            yield {"event": "error", "detail": f"Analysis failed: {e}"}
+                report = self._assemble_report(
+                    repo_context, repo_lens_out,
+                    outputs["plan_forge"], outputs["guardrail"], outputs["testpilot"],
+                )
+                yield {"event": "report.done", "report": report.model_dump()}
+            except Exception as e:  # pragma: no cover - defensive stream guard
+                yield {"event": "error", "detail": f"Analysis failed: {e}"}
 
     def _assemble_report(
         self, repo_context, repo_lens_out, plan_forge_out, guardrail_out, testpilot_out

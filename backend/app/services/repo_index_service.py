@@ -144,6 +144,21 @@ class RepoIndexService:
         cls, token, owner, repo, branch,
         include_source_corpus, run_repo_lens, pr_number, feature_context,
     ) -> RepoIndex:
+        # ── Persistent L2 (B4): keyed by the branch-head COMMIT SHA. A hit means
+        # this EXACT tree was already built (in this or a PRIOR process), so we
+        # rehydrate instead of re-paying the tree-walk + ~40 file fetches +
+        # RepoLens. SHA-keyed ⇒ never stale (a push = a new SHA = a clean miss).
+        # A missing SHA (resolver failed) just skips the L2 path. Fail-open.
+        commit_sha = await cls._resolve_sha(token, owner, repo, branch)
+        if commit_sha:
+            hydrated = cls._load_persistent(
+                owner, repo, branch, include_source_corpus, pr_number, commit_sha,
+            )
+            if hydrated is not None:
+                logger.info("RepoIndex L2 HIT %s/%s@%s sha=%s — rehydrated from store",
+                            owner, repo, branch, commit_sha[:8])
+                return hydrated
+
         logger.debug("RepoIndex MISS — building %s/%s@%s (src=%s pr=%s)",
                      owner, repo, branch, include_source_corpus, pr_number)
         repo_context = await RepoAnalysisService.build_context(
@@ -164,12 +179,70 @@ class RepoIndexService:
                 logger.warning("RepoIndex: RepoLens failed for %s/%s (%s); proceeding",
                                owner, repo, e)
 
-        return RepoIndex(
+        built = RepoIndex(
             repo_context=repo_context,
             repo_lens=repo_lens,
             built_at=time.time(),
             source_enriched=include_source_corpus,
         )
+        # Persist for the next process / worker (best-effort).
+        if commit_sha:
+            cls._save_persistent(
+                owner, repo, branch, include_source_corpus, pr_number,
+                commit_sha, built,
+            )
+        return built
+
+    @staticmethod
+    async def _resolve_sha(token, owner, repo, branch) -> Optional[str]:
+        """Cheap branch-head SHA for the L2 key. Fail-open to None."""
+        try:
+            from app.services.github_api_service import GitHubAPIService
+            return await GitHubAPIService.get_branch_head_sha(token, owner, repo, branch)
+        except Exception as e:  # pragma: no cover - fail-open
+            logger.debug("RepoIndex: SHA resolve failed (%s); skipping L2", e)
+            return None
+
+    @staticmethod
+    def _load_persistent(
+        owner, repo, branch, include_source_corpus, pr_number, commit_sha,
+    ) -> Optional["RepoIndex"]:
+        try:
+            from app.services import repo_index_store as store
+            hit = store.get(owner, repo, branch, include_source_corpus,
+                            pr_number, commit_sha)
+            if hit is None:
+                return None
+            repo_lens = None
+            if hit.get("repo_lens"):
+                try:
+                    from app.schemas.agent_schemas import RepoLensOutput
+                    repo_lens = RepoLensOutput.model_validate(hit["repo_lens"])
+                except Exception:
+                    repo_lens = None
+            return RepoIndex(
+                repo_context=hit["repo_context"],
+                repo_lens=repo_lens,
+                built_at=hit.get("built_at", time.time()),
+                source_enriched=include_source_corpus,
+            )
+        except Exception as e:  # pragma: no cover - fail-open
+            logger.debug("RepoIndex: L2 load failed (%s)", e)
+            return None
+
+    @staticmethod
+    def _save_persistent(
+        owner, repo, branch, include_source_corpus, pr_number, commit_sha, index,
+    ) -> None:
+        try:
+            from app.services import repo_index_store as store
+            lens_json = None
+            if index.repo_lens is not None and hasattr(index.repo_lens, "model_dump_json"):
+                lens_json = index.repo_lens.model_dump_json()
+            store.put(owner, repo, branch, include_source_corpus, pr_number,
+                      commit_sha, index.repo_context, lens_json)
+        except Exception as e:  # pragma: no cover - fail-open
+            logger.debug("RepoIndex: L2 save failed (%s)", e)
 
     @staticmethod
     def _snapshot(index: RepoIndex) -> RepoIndex:
@@ -208,6 +281,15 @@ class RepoIndexService:
             if k[0] == owner and k[1] == repo and (branch is None or k[2] == branch):
                 cls._cache.pop(k, None)
                 dropped += 1
+        # Also drop the persistent L2 entries so a post-push rebuild can't serve
+        # a rehydrated stale corpus. (SHA-keyed L2 is self-invalidating on a real
+        # push, but an explicit invalidate — e.g. our own actuate changed the
+        # repo — should clear it too.) Best-effort.
+        try:
+            from app.services import repo_index_store as store
+            store.invalidate(owner, repo, branch)
+        except Exception:  # pragma: no cover
+            pass
         return dropped
 
     @classmethod
