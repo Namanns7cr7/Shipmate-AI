@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 
@@ -14,7 +15,10 @@ logger = logging.getLogger("shipmate.analysis_route")
 
 router = APIRouter(tags=["analysis"])
 
-_orchestrator = ShipMateOrchestrator()
+# No module-global orchestrator: /analyze offloads run() to a worker thread, so
+# analyses run concurrently. Each request gets its OWN orchestrator (fresh agent
+# instances) so concurrent runs can never share mutable agent state. Agent
+# construction is cheap (no I/O in __init__), so this costs ~nothing.
 
 async def _verify_repo_write_access(token: str, owner: str, repo: str) -> None:
     """Back-compat shim — the canonical check now lives in app.api.deps.
@@ -74,7 +78,13 @@ async def analyze(request: AnalyzeRequest):
         )
 
     try:
-        report = _orchestrator.run(repo_context)
+        # run() is synchronous and makes ~4 blocking LLM calls (~2-3 min total).
+        # Calling it directly in this async route would block the event loop and
+        # freeze EVERY other request for the whole analysis. Offload to a worker
+        # thread — the same treatment run_stream() already gives each agent.
+        # Per-request orchestrator: concurrent analyses get isolated agents.
+        orchestrator = ShipMateOrchestrator.new_per_request()
+        report = await asyncio.to_thread(orchestrator.run, repo_context)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Analysis pipeline failed: {str(e)}")
 
@@ -118,9 +128,12 @@ async def analyze_stream(request: AnalyzeRequest):
             detail=f"Failed to fetch repository data from GitHub: {str(e)}",
         )
 
+    # Per-request orchestrator (isolated agents) for this stream too.
+    orchestrator = ShipMateOrchestrator.new_per_request()
+
     async def _event_source():
         try:
-            async for event in _orchestrator.run_stream(repo_context):
+            async for event in orchestrator.run_stream(repo_context):
                 # Persist the streamed run too, so the history dashboard sees it.
                 # The report.done frame carries the assembled report as a dict;
                 # rebuild a ShipMateReport from it for the store (best-effort).
