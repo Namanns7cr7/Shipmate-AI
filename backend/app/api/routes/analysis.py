@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 
@@ -74,7 +75,11 @@ async def analyze(request: AnalyzeRequest):
         )
 
     try:
-        report = _orchestrator.run(repo_context)
+        # run() is synchronous and makes ~4 blocking LLM calls (~2-3 min total).
+        # Calling it directly in this async route would block the event loop and
+        # freeze EVERY other request for the whole analysis. Offload to a worker
+        # thread — the same treatment run_stream() already gives each agent.
+        report = await asyncio.to_thread(_orchestrator.run, repo_context)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Analysis pipeline failed: {str(e)}")
 

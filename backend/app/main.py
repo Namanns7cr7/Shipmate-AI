@@ -9,6 +9,7 @@ import hmac
 import hashlib
 import logging
 import unicodedata
+from collections import OrderedDict
 from io import BytesIO
 from typing import Any, Callable
 from urllib.parse import urlparse
@@ -76,31 +77,63 @@ class _TokenBucket:
 
 
 class _RateLimiter:
-    """Per-IP rate limiter using token buckets."""
-    
-    def __init__(self, capacity: int, refill_rate: float):
+    """Per-IP rate limiter using token buckets.
+
+    Bucket eviction (was an unbounded memory leak): every distinct client IP
+    created a bucket that was NEVER removed, so steady traffic — or a flood of
+    spoofed X-Forwarded-For values — grew `buckets` without bound. We now (a)
+    lazily drop buckets that have sat idle past an eviction window (a full
+    bucket is indistinguishable from a fresh one, so an idle entry is pure
+    waste), and (b) hard-cap the dict size, evicting the least-recently-seen
+    entry when full. Both are O(1)-amortized and need no background task."""
+
+    def __init__(self, capacity: int, refill_rate: float,
+                 max_buckets: int = 10_000, idle_evict_s: float = 3600.0):
         """Initialize rate limiter.
-        
+
         Args:
             capacity: Burst size (max tokens per bucket).
             refill_rate: Tokens per second.
+            max_buckets: Hard ceiling on tracked IPs (LRU-evict past this).
+            idle_evict_s: Drop a bucket untouched for this many seconds.
         """
         self.capacity = capacity
         self.refill_rate = refill_rate
-        # Plain dict — is_allowed() creates buckets on demand via an explicit
-        # key check below. The old `defaultdict()` (no factory) was misleading:
-        # with no factory it behaves exactly like {} but signals auto-vivify
-        # that never happens.
-        self.buckets: dict[str, _TokenBucket] = {}
-    
+        self.max_buckets = max_buckets
+        self.idle_evict_s = idle_evict_s
+        # OrderedDict so we can evict the least-recently-used IP in O(1).
+        self.buckets: "OrderedDict[str, _TokenBucket]" = OrderedDict()
+
+    def _evict_idle(self, now: float) -> None:
+        # Drop entries that have gone idle past the window. Buckets are kept in
+        # last-seen order (move_to_end on touch), so the stale ones are always
+        # at the front — stop at the first still-fresh entry.
+        while self.buckets:
+            _ip, bucket = next(iter(self.buckets.items()))
+            if now - bucket.last_refill > self.idle_evict_s:
+                self.buckets.popitem(last=False)
+            else:
+                break
+
     def is_allowed(self, client_ip: str) -> bool:
         """Check if a request from client_ip is allowed.
-        
+
         Returns True if allowed, False if rate limit exceeded.
         """
-        if client_ip not in self.buckets:
-            self.buckets[client_ip] = _TokenBucket(self.capacity, self.refill_rate)
-        return self.buckets[client_ip].allow_request()
+        now = time.time()
+        self._evict_idle(now)
+        bucket = self.buckets.get(client_ip)
+        if bucket is None:
+            # Make room BEFORE inserting so the dict never exceeds max_buckets:
+            # evict least-recently-used until there's a free slot for the new IP.
+            while len(self.buckets) >= self.max_buckets:
+                self.buckets.popitem(last=False)
+            bucket = _TokenBucket(self.capacity, self.refill_rate)
+            self.buckets[client_ip] = bucket
+        else:
+            # Mark as most-recently-used.
+            self.buckets.move_to_end(client_ip)
+        return bucket.allow_request()
 
 
 # Rate limiters for sensitive endpoints
@@ -114,16 +147,31 @@ _analysis_limiter = _RateLimiter(capacity=5, refill_rate=30.0 / 60.0)
 _webhook_limiter = _RateLimiter(capacity=10, refill_rate=60.0 / 60.0)
 
 
+# X-Forwarded-For is CLIENT-CONTROLLED and must only be trusted when the
+# request actually arrives through a known reverse proxy that appends it.
+# Trusting it unconditionally (the old behavior) let anyone spoof their per-IP
+# rate-limit key — send a random XFF per request and every request looks like a
+# brand-new IP, defeating the limiter AND inflating the bucket map. We only honor
+# XFF when TRUST_PROXY_HEADERS is enabled (set it true behind Azure Container
+# Apps / any trusted ingress that sets the header); otherwise we use the real
+# socket peer address, which a client cannot forge.
+_TRUST_PROXY_HEADERS = os.getenv("TRUST_PROXY_HEADERS", "false").strip().lower() in ("1", "true", "yes")
+
+
 def _get_client_ip(request: Request) -> str:
-    """Extract client IP from request, accounting for proxies.
-    
-    Checks X-Forwarded-For header first (for proxied requests),
-    then falls back to request.client.host.
-    """
-    forwarded_for = request.headers.get("x-forwarded-for")
-    if forwarded_for:
-        # X-Forwarded-For can contain multiple IPs; take the first (original client)
-        return forwarded_for.split(",")[0].strip()
+    """Resolve the client IP for rate-limiting.
+
+    When TRUST_PROXY_HEADERS is set (deployed behind a trusted proxy that
+    populates X-Forwarded-For), take the left-most XFF entry. Otherwise — and
+    by default — use the unforgeable socket peer address. Never trust an
+    attacker-supplied header to key security controls."""
+    if _TRUST_PROXY_HEADERS:
+        forwarded_for = request.headers.get("x-forwarded-for")
+        if forwarded_for:
+            # X-Forwarded-For can carry multiple IPs; the original client is left-most.
+            first = forwarded_for.split(",")[0].strip()
+            if first:
+                return first
     if request.client:
         return request.client.host
     return "unknown"
