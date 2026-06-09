@@ -88,6 +88,17 @@ async def dismiss_finding(ref: FindingRef) -> Dict[str, Any]:
             sig, ref.repo_full_name, "dismissed",
             notes=ref.notes or "dismissed via UI",
         )
+        # Semantic memory (B1): remember the dismissed finding's TEXT so a
+        # reworded version of it is recognized + suppressed on the next run —
+        # the journal alone only suppresses the exact signature.
+        try:
+            from app.services import finding_memory as fm
+            fm.remember(
+                ref.repo_full_name, sig, ref.kind, "dismissed",
+                ref.title, ref.notes or "",
+            )
+        except Exception as e:  # pragma: no cover - memory is best-effort
+            logger.debug("finding_memory.remember (dismiss) failed: %s", e)
     except Exception as e:
         logger.warning("dismiss_finding failed: %s", e)
         raise HTTPException(status_code=500, detail=f"could not dismiss: {e}")

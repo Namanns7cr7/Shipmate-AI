@@ -431,9 +431,18 @@ async def _lifespan(app: "FastAPI"):
     Shutdown: nothing to flush — sqlite commits are synchronous per write."""
     # --- startup ---
     try:
-        # One call creates every registered sqlite store (inflight, reports,
-        # oauth) with the shared connection/PRAGMA/location policy. The route
-        # imports above have already executed each store module's register().
+        # Import every module that registers a sqlite store so init_all() below
+        # creates ALL of them — the route imports cover inflight/reports/oauth;
+        # these are the memory/observability stores added for the architecture
+        # work (run traces, semantic finding memory, Coder lessons, capability
+        # posture, persistent repo-index L2). Importing is enough — each module
+        # calls sqlite_store.register() at import time.
+        from app.services import (  # noqa: F401
+            run_trace, finding_memory, coder_lessons,
+            capability_store, repo_index_store,
+        )
+        # One call creates every registered sqlite store with the shared
+        # connection/PRAGMA/location policy.
         from app.services import sqlite_store as _store
         _store.init_all()
     except Exception as e:  # pragma: no cover - startup best-effort

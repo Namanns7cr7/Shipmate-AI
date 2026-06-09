@@ -85,6 +85,16 @@ def _branch_name(finding: FindingPayload) -> str:
     return f"shipmate/{finding.kind}-{_slugify(finding.id)}-{ts}"
 
 
+def _record_coder_lessons(repo_full: str, gate: str, issues) -> None:
+    """Distill a gate rejection into per-repo Coder lessons (B2). Best-effort —
+    a lessons-write failure must never affect the actuate's own outcome."""
+    try:
+        from app.services import coder_lessons as cl
+        cl.record_failure(repo_full, gate, issues)
+    except Exception as e:  # pragma: no cover - best-effort
+        logger.debug("coder_lessons.record_failure skipped (%s)", e)
+
+
 def _commit_message(finding: FindingPayload, path: str) -> str:
     head = finding.title[:60].rstrip()
     return f"shipmate({finding.kind}): {head} — {path}"
@@ -412,8 +422,14 @@ def _lint_coder_output(
     return issues
 
 
-def _build_task(finding: FindingPayload) -> str:
-    """The instruction string that becomes the Coder agent's `task`."""
+def _build_task(finding: FindingPayload, repo_full_name: str = "") -> str:
+    """The instruction string that becomes the Coder agent's `task`.
+
+    When `repo_full_name` is given, appends the repo's recurring Coder lessons
+    (B2 failure-memory) so the model is told exactly which past mistakes to
+    avoid for THIS repo (hallucinated imports, scope drift, test breakage, …)
+    instead of re-making them. Fail-open: a lessons lookup error just omits the
+    block."""
     pieces = [f"[{finding.kind.upper()}] {finding.title}"]
     if finding.description:
         pieces.append(f"Description: {finding.description}")
@@ -423,6 +439,14 @@ def _build_task(finding: FindingPayload) -> str:
         "Apply the minimal, focused patch needed to address this. "
         "Don't refactor surrounding code or introduce unrelated changes."
     )
+    if repo_full_name:
+        try:
+            from app.services import coder_lessons as cl
+            digest = cl.lessons_digest(repo_full_name)
+            if digest:
+                pieces.append(digest)
+        except Exception as e:  # pragma: no cover - best-effort
+            logger.debug("lessons_digest injection skipped (%s)", e)
     return "\n\n".join(pieces)
 
 
@@ -451,7 +475,7 @@ class CoderOrchestrator:
 
         plan = await asyncio.to_thread(
             Decomposer().plan,
-            _build_task(req.finding),
+            _build_task(req.finding, f"{req.owner}/{req.repo}"),
             f"{req.owner}/{req.repo}",
             ctx.primary_language,
             ctx.tech_stack,
@@ -575,7 +599,7 @@ class CoderOrchestrator:
         # 3. Run Coder (sync, on a worker thread).
         await _emit("coding.start", paths=target_paths)
         brief = CoderBrief(
-            task=_build_task(req.finding),
+            task=_build_task(req.finding, f"{req.owner}/{req.repo}"),
             repo_full_name=f"{req.owner}/{req.repo}",
             primary_language=ctx.primary_language,
             tech_stack=ctx.tech_stack,
@@ -639,6 +663,9 @@ class CoderOrchestrator:
                 "Coder output still rejected after lint-feedback retry for %s/%s: %s",
                 req.finding.kind, req.finding.id, lint_issues,
             )
+            # Failure-memory (B2): distill the lint issues into durable lessons
+            # for this repo so the NEXT Coder brief warns against repeating them.
+            _record_coder_lessons(f"{req.owner}/{req.repo}", "lint", lint_issues)
             await _emit("done", status="lint_rejected", pr_url=None)
             return ActuateResponse(
                 status="lint_rejected",
@@ -724,6 +751,7 @@ class CoderOrchestrator:
                     "scope guard still rejected %s/%s after feedback retry: %s",
                     req.finding.kind, req.finding.id, "; ".join(scope_issues),
                 )
+                _record_coder_lessons(repo_full, "scope", scope_issues)
                 await _emit("done", status="scope_rejected", pr_url=None)
                 return ActuateResponse(
                     status="scope_rejected",
@@ -782,6 +810,7 @@ class CoderOrchestrator:
                         logger.warning("pytest-feedback retry raised %s; keeping rejection", e)
                 if not result.passed:
                     await asyncio.to_thread(vg.restore_snapshot, snap)
+                    _record_coder_lessons(repo_full, "pytest", result.reason)
                     await _emit("done", status="pytest_rejected", pr_url=None)
                     return ActuateResponse(
                         status="pytest_rejected",
@@ -819,6 +848,7 @@ class CoderOrchestrator:
                     req.owner, req.repo, req.branch, serialized, req.access_token,
                 )
                 if not tgt.passed:
+                    _record_coder_lessons(repo_full, "pytest", tgt.reason)
                     await _emit("done", status="pytest_rejected", pr_url=None)
                     return ActuateResponse(
                         status="pytest_rejected",
@@ -854,6 +884,10 @@ class CoderOrchestrator:
                 logger.warning(
                     "resolution check FAILED for %s/%s: offending pattern still present",
                     req.finding.kind, req.finding.id,
+                )
+                _record_coder_lessons(
+                    repo_full, "resolution",
+                    f"{req.finding.category or req.finding.kind}: offending pattern still present",
                 )
                 await _emit("done", status="resolution_failed", pr_url=None)
                 return ActuateResponse(
@@ -953,6 +987,22 @@ class CoderOrchestrator:
                     )
                 except Exception as e:
                     logger.debug("journal_set_state failed (non-fatal): %s", e)
+
+                # Semantic memory (B1): remember this finding's TEXT so a
+                # reworded version of the SAME issue is recognized + suppressed
+                # on a future analyze (the exact-signature journal can't catch a
+                # rephrase). We remember at PR-open as a 'shipped' candidate; if
+                # CI later fails and the watcher gives up, the journal state
+                # diverges but the semantic suppression of a true duplicate is
+                # still the behaviour we want.
+                try:
+                    from app.services import finding_memory as fm
+                    fm.remember(
+                        repo_full, sig, req.finding.kind, "shipped",
+                        req.finding.title, req.finding.description or "",
+                    )
+                except Exception as e:  # pragma: no cover - best-effort
+                    logger.debug("finding_memory.remember (shipped) failed: %s", e)
 
             await _emit("done", status="complete", pr_url=pr_url,
                         files=[c.path for c in committed])

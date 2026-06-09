@@ -439,10 +439,12 @@ class LLMService:
                 os.getenv("LLM_PROVIDER", "(unset)"),
             )
             # Even with no LLM, still apply journal suppression (it's local +
-            # free) so dismissed findings don't recur in pure-heuristic mode.
+            # free) so dismissed findings don't recur in pure-heuristic mode,
+            # and still record/diff the capability posture (deterministic).
             base.findings = cls._refine_findings(
                 base.findings, "guardrail", context, "", None,
             )
+            base.findings = cls._apply_capability_drift(context, base.findings)
             return base
 
         try:
@@ -472,6 +474,11 @@ class LLMService:
             merged.findings = cls._refine_findings(
                 merged.findings, "guardrail", context, code_blob, provider,
             )
+            # Capability posture snapshot + drift (B3): persist which controls
+            # exist this run and, if a control PRESENT before is now GONE, surface
+            # that regression as a real finding instead of silently not-detecting
+            # it. Best-effort — never let posture tracking break discovery.
+            merged.findings = cls._apply_capability_drift(context, merged.findings)
             return merged
         except Exception as e:
             logger.warning("GuardRail discovery failed (%s); using base output", e)
@@ -480,18 +487,80 @@ class LLMService:
 
     @staticmethod
     def _refine_findings(findings, kind, context, code_blob, provider):
-        """Shared post-processing for a finding list: drop journal-suppressed
-        (dismissed/shipped) findings, then run the critic verifier against the
-        exact code that was analyzed. Both fail-open — a failure here returns
-        the findings unchanged rather than hiding anything."""
+        """Shared post-processing for a finding list:
+          1. drop EXACT-signature journal-suppressed (dismissed/shipped) findings;
+          2. drop SEMANTIC rephrases of shipped/dismissed findings (B1) — this is
+             the architectural fix for GuardRail re-wording the same finding to
+             mint a fresh signature every run;
+          3. run the critic verifier against the exact code that was analyzed.
+        All three fail-open — a failure here returns the findings unchanged
+        rather than hiding anything."""
         try:
             from app.services import finding_critic as fc
             repo_full = (context.get("repo_info") or {}).get("full_name", "") or ""
             findings = fc.filter_suppressed(findings, kind, repo_full)
+            # Semantic dedup against memory of shipped/dismissed findings —
+            # catches a rephrase the exact-signature pass above misses.
+            try:
+                from app.services import finding_memory as fm
+                findings = fm.filter_semantic_duplicates(findings, repo_full)
+            except Exception as e:  # pragma: no cover - best-effort
+                logger.debug("semantic dedup skipped (%s)", e)
             findings = fc.verify_findings(findings, code_blob, provider)
         except Exception as e:  # pragma: no cover - defensive
             logger.debug("_refine_findings failed (%s); keeping findings as-is", e)
         return findings
+
+    @staticmethod
+    def _apply_capability_drift(context: Dict[str, Any], findings):
+        """Record this run's detected security-control set (B3) and, if a control
+        present in a PRIOR run is now absent, append a 'control regressed'
+        finding so the regression is surfaced rather than silently not-detected.
+        Fail-open: any error returns findings unchanged."""
+        try:
+            from app.services import capability_store as cs
+            key_files = context.get("key_files") or {}
+            file_tree = context.get("file_tree") or []
+            controls = _detect_security_controls(key_files, file_tree)
+            drift = cs.record_snapshot(context, controls)
+            seeds = cs.regression_findings(drift)
+            if not seeds:
+                return findings
+            # Build SecurityFinding objects for each regressed control and prepend
+            # them (regressions are high-signal — show them first). Continue the
+            # EXISTING SEC-id sequence (parse the max id already minted by the
+            # heuristic + discovery passes) so ids stay monotonic and unique —
+            # a hard-coded 900 base would gap the sequence and could collide with
+            # a later discovery pass that also climbs past it.
+            next_id = 1
+            for f in findings:
+                fid = getattr(f, "id", "") or ""
+                if fid.startswith("SEC-"):
+                    try:
+                        next_id = max(next_id, int(fid.split("-")[1]) + 1)
+                    except (ValueError, IndexError):
+                        pass
+            regressions = []
+            for seed in seeds:
+                regressions.append(SecurityFinding(
+                    id=f"SEC-{next_id:03d}",
+                    title=seed["title"],
+                    severity=Severity.HIGH,
+                    category="config",
+                    description=seed["description"],
+                    recommendation=(
+                        "Confirm whether removing this control was intentional. If "
+                        "not, restore it; if intentional, document why the posture "
+                        "changed."
+                    ),
+                    source="discovery",
+                    rationale=f"capability drift: control '{seed['control']}' no longer detected",
+                ))
+                next_id += 1
+            return regressions + list(findings)
+        except Exception as e:  # pragma: no cover - best-effort
+            logger.debug("_apply_capability_drift failed (%s); skipping", e)
+            return findings
 
     @classmethod
     def discover_testpilot(
