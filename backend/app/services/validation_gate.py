@@ -159,6 +159,9 @@ _FAILED_RE = re.compile(r"(\d+)\s+failed")
 
 _ERROR_RE = re.compile(r"(\d+)\s+error")
 
+# pytest-cov prints a TOTAL line: "TOTAL   1234    456    63%". Capture the %.
+_COV_TOTAL_RE = re.compile(r"TOTAL\s+\d+\s+\d+\s+(\d+)%")
+
 
 def run_pytest(target: str = "tests/") -> Tuple[int, int, str]:
     """Run the backend test suite. Returns (passed, failed, summary_tail).
@@ -198,6 +201,115 @@ def run_pytest(target: str = "tests/") -> Tuple[int, int, str]:
     errors = int(m.group(1)) if (m := _ERROR_RE.search(out)) else 0
     failed += errors
     return passed, failed, out[-2000:]
+
+
+# ── Differential measurement (A2 — coverage deltas, not just pass/fail) ──────
+#
+# The regression-only pass-count gate is the right SAFETY signal, but it tells
+# the loop NOTHING about whether a patch IMPROVED coverage — so the loop can't
+# prefer the patch that adds a test over the one that merely doesn't regress.
+# This adds a structured coverage measurement (overall % + passing test count)
+# the loop can diff before/after a patch. It's OPT-IN (slower than the bare
+# gate) — the synthesis pipeline (A1) and "did this test actually add coverage"
+# checks use it; the hot per-actuate gate stays on the fast pass-count path.
+
+class CoverageResult:
+    """One coverage measurement: overall line-coverage %, passing test count,
+    and the parsed failure count. -1 coverage_pct means 'could not measure'."""
+
+    def __init__(self, coverage_pct: float, passed: int, failed: int, summary_tail: str):
+        self.coverage_pct = coverage_pct
+        self.passed = passed
+        self.failed = failed
+        self.summary_tail = summary_tail
+
+    def __repr__(self) -> str:
+        return (f"CoverageResult(cov={self.coverage_pct}%, passed={self.passed}, "
+                f"failed={self.failed})")
+
+
+def run_pytest_with_coverage(
+    target: str = "tests/", cov_package: str = "app",
+) -> CoverageResult:
+    """Run the suite under coverage and parse the overall % + pass/fail counts.
+    Slower than run_pytest (instrumentation overhead), so callers use it only
+    when they need the coverage signal, not on every actuate. coverage_pct=-1.0
+    when pytest-cov isn't available or the TOTAL line couldn't be parsed (the
+    caller treats that as 'no signal', never as 0%)."""
+    try:
+        proc = subprocess.run(
+            [PYTHON, "-m", "pytest", target,
+             "-q", "--tb=no", "--no-header", "-p", "no:cacheprovider",
+             "--continue-on-collection-errors",
+             f"--cov={cov_package}", "--cov-report=term-missing:skip-covered"],
+            cwd=str(BACKEND_DIR),
+            capture_output=True, text=True, timeout=PYTEST_TIMEOUT_S * 2,
+        )
+    except subprocess.TimeoutExpired:
+        return CoverageResult(-1.0, 0, 0, "pytest+cov timeout")
+    except Exception as e:  # pragma: no cover - defensive
+        return CoverageResult(-1.0, 0, 0, f"pytest+cov error: {e}")
+
+    out = (proc.stdout or "") + (proc.stderr or "")
+    passed = int(m.group(1)) if (m := _PASSED_RE.search(out)) else 0
+    failed = int(m.group(1)) if (m := _FAILED_RE.search(out)) else 0
+    failed += int(m.group(1)) if (m := _ERROR_RE.search(out)) else 0
+    cov = float(m.group(1)) if (m := _COV_TOTAL_RE.search(out)) else -1.0
+    return CoverageResult(cov, passed, failed, out[-2000:])
+
+
+class CoverageDelta:
+    """Structured before/after diff for a patch. `coverage_delta` > 0 means the
+    patch raised line coverage; `tests_delta` > 0 means it added passing tests.
+    `improved` is the loop-prioritization signal: a patch that adds coverage or
+    tests without regressing is preferable to one that merely doesn't regress."""
+
+    def __init__(self, before: CoverageResult, after: CoverageResult):
+        self.before = before
+        self.after = after
+        self.coverage_delta = (
+            round(after.coverage_pct - before.coverage_pct, 2)
+            if before.coverage_pct >= 0 and after.coverage_pct >= 0 else 0.0
+        )
+        self.tests_delta = after.passed - before.passed
+        self.regressed = after.passed < before.passed
+        self.improved = (not self.regressed) and (
+            self.coverage_delta > 0 or self.tests_delta > 0
+        )
+
+    def as_dict(self) -> Dict[str, object]:
+        return {
+            "coverage_before": self.before.coverage_pct,
+            "coverage_after": self.after.coverage_pct,
+            "coverage_delta": self.coverage_delta,
+            "tests_before": self.before.passed,
+            "tests_after": self.after.passed,
+            "tests_delta": self.tests_delta,
+            "regressed": self.regressed,
+            "improved": self.improved,
+        }
+
+    def __repr__(self) -> str:
+        return (f"CoverageDelta(cov {self.before.coverage_pct}%→{self.after.coverage_pct}% "
+                f"Δ{self.coverage_delta:+}, tests {self.before.passed}→{self.after.passed} "
+                f"Δ{self.tests_delta:+}, improved={self.improved})")
+
+
+def measure_coverage_delta(
+    files: List[Dict[str, str]], cov_package: str = "app",
+) -> Tuple[CoverageDelta, Dict[str, Optional[str]]]:
+    """Measure coverage BEFORE applying `files`, apply them, measure AFTER, and
+    return (delta, snapshot). The CALLER restores the snapshot (same contract as
+    gate_patch) — we don't auto-rollback. Use this to decide whether a patch
+    (e.g. a synthesized test) actually ADDED coverage, not just whether it
+    compiled. Best-effort: a measurement that can't run yields a neutral delta
+    (improved=False) rather than raising."""
+    paths = [f["path"] for f in files]
+    snap = snapshot_files(paths)
+    before = run_pytest_with_coverage(cov_package=cov_package)
+    write_files_to_tree(files)
+    after = run_pytest_with_coverage(cov_package=cov_package)
+    return CoverageDelta(before, after), snap
 
 
 # ── Baseline cache (cross-process via InflightRegistry.meta_kv) ─────────────

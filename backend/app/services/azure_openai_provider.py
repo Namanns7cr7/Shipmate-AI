@@ -39,52 +39,17 @@ from typing import Any, Literal, Type
 
 from pydantic import BaseModel
 
+from app.services import run_trace
+from app.services.provider_coercion import (
+    MIN_CODER_SUMMARY_CHARS as _MIN_CODER_SUMMARY_CHARS,
+    coerce_to_schema as _coerce_to_schema,
+    is_short_summary_coder_output as _is_short_summary,
+    shrink_oversized_file_blocks as _shrink_oversized_file_blocks,
+)
+
 logger = logging.getLogger("shipmate.azure_openai_provider")
 
-# Mirror BedrockProvider: a CoderOutput with files but a near-empty summary is
-# the flaky-truncation signature. Retry once with shrunk context. Kept in sync
-# with bedrock_provider._MIN_CODER_SUMMARY_CHARS.
-_MIN_CODER_SUMMARY_CHARS = 30
-
 _DEFAULT_API_VERSION = "2024-10-21"
-
-
-def _coerce_stringified_json(value: Any) -> Any:
-    """Recursively parse any string that looks like JSON (first non-space char
-    `[` or `{`). Azure tool-call arguments arrive as one JSON string which we
-    json.loads up front, but nested fields can occasionally come back as
-    re-serialized strings — this normalizes them so Pydantic validates. Same
-    semantics as the Bedrock provider's helper of the same name."""
-    if isinstance(value, str):
-        stripped = value.lstrip()
-        if stripped[:1] in ("[", "{"):
-            try:
-                return _coerce_stringified_json(json.loads(value))
-            except json.JSONDecodeError:
-                return value
-        return value
-    if isinstance(value, list):
-        return [_coerce_stringified_json(v) for v in value]
-    if isinstance(value, dict):
-        return {k: _coerce_stringified_json(v) for k, v in value.items()}
-    return value
-
-
-def _shrink_oversized_file_blocks(user_prompt: str, threshold: int = 8_000) -> str:
-    """Halve an oversized prompt to free output budget on a short-summary
-    retry. Keeps head (task + early files) and tail (usually the edit target),
-    dropping the middle. Identical strategy to BedrockProvider."""
-    if len(user_prompt) <= 2 * threshold:
-        return user_prompt
-    head = user_prompt[:threshold]
-    tail = user_prompt[-threshold:]
-    dropped = len(user_prompt) - 2 * threshold
-    return (
-        head
-        + f"\n\n# ... [ShipMate retry: dropped {dropped} chars of file context "
-        "to free output budget; focus on the task and the file content shown] ...\n\n"
-        + tail
-    )
 
 
 class AzureOpenAIProvider:
@@ -151,55 +116,57 @@ class AzureOpenAIProvider:
         schema = schema_class.model_json_schema()
         max_tokens = 8192
 
-        try:
-            payload = self._call_chat(
-                deployment, tool_name, schema, system_prompt, user_prompt, max_tokens
-            )
-            coerced = _coerce_stringified_json(payload)
-            result = schema_class.model_validate(coerced)
-            result = self._maybe_retry_short_summary(
-                result, schema_class, deployment, tool_name, schema,
-                system_prompt, user_prompt, max_tokens,
-            )
-            return result
-        except Exception as first_err:
-            from pydantic import ValidationError as _VE
+        with run_trace.span(
+            component=f"llm:azure:{deployment_hint}",
+            op=f"invoke:{schema_class.__name__}",
+            model=deployment, prompt=system_prompt + user_prompt,
+        ) as _sp:
+            try:
+                payload = self._call_chat(
+                    deployment, tool_name, schema, system_prompt, user_prompt, max_tokens
+                )
+                # Schema-aware coercion fixes a stringified array/object up front
+                # so the validation-retry below is a rare fallback, not the main path.
+                coerced = _coerce_to_schema(payload, schema_class)
+                result = schema_class.model_validate(coerced)
+                result = self._maybe_retry_short_summary(
+                    result, schema_class, deployment, tool_name, schema,
+                    system_prompt, user_prompt, max_tokens, span=_sp,
+                )
+                _sp.set_output(result.model_dump_json() if hasattr(result, "model_dump_json") else result)
+                return result
+            except Exception as first_err:
+                from pydantic import ValidationError as _VE
 
-            err_str = str(first_err)
-            is_validation = isinstance(first_err, _VE) or "validation error" in err_str.lower()
-            if not is_validation:
-                # Unlike Bedrock there's no ADA cred-rollover to recover from —
-                # an auth error here means a bad/rotated API key, which a retry
-                # won't fix. Surface it.
-                raise
-            logger.warning(
-                "AzureOpenAIProvider: structured-output validation failed (%s); "
-                "retrying once with explicit array-not-string reminder",
-                err_str[:200],
-            )
-            retry_user = (
-                user_prompt
-                + "\n\n# RETRY NOTICE\nA prior attempt returned a list/object "
-                "field (e.g. `files`) as a JSON-encoded STRING instead of a "
-                "native JSON array/object, which broke parsing. Return every "
-                "field as a native JSON value matching the function schema "
-                "exactly. Do not stringify arrays or nested objects."
-            )
-            payload = self._call_chat(
-                deployment, tool_name, schema, system_prompt, retry_user, max_tokens
-            )
-            coerced = _coerce_stringified_json(payload)
-            return schema_class.model_validate(coerced)
+                err_str = str(first_err)
+                is_validation = isinstance(first_err, _VE) or "validation error" in err_str.lower()
+                if not is_validation:
+                    # Unlike Bedrock there's no ADA cred-rollover to recover from —
+                    # an auth error here means a bad/rotated API key, which a retry
+                    # won't fix. Surface it.
+                    raise
+                logger.warning(
+                    "AzureOpenAIProvider: structured-output validation failed (%s); "
+                    "retrying once with explicit array-not-string reminder",
+                    err_str[:200],
+                )
+                _sp.bump_retry()
+                retry_user = (
+                    user_prompt
+                    + "\n\n# RETRY NOTICE\nA prior attempt returned a list/object "
+                    "field (e.g. `files`) as a JSON-encoded STRING instead of a "
+                    "native JSON array/object, which broke parsing. Return every "
+                    "field as a native JSON value matching the function schema "
+                    "exactly. Do not stringify arrays or nested objects."
+                )
+                payload = self._call_chat(
+                    deployment, tool_name, schema, system_prompt, retry_user, max_tokens
+                )
+                coerced = _coerce_to_schema(payload, schema_class)
+                return schema_class.model_validate(coerced)
 
-    @staticmethod
-    def _is_short_summary_coder_output(result: BaseModel) -> bool:
-        """True when *result* is a CoderOutput carrying a patch but an
-        implausibly short summary (a flaky-truncation signature)."""
-        if type(result).__name__ != "CoderOutput":
-            return False
-        files = getattr(result, "files", None) or []
-        summary = getattr(result, "summary", "") or ""
-        return len(files) > 0 and len(summary.strip()) < _MIN_CODER_SUMMARY_CHARS
+    # Thin back-compat shim — the real predicate lives in provider_coercion.
+    _is_short_summary_coder_output = staticmethod(_is_short_summary)
 
     def _maybe_retry_short_summary(
         self,
@@ -211,12 +178,15 @@ class AzureOpenAIProvider:
         system_prompt: str,
         user_prompt: str,
         max_tokens: int,
+        span: Any = None,
     ) -> BaseModel:
         """One-shot retry for a CoderOutput with files but a near-empty summary.
         Shrinks oversized file blocks to free output budget, re-invokes once,
         keeps whichever has the longer summary. Mirrors BedrockProvider."""
-        if not self._is_short_summary_coder_output(result):
+        if not _is_short_summary(result):
             return result
+        if span is not None:
+            span.bump_retry()
         logger.warning(
             "AzureOpenAIProvider: CoderOutput summary suspiciously short "
             "(%d chars, %d files) — retrying once with shrunk context",
@@ -228,7 +198,7 @@ class AzureOpenAIProvider:
             payload = self._call_chat(
                 deployment, tool_name, schema, system_prompt, shrunk_user, max_tokens
             )
-            coerced = _coerce_stringified_json(payload)
+            coerced = _coerce_to_schema(payload, schema_class)
             retried = schema_class.model_validate(coerced)
         except Exception as e:
             logger.info("short-summary retry failed (%s); keeping first result", e)

@@ -5,11 +5,14 @@ Access tokens are never logged or stored beyond the request lifetime.
 
 import base64
 import asyncio
+import logging
 import os
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
+
+logger = logging.getLogger("shipmate.github_api")
 
 _BASE = "https://api.github.com"
 _TIMEOUT = httpx.Timeout(20.0)
@@ -161,6 +164,29 @@ class GitHubAPIService:
 
         _tree_cache_put(cache_key, paths)
         return paths
+
+    @staticmethod
+    async def get_branch_head_sha(
+        token: str, owner: str, repo: str, branch: str = "main",
+    ) -> Optional[str]:
+        """Resolve the commit SHA at the tip of `branch` with a single GET (no
+        write-access gate — this is a READ-path identity used to key the repo
+        index cache). Falls back to 'master', then to the repo's default branch.
+        Returns None on any failure (caller treats a missing SHA as 'no cache
+        key' and rebuilds)."""
+        try:
+            async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+                for ref in (branch, "master"):
+                    resp = await client.get(
+                        f"{_BASE}/repos/{owner}/{repo}/commits/{ref}",
+                        headers={**_headers(token), "Accept": "application/vnd.github.sha"},
+                    )
+                    if resp.status_code == 200 and resp.text:
+                        return resp.text.strip()[:40]
+        except Exception as e:  # pragma: no cover - fail-open
+            logger.debug("get_branch_head_sha failed for %s/%s@%s: %s",
+                         owner, repo, branch, e)
+        return None
 
     @staticmethod
     async def get_file_content(
