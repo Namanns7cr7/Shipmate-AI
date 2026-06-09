@@ -230,6 +230,14 @@ class CoderBrief(BaseModel):
     tech_stack: List[str] = Field(default_factory=list)
     entry_points: List[str] = Field(default_factory=list)
     target_files: Dict[str, str] = Field(default_factory=dict, description="path -> current content (empty for new files)")
+    repo_map: str = Field(
+        default="",
+        description=(
+            "Real module/symbol map of the package(s) the target files live in "
+            "(built by repo_map.build_repo_map). Anti-hallucination: the model "
+            "imports only from modules/symbols listed here. Empty ⇒ omit the section."
+        ),
+    )
     finding_kind: str
     finding_id: str
     finding_severity: Optional[str] = None
@@ -256,6 +264,11 @@ def _format_files_block(target_files: Dict[str, str]) -> str:
 def _build_user_prompt(brief: CoderBrief) -> str:
     stack = ", ".join(brief.tech_stack) or "unknown"
     entries = ", ".join(brief.entry_points[:5]) or "unknown"
+    # The repo map (when present) goes BEFORE the target files: the model reads
+    # the real namespace first, so when it later writes import lines it has the
+    # true module/symbol list in front of it instead of guessing a plausible-
+    # sounding sibling. Empty map ⇒ omit the section entirely.
+    repo_map_block = f"\n{brief.repo_map}\n" if brief.repo_map else ""
     return (
         f"# Task\n{brief.task}\n\n"
         f"# Repo\n"
@@ -264,7 +277,8 @@ def _build_user_prompt(brief: CoderBrief) -> str:
         f"- Tech stack: {stack}\n"
         f"- Entry points: {entries}\n"
         f"- Originating finding: {brief.finding_kind}/{brief.finding_id}"
-        f"{f' (severity {brief.finding_severity})' if brief.finding_severity else ''}\n\n"
+        f"{f' (severity {brief.finding_severity})' if brief.finding_severity else ''}\n"
+        f"{repo_map_block}\n"
         f"# Target files\n{_format_files_block(brief.target_files)}\n\n"
         f"Produce the patch. Return ONLY the structured CoderOutput object."
     )
