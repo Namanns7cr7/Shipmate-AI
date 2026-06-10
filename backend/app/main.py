@@ -29,6 +29,7 @@ from app.api.routes.branches import router as branches_router
 from app.api.routes.findings import router as findings_router
 from app.api.routes.auto_fix import router as auto_fix_router
 from app.api.routes.build import router as build_router
+from app.api.routes.metrics import router as metrics_router
 
 # ---------------------------------------------------------------------------
 # Rate Limiting: Token Bucket Implementation
@@ -617,6 +618,7 @@ app.include_router(branches_router, prefix="/api")
 app.include_router(findings_router, prefix="/api")
 app.include_router(auto_fix_router, prefix="/api")
 app.include_router(build_router, prefix="/api")
+app.include_router(metrics_router, prefix="/api")
 
 
 @app.get("/")
