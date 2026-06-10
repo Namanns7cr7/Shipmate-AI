@@ -467,14 +467,30 @@ _MANIFEST_CATEGORIES = frozenset({"deps", "dependency", "dependencies"})
 # Categories/kinds that are pure prose (lint-only).
 _DOCS_CATEGORIES = frozenset({"docs", "documentation", "readme"})
 
+# gate_kind string (from a Skill) -> the concrete GateTier to run. Single point
+# where the skill's declared validation tier becomes a runnable tier.
+_GATE_KIND_TO_TIER = {
+    "lint": _TIER_LINT,
+    "import-smoke": _TIER_IMPORT_SMOKE,
+    "test": _TIER_TEST,
+    "full": _TIER_FULL,
+}
+
 
 def gate_for(kind: str, category: str = "") -> GateTier:
-    """Pick the validation tier for a finding. Deterministic (no LLM):
-      • docs/readme            → lint only
-      • deps/manifest          → import-smoke
-      • test                   → collect + run
-      • guardrail/security/etc → full pytest
-      • anything unknown       → full (fail-safe: over-validate, never under).
+    """Pick the validation tier for a finding. Deterministic (no LLM).
+
+    The skill registry (skills.skill_for) is the SINGLE source of truth for the
+    kind/category → tier mapping: each skill declares its `gate_kind` next to
+    its behaviour rules, and we translate that to a runnable GateTier here. Two
+    gate-ONLY distinctions have no dedicated skill (a docs or manifest edit
+    still gets feature/base prompt rules) but warrant a cheaper tier, so they're
+    special-cased first:
+      • docs/readme   → lint only (pure prose, nothing to execute)
+      • deps/manifest → import-smoke (entry point must still import)
+    Everything else inherits the matched skill's gate_kind (e.g. write-test →
+    test, fix-ci → lint, fix-security/add-feature/refactor/fix-bug/unknown →
+    full). Fail-safe: any lookup miss → full (over-validate, never under).
     """
     k = (kind or "").lower().strip()
     c = (category or "").lower().strip()
@@ -483,7 +499,10 @@ def gate_for(kind: str, category: str = "") -> GateTier:
         return _TIER_LINT
     if c in _MANIFEST_CATEGORIES:
         return _TIER_IMPORT_SMOKE
-    if k == "test":
-        return _TIER_TEST
-    # guardrail, milestone, blocker, next_action, feature, security, unknown …
-    return _TIER_FULL
+
+    try:
+        from app.services import skills
+        gate_kind = skills.skill_for(k, c).gate_kind
+        return _GATE_KIND_TO_TIER.get(gate_kind, _TIER_FULL)
+    except Exception:  # pragma: no cover - fail-safe to full
+        return _TIER_FULL
