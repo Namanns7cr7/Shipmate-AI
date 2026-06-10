@@ -556,6 +556,7 @@ class CoderOrchestrator:
                 finding_kind=req.finding.kind,
                 finding_id=f"{req.finding.id}-step{idx + 1}",
                 finding_severity=req.finding.severity,
+                finding_category=getattr(req.finding, "category", "") or "",
             )
             step_out: CoderOutput = await asyncio.to_thread(
                 agent.run, step_brief, hint, mode,
@@ -634,6 +635,7 @@ class CoderOrchestrator:
             finding_kind=req.finding.kind,
             finding_id=req.finding.id,
             finding_severity=req.finding.severity,
+            finding_category=getattr(req.finding, "category", "") or "",
         )
         agent = CoderAgent()
         _mode = "diff" if getattr(req, "diff_mode", False) else "full"
