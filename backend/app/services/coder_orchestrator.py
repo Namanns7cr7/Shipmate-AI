@@ -36,6 +36,7 @@ from app.schemas.api_schemas import (
 )
 from app.services import ast_lint
 from app.services import inflight_registry as ir
+from app.services import sandbox
 from app.services import scope_guard as sg
 from app.services import validation_gate as vg
 from app.services.github_api_service import GitHubAPIService
@@ -796,8 +797,61 @@ class CoderOrchestrator:
             # tree to test against, so we skip. Snapshot → apply → smoke import
             # → pytest → restore-on-regression. If the patch drops the pass
             # count, reject with `pytest_rejected` and DON'T open a PR.
+            # Per-finding gate tier (Phase 2): a docs-only edit doesn't warrant
+            # a full ~45s pytest run, while a security patch does. gate_for is
+            # deterministic (no LLM) and fail-safe (unknown → full). A
+            # lint/import-smoke tier downgrades the HEAVY pytest gate to a
+            # cheaper check; every other tier runs the full gate below.
+            try:
+                _tier = sandbox.gate_for(
+                    req.finding.kind, getattr(req.finding, "category", "") or "",
+                )
+            except Exception:
+                _tier = None
+            # Only the lint tier skips ALL execution (pure prose). An
+            # import-smoke tier (deps/manifest edits) must still RUN the smoke
+            # check — skipping it entirely would let a manifest edit that breaks
+            # `import app.main` open a PR with zero validation.
+            _lint_only_tier = _tier is not None and not _tier.run_pytest and not _tier.run_smoke
+            _smoke_only_tier = _tier is not None and _tier.run_smoke and not _tier.run_pytest
+
             gate_ran = False
-            if _PYTEST_GATE_ENABLED and repo_full == _SELF_REPO:
+            if _PYTEST_GATE_ENABLED and repo_full == _SELF_REPO and _lint_only_tier:
+                logger.info(
+                    "pytest gate SKIPPED for %s/%s — tier '%s' (%s)",
+                    req.finding.kind, req.finding.id, _tier.name, _tier.description,
+                )
+                await _emit("gate.skip", phase="pytest", tier=_tier.name)
+            elif _PYTEST_GATE_ENABLED and repo_full == _SELF_REPO and _smoke_only_tier:
+                # Apply the patch, run ONLY the import smoke, restore. Catches a
+                # manifest/dependency edit that breaks the entry-point import
+                # without paying for the full suite.
+                gate_ran = True
+                await _emit("gate.start", phase="import-smoke", tier=_tier.name)
+                snap = await asyncio.to_thread(vg.snapshot_files,
+                                               [cf["path"] for cf in serialized])
+                await asyncio.to_thread(vg.write_files_to_tree, serialized)
+                smoke_ok, smoke_err = await asyncio.to_thread(vg.smoke_imports)
+                await asyncio.to_thread(vg.restore_snapshot, snap)
+                if not smoke_ok:
+                    _record_coder_lessons(repo_full, "pytest",
+                                          f"import smoke failed: {smoke_err[:200]}")
+                    await _emit("done", status="pytest_rejected", pr_url=None)
+                    return ActuateResponse(
+                        status="pytest_rejected",
+                        pr_url=None,
+                        branch_name=branch_name,
+                        files_changed=[],
+                        skipped=[cf.path for cf in coder_out.files],
+                        summary=(
+                            f"Patch (tier '{_tier.name}') broke the entry-point import: "
+                            f"{smoke_err[:200]}. No PR was created. "
+                            f"Coder summary: {coder_out.summary[:200]}"
+                        ),
+                    )
+                logger.info("import-smoke gate passed for %s/%s (tier '%s')",
+                            req.finding.kind, req.finding.id, _tier.name)
+            elif _PYTEST_GATE_ENABLED and repo_full == _SELF_REPO:
                 gate_ran = True
                 await _emit("gate.start", phase="pytest")
                 result, snap = await asyncio.to_thread(vg.gate_patch, serialized)
