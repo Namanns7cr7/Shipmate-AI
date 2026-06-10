@@ -13,6 +13,7 @@ import os
 import pytest
 
 from app.services import validation_gate as vg
+from app.services import sandbox
 
 
 # ── detect_test_command ──────────────────────────────────────────────────────
@@ -65,6 +66,25 @@ def test_stripped_env_omits_secrets(monkeypatch):
     # PATH must survive so the test runner can be found.
     assert "PATH" in env
     assert env.get("SHIPMATE_SANDBOX") == "1"
+
+
+def test_stripped_env_preserves_loader_paths(monkeypatch):
+    """Regression: the dynamic-loader search paths must survive the strip.
+
+    GitHub's setup-python toolcache interpreter is dynamically linked against
+    libpython in …/x64/lib and CANNOT START without LD_LIBRARY_PATH. Stripping
+    it made the target-repo gate's nested `python -m pytest` exit 127 (loader
+    failure) on the Linux CI runner — before pytest ran — while passing on
+    macOS. These are our own interpreter's lib paths, not secrets, so they must
+    be inherited."""
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/opt/hostedtoolcache/Python/3.11/x64/lib")
+    monkeypatch.setenv("DYLD_LIBRARY_PATH", "/usr/local/lib")
+    monkeypatch.setenv("GITHUB_CLIENT_SECRET", "supersecret")  # still a secret
+    env = vg._stripped_env()
+    assert env.get("LD_LIBRARY_PATH") == "/opt/hostedtoolcache/Python/3.11/x64/lib"
+    assert env.get("DYLD_LIBRARY_PATH") == "/usr/local/lib"
+    # …but the strip still drops real secrets.
+    assert "GITHUB_CLIENT_SECRET" not in env
 
 
 # ── flag gating ──────────────────────────────────────────────────────────────
@@ -142,6 +162,11 @@ def test_runs_detected_pytest_in_clone(monkeypatch, tmp_path):
     the run+parse mechanics, not the sandbox policy)."""
     monkeypatch.setenv("SHIPMATE_TARGET_REPO_GATE", "1")
     monkeypatch.setenv("SHIPMATE_ALLOW_UNSANDBOXED_TARGET_TESTS", "1")
+    # This test exercises the run+parse MECHANICS on the host path (the backend
+    # venv has pytest). Pin docker OFF so it deterministically takes that path —
+    # on a docker-equipped runner (GitHub) the gate would otherwise launch the
+    # suite inside python:3.x-slim, which has no pytest installed.
+    monkeypatch.setattr(sandbox, "docker_available", lambda: False)
 
     import subprocess
     real_run = subprocess.run
@@ -180,6 +205,9 @@ def test_runs_detected_pytest_in_clone(monkeypatch, tmp_path):
 def test_failing_target_tests_reject_the_patch(monkeypatch):
     monkeypatch.setenv("SHIPMATE_TARGET_REPO_GATE", "1")
     monkeypatch.setenv("SHIPMATE_ALLOW_UNSANDBOXED_TARGET_TESTS", "1")
+    # Host path (backend venv has pytest); pin docker OFF — see the note in
+    # test_runs_detected_pytest_in_clone.
+    monkeypatch.setattr(sandbox, "docker_available", lambda: False)
 
     import subprocess
     real_run = subprocess.run
@@ -219,6 +247,9 @@ def test_clone_credential_scrubbed_before_running_suite(monkeypatch):
     suite runs, so the suite can't lift the bearer token from disk."""
     monkeypatch.setenv("SHIPMATE_TARGET_REPO_GATE", "1")
     monkeypatch.setenv("SHIPMATE_ALLOW_UNSANDBOXED_TARGET_TESTS", "1")
+    # Host path (backend venv has pytest); pin docker OFF — see the note in
+    # test_runs_detected_pytest_in_clone.
+    monkeypatch.setattr(sandbox, "docker_available", lambda: False)
 
     import subprocess
     real_run = subprocess.run
