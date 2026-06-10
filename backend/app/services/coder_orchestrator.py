@@ -574,6 +574,109 @@ class CoderOrchestrator:
         )
 
     @classmethod
+    async def _run_verify_loop(
+        cls, req, brief, agent, coder_out, target_files, file_tree, emit,
+    ):
+        """Run the inner verify-loop (Phase 4) over the Coder's first output.
+
+        Composes the cheap checks (lint + scope + sandbox smoke) and a feedback
+        callback that re-prompts the Coder with the skill-composed prompt, then
+        hands both to verify_loop.run_verify_loop. The smoke check executes in a
+        throwaway worktree, so it's safe to run before path claims. Returns
+        (final_coder_out, VerifyLoopResult).
+
+        Fail-open is DEFENSIVE, not permissive: if the loop can't run, we still
+        evaluate the cheap PURE checks (lint + scope, no execution) once so a
+        hallucinated-import / scope-drift patch is never shipped unlinted —
+        only the EXECUTION step (smoke) and the iteration are skipped."""
+        from app.services import verify_checks
+        from app.services import verify_loop
+
+        repo_full = f"{req.owner}/{req.repo}"
+        hint = _deployment_hint(req.finding)
+        kind = req.finding.kind
+        category = getattr(req.finding, "category", "") or ""
+
+        def _pure_only_result():
+            """Fallback: run lint + scope (no execution) ONCE and report their
+            real verdict — so a setup/loop error degrades to the pre-Phase-4
+            single-pass lint+scope behaviour, NOT to shipping unverified code."""
+            try:
+                pure = verify_checks.default_checks(
+                    kind, category, target_files, file_tree, include_smoke=False,
+                )
+                agg = verify_loop._run_checks(coder_out, pure)
+                return verify_loop.VerifyLoopResult(
+                    coder_out, not agg.issues, 0, list(agg.issues),
+                    "clean" if not agg.issues else "setup_error", [],
+                    [n for n in agg.name.split(",") if n],
+                )
+            except Exception as e:  # pragma: no cover - last-resort fail-open
+                logger.debug("verify-loop pure fallback failed (%s)", e)
+                return verify_loop.VerifyLoopResult(coder_out, True, 0, [], "clean")
+
+        # The smoke (execution) step is only meaningful on ShipMate's own
+        # checkout AND when the pytest gate is enabled — it shares the gate's
+        # kill-switch so a hosted deploy that sets SHIPMATE_PYTEST_GATE=0 (per
+        # the runbook) doesn't silently re-introduce execution here. For an
+        # external repo there's no local app.main to import. Either way the
+        # pure lint+scope checks still run.
+        include_smoke = repo_full == _SELF_REPO and _PYTEST_GATE_ENABLED
+
+        try:
+            checks = verify_checks.default_checks(
+                kind, category, target_files, file_tree,
+                include_smoke=include_smoke,
+            )
+        except Exception as e:  # pragma: no cover - fail-open to pure checks
+            logger.debug("verify-loop check build failed (%s) — pure-check fallback", e)
+            return coder_out, _pure_only_result()
+
+        def _feedback(issues):
+            # Re-prompt the Coder with the concrete issues. Synchronous (the
+            # loop runs on a worker thread via asyncio.to_thread below).
+            try:
+                return agent.run_with_lint_feedback(brief, issues, hint)
+            except Exception as e:
+                logger.warning("verify-loop feedback re-prompt raised %s", e)
+                return None
+
+        # Secondary bound: a soft approx-token ceiling so the loop can't keep
+        # re-prompting deep into a token-heavy analyze/actuate run. Read from
+        # env (0/unset ⇒ iteration cap only, the conservative default). When set,
+        # the loop stops re-prompting once the active run's spent tokens leave
+        # less than the per-Coder-call headroom.
+        token_budget = None
+        try:
+            _tb = int(os.getenv("SHIPMATE_VERIFY_TOKEN_BUDGET", "0") or "0")
+            token_budget = _tb if _tb > 0 else None
+        except ValueError:
+            token_budget = None
+
+        # The loop calls the (blocking) Coder + subprocess smoke, so run the
+        # whole thing on a worker thread to keep the event loop free.
+        def _drive():
+            return verify_loop.run_verify_loop(
+                coder_out, checks, _feedback, token_budget=token_budget,
+            )
+
+        try:
+            loop = await asyncio.to_thread(_drive)
+        except Exception as e:  # pragma: no cover - fail-open to pure checks
+            logger.warning("verify-loop raised %s — pure-check fallback", e)
+            return coder_out, _pure_only_result()
+
+        await emit("verify-loop.done", iterations=loop.iterations,
+                   passed=loop.passed, stop_reason=loop.stop_reason)
+        logger.info(
+            "verify-loop %s/%s: %s after %d iter(s) (%s)",
+            req.finding.kind, req.finding.id,
+            "passed" if loop.passed else "failed",
+            loop.iterations, loop.stop_reason,
+        )
+        return loop.coder_out, loop
+
+    @classmethod
     async def run_actuation(
         cls, req: ActuateRequest, on_event: EventSink = None,
     ) -> ActuateResponse:
@@ -661,51 +764,51 @@ class CoderOrchestrator:
                 summary=coder_out.summary or "Coder determined no patch was needed.",
             )
 
-        # 3b. Quality lint — reject hallucinations BEFORE branching/committing.
-        # This is the second line of defense after the system prompt — if Coder
-        # invents imports despite rule #1, we catch it here and return a clean
-        # error instead of opening a bogus PR.
-        await _emit("gate.start", phase="lint")
-        lint_issues = _lint_coder_output(coder_out, target_files, file_tree)
-        if lint_issues:
-            # One auto-retry with the issues fed back to Coder before giving
-            # up. A large fraction of lint rejections are first-shot
-            # hallucinated imports the model will fix when told exactly what
-            # was wrong — cheaper than a wasted PR or a human round-trip.
-            logger.warning(
-                "Coder output rejected by post-lint for %s/%s: %s — retrying once with feedback",
-                req.finding.kind, req.finding.id, lint_issues,
-            )
-            try:
-                coder_out = await asyncio.to_thread(
-                    agent.run_with_lint_feedback, brief, lint_issues,
-                    _deployment_hint(req.finding),
-                )
-            except Exception as e:
-                logger.warning("lint-feedback retry raised %s; keeping first output", e)
-            if coder_out.files:
-                lint_issues = _lint_coder_output(coder_out, target_files, file_tree)
+        # 3b. Inner verify-loop (Phase 4) — iterate the Coder against the CHEAP
+        # checks (AST lint + scope guard + sandbox import-smoke) BEFORE touching
+        # GitHub or the expensive full pytest gate. This unifies what used to be
+        # three scattered one-shot feedback retries (lint, scope) into one
+        # bounded loop: generate → cheap-verify → feed concrete errors back →
+        # repeat, ≤ max_iters and ≤ token budget. Each re-prompt uses the
+        # skill-composed prompt (P3); the smoke runs in a throwaway worktree
+        # (P2, race-free); the brief carries the repo map (P1).
+        await _emit("gate.start", phase="verify-loop")
+        repo_full = f"{req.owner}/{req.repo}"
+        coder_out, loop = await cls._run_verify_loop(
+            req, brief, agent, coder_out, target_files, file_tree, _emit,
+        )
 
-        if lint_issues or not coder_out.files:
+        if not coder_out.files or not loop.passed:
+            outstanding = loop.issues or ["Coder produced no usable files"]
             logger.warning(
-                "Coder output still rejected after lint-feedback retry for %s/%s: %s",
-                req.finding.kind, req.finding.id, lint_issues,
+                "verify-loop did not converge for %s/%s after %d iter(s) (%s): %s",
+                req.finding.kind, req.finding.id, loop.iterations,
+                loop.stop_reason, outstanding,
             )
-            # Failure-memory (B2): distill the lint issues into durable lessons
-            # for this repo so the NEXT Coder brief warns against repeating them.
-            _record_coder_lessons(f"{req.owner}/{req.repo}", "lint", lint_issues)
-            await _emit("done", status="lint_rejected", pr_url=None)
+            # Classify by WHICH check failed (the loop tags each), not by
+            # sniffing issue text — scope_guard's catch-all "DELETES N of M
+            # lines" message carries none of the old keyword markers. A scope
+            # failure surfaces as scope_rejected, everything else lint_rejected.
+            scope_failed = "scope" in (loop.failed_checks or [])
+            # Failure-memory (B2): record under the gate that actually failed so
+            # the lessons signal isn't flattened to always-"lint".
+            _record_coder_lessons(
+                repo_full, "scope" if scope_failed else "lint", outstanding,
+            )
+            status = "scope_rejected" if scope_failed else "lint_rejected"
+            await _emit("done", status=status, pr_url=None)
             return ActuateResponse(
-                status="lint_rejected",
+                status=status,
                 pr_url=None,
                 branch_name=branch_name,
                 files_changed=[],
                 skipped=[cf.path for cf in coder_out.files],
                 summary=(
-                    f"Coder produced output but post-lint rejected it (after "
-                    f"one feedback retry): {'; '.join(lint_issues) or 'no files'}. "
-                    f"The patch was discarded and no branch/PR was created. "
-                    f"Original Coder summary: {coder_out.summary[:300]}"
+                    f"Coder output rejected by the verify-loop after "
+                    f"{loop.iterations} feedback iteration(s) "
+                    f"({loop.stop_reason}): {'; '.join(outstanding) or 'no files'}. "
+                    f"No branch/PR was created. "
+                    f"Coder summary: {coder_out.summary[:300]}"
                 ),
             )
 
@@ -713,7 +816,7 @@ class CoderOrchestrator:
         # CLI loop (or two UI clicks) can't both rewrite the same file. If
         # any path is already claimed, bail with `path_busy` immediately
         # (user-facing retry — see ActuateButton). Always released in `finally`.
-        repo_full = f"{req.owner}/{req.repo}"
+        # (repo_full was set above for the verify-loop.)
         claimed_paths: List[str] = []
         claimer = f"actuate:{req.finding.kind}:{req.finding.id}"
         sig = _finding_signature(req.finding)
@@ -737,62 +840,15 @@ class CoderOrchestrator:
                     )
                 claimed_paths.append(cf.path)
 
-            # 3c.5. Scope-discipline guard. Pure text analysis (no local tree
-            # needed) so it runs for ALL repos, not just the dogfood case.
-            # Catches whole-file rewrites that silently drop pre-existing
-            # top-level defs (the untested-_lifespan-hook miss) or delete lines
-            # from protected config files (the .gitignore miss) — drift the
-            # pass-count gate can't see. Reject before touching GitHub.
+            # Serialize the verify-loop's surviving output for the downstream
+            # pytest gate / commit. Lint + scope + smoke already passed inside
+            # the loop (3b); the path claim above is the first GitHub-touching
+            # step, taken on the loop's FINAL file set.
             serialized = [
                 {"path": cf.path, "new_content": cf.new_content,
                  "rationale": cf.rationale}
                 for cf in coder_out.files
             ]
-            await _emit("gate.start", phase="scope")
-            scope_issues = sg.check_patch(serialized, target_files, coder_out.summary)
-            if scope_issues:
-                # One auto-retry feeding the scope violations back to the Coder
-                # before giving up — same rationale as the lint-feedback retry:
-                # a whole-file rewrite that dropped an untested def is often
-                # fixed when the model is told exactly which lines it must
-                # preserve, cheaper than a wasted human round-trip. (Previously
-                # only lint failures got a retry; scope failures hard-rejected.)
-                logger.warning(
-                    "scope guard rejected %s/%s: %s — retrying once with feedback",
-                    req.finding.kind, req.finding.id, "; ".join(scope_issues),
-                )
-                try:
-                    coder_out = await asyncio.to_thread(
-                        agent.run_with_lint_feedback, brief, scope_issues,
-                        _deployment_hint(req.finding),
-                    )
-                    serialized = [
-                        {"path": cf.path, "new_content": cf.new_content,
-                         "rationale": cf.rationale}
-                        for cf in coder_out.files
-                    ]
-                    scope_issues = sg.check_patch(serialized, target_files, coder_out.summary)
-                except Exception as e:
-                    logger.warning("scope-feedback retry raised %s; keeping first output", e)
-            if scope_issues:
-                logger.warning(
-                    "scope guard still rejected %s/%s after feedback retry: %s",
-                    req.finding.kind, req.finding.id, "; ".join(scope_issues),
-                )
-                _record_coder_lessons(repo_full, "scope", scope_issues)
-                await _emit("done", status="scope_rejected", pr_url=None)
-                return ActuateResponse(
-                    status="scope_rejected",
-                    pr_url=None,
-                    branch_name=branch_name,
-                    files_changed=[],
-                    skipped=[cf.path for cf in coder_out.files],
-                    summary=(
-                        f"Patch passed lint but failed the scope-discipline guard: "
-                        f"{' | '.join(scope_issues)} No branch/PR was created. "
-                        f"Coder summary: {coder_out.summary[:200]}"
-                    ),
-                )
 
             # 3d. Local pytest gate — only when actuating THIS repo on a local
             # checkout (the dogfood case). For external repos there's no local

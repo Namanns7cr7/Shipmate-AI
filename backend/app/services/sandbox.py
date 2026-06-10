@@ -35,6 +35,7 @@ import subprocess
 import tempfile
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
@@ -207,6 +208,91 @@ def _smoke_in_worktree(worktree_root: Path, module: str = "app.main") -> Tuple[b
     return proc.returncode == 0, (proc.stderr or proc.stdout or "")[-500:]
 
 
+@contextmanager
+def _worktree(ref: str, root: Path):
+    """Context manager yielding a throwaway `git worktree` path checked out at
+    `ref`, ALWAYS torn down on exit (crash-safe). Yields None when a worktree
+    can't be created so callers fall back. Centralizes the add/teardown so
+    worktree_gate and worktree_smoke share one correct lifecycle.
+
+    Teardown order matters: `worktree remove` can fail (locked/busy), leaving
+    both the dir AND git's registration; a bare `prune` won't reclaim a
+    registration whose dir still exists. So we always rmtree the parent (can't
+    leak the checkout) BEFORE prune, making a stale registration reclaimable."""
+    wt_parent = tempfile.mkdtemp(prefix=_WORKTREE_TMP_PREFIX + uuid.uuid4().hex[:8] + "_")
+    wt_path = Path(wt_parent) / "tree"   # git creates this leaf dir
+    created = False
+    try:
+        try:
+            proc = subprocess.run(
+                ["git", "-C", str(root), "worktree", "add", "--detach",
+                 "--force", str(wt_path), ref],
+                capture_output=True, text=True, timeout=60,
+            )
+        except Exception as e:
+            logger.warning("worktree add failed to spawn (%s) — caller falls back", e)
+            yield None
+            return
+        if proc.returncode != 0:
+            logger.warning(
+                "worktree add returned %d (%s) — caller falls back",
+                proc.returncode, (proc.stderr or "")[-200:],
+            )
+            yield None
+            return
+        created = True
+        yield wt_path
+    finally:
+        if created:
+            removed = False
+            try:
+                rm = subprocess.run(
+                    ["git", "-C", str(root), "worktree", "remove", "--force", str(wt_path)],
+                    capture_output=True, text=True, timeout=30,
+                )
+                removed = rm.returncode == 0
+            except Exception as e:
+                logger.debug("worktree remove failed (%s)", e)
+            shutil.rmtree(wt_parent, ignore_errors=True)
+            if not removed:
+                logger.warning(
+                    "worktree remove did not succeed for %s — pruning stale registration",
+                    wt_path,
+                )
+            try:
+                subprocess.run(
+                    ["git", "-C", str(root), "worktree", "prune"],
+                    capture_output=True, text=True, timeout=30,
+                )
+            except Exception:
+                pass
+        else:
+            shutil.rmtree(wt_parent, ignore_errors=True)
+
+
+def worktree_smoke(
+    files: List[Dict[str, str]],
+    ref: str = "HEAD",
+    *,
+    module: str = "app.main",
+    repo_root: Optional[Path] = None,
+) -> Optional[Tuple[bool, str]]:
+    """Apply `files` in a throwaway worktree and run ONLY the import smoke —
+    race-free and crash-safe, the real tree untouched. Returns (ok, detail), or
+    None when no worktree could be created (caller falls back to a snapshot
+    smoke or skips). This is the EXECUTION step the inner verify-loop uses: it's
+    cheap (~2s) and safe to run before path claims, unlike a snapshot smoke that
+    mutates the shared tree."""
+    root = repo_root or REPO_ROOT
+    if not worktree_available(root):
+        return None
+    with _worktree(ref, root) as wt_path:
+        if wt_path is None:
+            return None
+        _apply_files_to_dir(str(wt_path), files)
+        return _smoke_in_worktree(wt_path, module)
+
+
 def worktree_gate(
     files: List[Dict[str, str]],
     ref: str = "HEAD",
@@ -250,26 +336,9 @@ def worktree_gate(
 
     run = runner or default_pytest_runner()
     started = time.time()
-    wt_parent = tempfile.mkdtemp(prefix=_WORKTREE_TMP_PREFIX + uuid.uuid4().hex[:8] + "_")
-    wt_path = Path(wt_parent) / "tree"   # git creates this leaf dir
-    created = False
-    try:
-        try:
-            proc = subprocess.run(
-                ["git", "-C", str(root), "worktree", "add", "--detach",
-                 "--force", str(wt_path), ref],
-                capture_output=True, text=True, timeout=60,
-            )
-        except Exception as e:
-            logger.warning("worktree add failed to spawn (%s) — caller falls back", e)
-            return None
-        if proc.returncode != 0:
-            logger.warning(
-                "worktree add returned %d (%s) — caller falls back",
-                proc.returncode, (proc.stderr or "")[-200:],
-            )
-            return None
-        created = True
+    with _worktree(ref, root) as wt_path:
+        if wt_path is None:
+            return None  # couldn't create a worktree → caller falls back
 
         # Apply the patch into the worktree (path-safe, rooted at the WT).
         _apply_files_to_dir(str(wt_path), files)
@@ -289,11 +358,8 @@ def worktree_gate(
         # supply one (the orchestrator passes its cached baseline → 1× pytest).
         before = before_count
         if before is None:
-            # Measure on a pristine second worktree-free pass: re-run runner on
-            # an unpatched copy would need another WT; instead we measure by
-            # running the runner BEFORE apply — but we've already applied. So
-            # for the self-measuring path, callers should pass before_count.
-            # Fall back to 0 (gate becomes 'tests must not fail') if absent.
+            # The self-measuring path would need a second worktree; callers
+            # should pass before_count. Fall back to 0 ('tests must not fail').
             before = 0
 
         after, failed, summary = run(wt_path)
@@ -317,41 +383,6 @@ def worktree_gate(
             passed=True, before=before, after=after, failed=failed,
             reason="ok", summary_tail=summary,
         )
-    finally:
-        # Always tear the worktree down — whether we passed, rejected, or raised.
-        # Order matters: `worktree remove` can fail (locked, busy), which would
-        # leave both the on-disk dir AND git's registration behind, and a bare
-        # `prune` WON'T reclaim a registration whose dir still exists. So if
-        # remove fails we delete the dir ourselves FIRST, then prune — now the
-        # registration points at a missing dir and prune can reclaim it.
-        if created:
-            removed = False
-            try:
-                rm = subprocess.run(
-                    ["git", "-C", str(root), "worktree", "remove", "--force", str(wt_path)],
-                    capture_output=True, text=True, timeout=30,
-                )
-                removed = rm.returncode == 0
-            except Exception as e:
-                logger.debug("worktree remove failed (%s)", e)
-            # The parent always goes (this also deletes wt_path under it), so a
-            # failed `remove` can't leak the checkout. Done before prune so the
-            # stale registration becomes reclaimable.
-            shutil.rmtree(wt_parent, ignore_errors=True)
-            if not removed:
-                logger.warning(
-                    "worktree remove did not succeed for %s — pruning stale registration",
-                    wt_path,
-                )
-            try:
-                subprocess.run(
-                    ["git", "-C", str(root), "worktree", "prune"],
-                    capture_output=True, text=True, timeout=30,
-                )
-            except Exception:
-                pass
-        else:
-            shutil.rmtree(wt_parent, ignore_errors=True)
 
 
 # ── Docker jail for the untrusted target-repo gate ───────────────────────────
