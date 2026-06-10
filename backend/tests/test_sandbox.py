@@ -232,6 +232,50 @@ class TestWorktreeGate:
         assert not (sandbox.REPO_ROOT / "backend" / "app" / "_probe_sbx.py").exists()
 
 
+class TestWorktreeSmoke:
+    """worktree_smoke (Phase 4): import-smoke in a throwaway worktree — race-free,
+    real tree untouched. The inner verify-loop's execution step."""
+
+    def test_returns_none_when_no_git(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(sandbox.shutil, "which", lambda _: None)
+        out = sandbox.worktree_smoke(
+            [{"path": "backend/app/x.py", "new_content": "X=1\n"}],
+            repo_root=tmp_path,
+        )
+        assert out is None
+
+    def test_clean_patch_imports_and_cleans_up(self):
+        if not sandbox.worktree_available():
+            pytest.skip("not inside a git work tree")
+        before = _count_worktrees()
+        # A harmless new module — app.main must still import in the worktree.
+        result = sandbox.worktree_smoke(
+            [{"path": "backend/app/_probe_smoke.py", "new_content": "PROBE = 1\n"}],
+        )
+        assert result is not None
+        ok, _detail = result
+        assert ok is True
+        # Worktree torn down; the probe never touched the real tree.
+        assert _count_worktrees() == before
+        assert not (sandbox.REPO_ROOT / "backend" / "app" / "_probe_smoke.py").exists()
+
+    def test_broken_import_detected(self):
+        if not sandbox.worktree_available():
+            pytest.skip("not inside a git work tree")
+        # Overwrite app.main with an unimportable module inside the worktree.
+        result = sandbox.worktree_smoke(
+            [{"path": "backend/app/main.py",
+              "new_content": "import a_module_that_does_not_exist_anywhere\n"}],
+        )
+        assert result is not None
+        ok, detail = result
+        assert ok is False
+        assert "a_module_that_does_not_exist" in detail or "ModuleNotFound" in detail
+        # Real app.main is intact (worktree was isolated).
+        real = (sandbox.REPO_ROOT / "backend" / "app" / "main.py").read_text()
+        assert "a_module_that_does_not_exist_anywhere" not in real
+
+
 def _count_worktrees() -> int:
     proc = subprocess.run(
         ["git", "-C", str(sandbox.REPO_ROOT), "worktree", "list"],
