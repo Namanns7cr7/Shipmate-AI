@@ -52,6 +52,11 @@ logger = logging.getLogger("shipmate.coder_orchestrator")
 # can disable it.
 _PYTEST_GATE_ENABLED = os.getenv("SHIPMATE_PYTEST_GATE", "1") == "1"
 
+# EvalOps acceptance gate (P5). OFF by default: it boots the patched app in a
+# worktree and runs a generated ValidationSpec, which adds latency + an LLM
+# call per actuate, so it's opt-in until proven. Fail-open everywhere when on.
+_EVAL_GATE_ENABLED = os.getenv("SHIPMATE_EVAL_GATE", "0").strip().lower() in ("1", "true", "yes")
+
 # Hard ceiling on the parallel file-content fetch so a hung GitHub connection
 # can't pin the actuate worker thread indefinitely (the gather had no timeout).
 _FETCH_TIMEOUT_S = float(os.getenv("SHIPMATE_FETCH_TIMEOUT_S", "45"))
@@ -1039,6 +1044,59 @@ class CoderOrchestrator:
                         f"was opened. Coder summary: {coder_out.summary[:200]}"
                     ),
                 )
+
+            # 3f. EvalOps acceptance gate (P5) — for feature/milestone findings
+            # on the dogfood repo, "shipped" should mean "the change WORKS", not
+            # just "it linted + passed pytest". Generate a ValidationSpec for the
+            # finding and run it against the PATCHED app in a throwaway worktree;
+            # reject (eval_rejected) if the scenarios fail. Opt-in via
+            # SHIPMATE_EVAL_GATE (default off so the hot actuate path is
+            # unchanged until explicitly enabled). Fully fail-open: any eval-infra
+            # error or a spec that couldn't run is treated as NO SIGNAL (never
+            # blocks a patch), mirroring test_synthesizer's report.ran semantics.
+            if (_EVAL_GATE_ENABLED and repo_full == _SELF_REPO
+                    and req.finding.kind in ("milestone", "blocker", "next_action")):
+                try:
+                    from app.services import define_validation, eval_runner
+                    from app.services.llm_service import LLMService
+                    provider = LLMService.provider()
+                    spec = define_validation.define_spec(req.finding, provider)
+                    await _emit("gate.start", phase="eval", spec=spec.name)
+                    # trusted=True: this is the SELF-repo dogfood patch — the
+                    # eval must boot the REAL app (needs the real env to import
+                    # providers/stores), and the gate only fires for _SELF_REPO,
+                    # so there's no untrusted-code exposure here. (A stripped env
+                    # would cripple the boot and could noise up the signal.)
+                    report = await asyncio.to_thread(
+                        lambda: eval_runner.run_eval_in_worktree(
+                            spec, serialized, trusted=True,
+                        ),
+                    )
+                    if report is not None and report.ran and not report.passed:
+                        fails = [x for s in report.scenarios for x in s.failures][:3]
+                        _record_coder_lessons(
+                            repo_full, "eval",
+                            f"EvalOps spec '{spec.name}' failed: {'; '.join(fails) or 'see report'}",
+                        )
+                        await _emit("done", status="eval_rejected", pr_url=None)
+                        return ActuateResponse(
+                            status="eval_rejected",
+                            pr_url=None,
+                            branch_name=branch_name,
+                            files_changed=[],
+                            skipped=[cf.path for cf in coder_out.files],
+                            summary=(
+                                f"Patch passed lint/tests but FAILED its EvalOps "
+                                f"acceptance spec ('{spec.name}'): "
+                                f"{'; '.join(fails) or 'scenarios did not pass'}. No PR "
+                                f"was opened. Coder summary: {coder_out.summary[:200]}"
+                            ),
+                        )
+                    if report is not None and report.passed:
+                        logger.info("eval gate PASSED for %s/%s (spec '%s')",
+                                    req.finding.kind, req.finding.id, spec.name)
+                except Exception as e:  # pragma: no cover - fail-open
+                    logger.debug("eval gate skipped (fail-open): %s", e)
 
             # 4. Create the branch.
             await _emit("branch.start", branch=branch_name)
