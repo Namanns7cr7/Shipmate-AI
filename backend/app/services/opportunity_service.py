@@ -158,7 +158,16 @@ class OpportunityService:
         """Plan → critique → (optionally) actuate. The plan + critique are always
         produced (cheap, safe). Steps are only actuated when execute=True AND the
         critic approves. Each step runs through the existing CoderOrchestrator,
-        so every step still passes lint/scope/pytest/resolution gates."""
+        so every step still passes lint/scope/pytest/resolution gates.
+
+        DECOMPOSITION CONTRAST (intentional, two valid routes — see
+        CoderOrchestrator._run_decomposed): this build/execute path runs each
+        plan step as its OWN run_actuation with open_pr=True → N steps = N
+        branches/PRs, stopping at the first failure so a broken step can't pile
+        on a broken base. The actuate `decompose=True` flag (auto-fix UI) instead
+        MERGES all steps into ONE CoderOutput → ONE branch/PR. Different by
+        design: build/execute favours reviewable per-step PRs; the decompose flag
+        favours a single atomic feature PR for one UI click."""
         import uuid
         from datetime import datetime, timezone
         from app.agents.planner_agent import PlannerAgent
