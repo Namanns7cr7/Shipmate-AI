@@ -164,13 +164,11 @@ _SYSTEM_PROMPT = (
     "summary under 5 sentences plus the mandatory VERIFY line."
 )
 
-# Diff-mode system prompt: same rules, but emit unified diffs. Used only when
-# the caller opts into diff mode (token savings on large files). The applier
-# (diff_apply) relocates hunks by context, so exact line numbers aren't
-# critical — but real context lines ARE, or the hunk won't locate.
-_SYSTEM_PROMPT_DIFF = (
-    _SYSTEM_PROMPT
-    + "\n\n# OUTPUT FORMAT OVERRIDE — UNIFIED DIFF MODE\n"
+# Diff-mode output-format override — appended to whichever system prompt is in
+# use (the legacy monolith OR a skill-composed prompt). Factored out so
+# system_prompt_for() can append it to a composed prompt too.
+_DIFF_OUTPUT_OVERRIDE = (
+    "\n\n# OUTPUT FORMAT OVERRIDE — UNIFIED DIFF MODE\n"
     "Instead of full file contents, emit a UNIFIED DIFF per changed file in "
     "the `unified_diff` field:\n"
     "  • Use `@@ -oldStart,oldCount +newStart,newCount @@` hunk headers.\n"
@@ -188,6 +186,9 @@ _SYSTEM_PROMPT_DIFF = (
     "full-file mode.\n"
     "All the scope/test/anti-theater rules above still apply to the diff."
 )
+
+# Legacy monolithic diff prompt — retained as the fail-open fallback target.
+_SYSTEM_PROMPT_DIFF = _SYSTEM_PROMPT + _DIFF_OUTPUT_OVERRIDE
 
 
 class CoderFile(BaseModel):
@@ -241,6 +242,14 @@ class CoderBrief(BaseModel):
     finding_kind: str
     finding_id: str
     finding_severity: Optional[str] = None
+    finding_category: str = Field(
+        default="",
+        description=(
+            "Finding category (e.g. secrets, ci_cd, testing, refactor). With "
+            "finding_kind it selects the Coder SKILL (skills.skill_for) so the "
+            "system prompt carries only the rules that finding shape needs."
+        ),
+    )
 
 
 def _truncate_for_prompt(content: str, max_chars: int = 30_000) -> str:
@@ -284,6 +293,27 @@ def _build_user_prompt(brief: CoderBrief) -> str:
     )
 
 
+def system_prompt_for(brief: CoderBrief, diff_mode: bool = False) -> str:
+    """Compose the Coder system prompt for THIS finding via the skill registry
+    (Phase 3): base/universal rules + the one skill fragment matched by
+    (finding_kind, finding_category). Shorter and sharper than the old
+    monolith, which carried every kind's rules on every patch.
+
+    Fail-open: if the skills package can't be imported or dispatch errors, fall
+    back to the legacy monolithic _SYSTEM_PROMPT so the Coder always has a valid
+    prompt. `diff_mode=True` appends the unified-diff output-format override."""
+    try:
+        from app.services import skills
+        skill = skills.skill_for(brief.finding_kind, brief.finding_category or "")
+        prompt = skills.compose_system_prompt(skill)
+    except Exception as e:  # pragma: no cover - fail-open to the monolith
+        logger.debug("skill composition failed (%s) — using legacy monolith prompt", e)
+        prompt = _SYSTEM_PROMPT
+    if diff_mode:
+        prompt = prompt + _DIFF_OUTPUT_OVERRIDE
+    return prompt
+
+
 class CoderAgent:
     name = "coder"
     description = "Generates full file contents to remediate a single finding"
@@ -322,14 +352,16 @@ class CoderAgent:
 
         provider = self._get_provider()
         user_prompt = _build_user_prompt(brief)
+        system_prompt = system_prompt_for(brief)
 
         logger.info(
-            "Coder.run kind=%s id=%s files=%d hint=%s",
-            brief.finding_kind, brief.finding_id, len(brief.target_files), deployment_hint,
+            "Coder.run kind=%s id=%s cat=%s files=%d hint=%s",
+            brief.finding_kind, brief.finding_id, brief.finding_category or "-",
+            len(brief.target_files), deployment_hint,
         )
 
         result = provider.invoke_structured_sync(
-            system_prompt=_SYSTEM_PROMPT,
+            system_prompt=system_prompt,
             user_prompt=user_prompt,
             schema_class=CoderOutput,
             deployment_hint=deployment_hint,
@@ -354,7 +386,7 @@ class CoderAgent:
             brief.finding_kind, brief.finding_id, len(brief.target_files),
         )
         diff_out: CoderOutputDiff = provider.invoke_structured_sync(
-            system_prompt=_SYSTEM_PROMPT_DIFF,
+            system_prompt=system_prompt_for(brief, diff_mode=True),
             user_prompt=user_prompt,
             schema_class=CoderOutputDiff,
             deployment_hint=deployment_hint,
@@ -404,7 +436,7 @@ class CoderAgent:
             brief.finding_kind, brief.finding_id, len(lint_issues),
         )
         result = provider.invoke_with_lint_feedback(
-            system_prompt=_SYSTEM_PROMPT,
+            system_prompt=system_prompt_for(brief),
             user_prompt=user_prompt,
             schema_class=CoderOutput,
             lint_issues=lint_issues,

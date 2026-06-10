@@ -456,6 +456,7 @@ async def _actuate_one(
             finding_kind=finding.kind,
             finding_id=finding.id,
             finding_severity=finding.severity,
+            finding_category=getattr(finding, "category", "") or "",
         )
         agent = CoderAgent()
         _mode = "diff" if diff_mode else "full"
