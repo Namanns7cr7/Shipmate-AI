@@ -381,6 +381,29 @@ _DANGEROUS_PATTERNS: list[re.Pattern] = [
 
 _SKIP_HEADERS = {"authorization", "cookie"}
 
+# Max request body the sanitizer will read+scan. A body larger than this is
+# rejected with 413 BEFORE any regex runs, so an attacker can't feed an
+# unbounded payload through the (multi-pass) injection-pattern scan to exhaust
+# memory or trigger pathological regex backtracking (ReDoS). 2 MB is far above
+# any legitimate ShipMate request (the largest is a CoderOutput-bearing actuate,
+# well under this). Override with SHIPMATE_MAX_BODY_BYTES.
+MAX_BODY_BYTES = int(os.getenv("SHIPMATE_MAX_BODY_BYTES", str(2 * 1024 * 1024)))
+
+
+def _body_too_large(request: "Request", body_len: int | None = None) -> bool:
+    """True if the request body exceeds MAX_BODY_BYTES. Checks the declared
+    Content-Length first (cheap, lets us reject before reading), then the actual
+    read length when provided. A malformed/absent Content-Length falls through
+    to the post-read check."""
+    cl = request.headers.get("content-length")
+    if cl is not None:
+        try:
+            if int(cl) > MAX_BODY_BYTES:
+                return True
+        except (TypeError, ValueError):
+            pass
+    return body_len is not None and body_len > MAX_BODY_BYTES
+
 
 def _normalize_for_scanning(text: str, max_passes: int = 3) -> str:
     """Defeat common blocklist-evasion encodings before pattern matching.
@@ -521,9 +544,24 @@ async def sanitize_input_middleware(request: Request, call_next):
     if request.method in ("POST", "PUT", "PATCH"):
         content_type = request.headers.get("content-type", "")
         if _is_text_content_type(content_type):
+            # Reject an oversized body by its declared Content-Length BEFORE
+            # reading it — cheapest path, and stops a huge upload before it's
+            # even buffered.
+            if _body_too_large(request):
+                return JSONResponse(
+                    status_code=413,
+                    content={"detail": "Request body too large"},
+                )
             try:
                 from urllib.parse import unquote_plus
                 body_bytes = await request.body()
+                # Belt-and-suspenders: a missing/lying Content-Length means we
+                # only learn the true size here — reject before any regex pass.
+                if _body_too_large(request, len(body_bytes)):
+                    return JSONResponse(
+                        status_code=413,
+                        content={"detail": "Request body too large"},
+                    )
                 raw_text = body_bytes.decode("utf-8", errors="ignore")
                 # URL-decode form bodies so percent-encoded patterns (exec%28…) are caught
                 body_text = unquote_plus(raw_text) if "form-urlencoded" in content_type else raw_text
@@ -670,9 +708,21 @@ async def github_webhook(request: Request):
     Validates webhook signature, extracts repository and branch info,
     and triggers automatic analysis.
     """
+    # Reject an oversized webhook body before buffering/HMAC — a webhook payload
+    # is small; an outsized one is abuse.
+    if _body_too_large(request):
+        return JSONResponse(
+            status_code=413,
+            content={"detail": "Request body too large"},
+        )
     # Get raw body for signature verification
     body_bytes = await request.body()
-    
+    if _body_too_large(request, len(body_bytes)):
+        return JSONResponse(
+            status_code=413,
+            content={"detail": "Request body too large"},
+        )
+
     # Verify webhook signature
     signature = request.headers.get("x-hub-signature-256", "")
     if not _verify_github_webhook_signature(body_bytes, signature):
