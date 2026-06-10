@@ -105,7 +105,7 @@ class TestAnalyzeOffloaded:
         # Pass the auth + credential gates without network.
         async def ok_auth(token, owner, repo):
             return None
-        monkeypatch.setattr(analysis_mod, "_verify_repo_write_access", ok_auth)
+        monkeypatch.setattr(analysis_mod, "verify_repo_write_access", ok_auth)
         monkeypatch.setattr(analysis_mod, "require_body_credential", lambda v: "real-token")
 
         class _Index:
