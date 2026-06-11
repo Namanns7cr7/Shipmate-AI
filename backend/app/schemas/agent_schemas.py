@@ -23,8 +23,10 @@ class ShipRecommendation(str, Enum):
 
 class ArchitectureRisk(BaseModel):
     risk: str
-    impact: str   # "critical" | "high" | "medium" | "low"
-    category: str  # "structure" | "deps" | "config" | "ci_cd" | "security" | "docs"
+    impact: str        # "critical" | "high" | "medium" | "low"
+    category: str      # "structure" | "deps" | "config" | "ci_cd" | "security" | "docs"
+    evidence: Optional[str] = None   # file path or pattern that grounds this risk
+    confidence: str = "high"         # "high" | "medium" | "low"
 
 
 class RepoLensOutput(BaseModel):

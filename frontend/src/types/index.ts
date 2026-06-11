@@ -59,6 +59,8 @@ export interface ArchitectureRisk {
   risk: string;
   impact: string;
   category: string;
+  evidence?: string;
+  confidence?: string;
 }
 
 export interface RepoLensOutput {
