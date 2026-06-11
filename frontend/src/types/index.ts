@@ -85,6 +85,7 @@ export interface Milestone {
   category: string;
   source?: 'heuristic' | 'discovery';
   rationale?: string | null;
+  confidence?: 'high' | 'medium' | 'low';
 }
 
 export interface Blocker {
@@ -96,6 +97,7 @@ export interface Blocker {
   category: string;
   source?: 'heuristic' | 'discovery';
   rationale?: string | null;
+  confidence?: 'high' | 'medium' | 'low';
 }
 
 export interface PlanForgeOutput {
@@ -118,6 +120,7 @@ export interface SecurityFinding {
   cve?: string;
   source?: 'heuristic' | 'discovery';
   rationale?: string | null;
+  confidence?: 'high' | 'medium' | 'low';
 }
 
 export interface GuardRailOutput {
@@ -144,6 +147,7 @@ export interface SuggestedTest {
   target_file?: string;
   source?: 'heuristic' | 'discovery';
   rationale?: string | null;
+  confidence?: 'high' | 'medium' | 'low';
 }
 
 export interface TestPilotOutput {
@@ -195,6 +199,8 @@ export interface ShipMateReport {
    *  unavailable) — the UI shows a heuristic-only banner. Optional for
    *  back-compat with older payloads. */
   ai_enhanced?: boolean;
+  /** Human-readable score deduction list (e.g. "-20 repo_score: no test files detected"). */
+  score_explanation?: string[];
 }
 
 export interface AnalyzeResponse {

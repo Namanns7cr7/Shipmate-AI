@@ -1,5 +1,5 @@
 from pydantic import BaseModel
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Literal
 from enum import Enum
 
 
@@ -53,6 +53,7 @@ class Milestone(BaseModel):
     category: str   # "feature" | "testing" | "security" | "ci_cd" | "infra" | "docs"
     source: str = "heuristic"        # "heuristic" | "discovery"
     rationale: Optional[str] = None  # Discovery-only: why this matters for THIS repo
+    confidence: Literal["high", "medium", "low"] = "high"
 
 
 class Blocker(BaseModel):
@@ -64,6 +65,7 @@ class Blocker(BaseModel):
     category: str
     source: str = "heuristic"
     rationale: Optional[str] = None
+    confidence: Literal["high", "medium", "low"] = "high"
 
 
 class PlanForgeOutput(BaseModel):
@@ -88,6 +90,7 @@ class SecurityFinding(BaseModel):
     cve: Optional[str] = None
     source: str = "heuristic"        # "heuristic" | "discovery"
     rationale: Optional[str] = None  # Discovery-only: code-grounded explanation
+    confidence: Literal["high", "medium", "low"] = "high"
 
 
 class GuardRailOutput(BaseModel):
@@ -116,6 +119,7 @@ class SuggestedTest(BaseModel):
     target_file: Optional[str] = None
     source: str = "heuristic"        # "heuristic" | "discovery"
     rationale: Optional[str] = None  # Discovery-only: code-grounded explanation
+    confidence: Literal["high", "medium", "low"] = "high"
 
 
 class TestPilotOutput(BaseModel):
@@ -169,6 +173,9 @@ class ShipMateReport(BaseModel):
     # the user wondering why findings look generic. Defaults True for back-compat
     # with any stored/older report that predates this field.
     ai_enhanced: bool = True
+    # Human-readable list of what drove each score deduction. Max 6 items,
+    # each under 80 chars (e.g. "-20 repo_score: no test files detected").
+    score_explanation: List[str] = []
 
 
 # ── Opportunity Planner (Phase 1A) ────────────────────────────────────────────
