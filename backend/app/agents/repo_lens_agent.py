@@ -141,6 +141,8 @@ class RepoLensAgent(BaseAgent):
             return "monorepo"
         if len(tops) > 6 and any(d in tops for d in ["api", "gateway", "service"]):
             return "microservices"
+        if "frontend" in tops and "backend" in tops:
+            return "fullstack"
         if "src" in tops and len(tops) < 6:
             return "library"
         return "monolith"
@@ -154,7 +156,8 @@ class RepoLensAgent(BaseAgent):
         }
         EXCLUDE_DIR_TOKENS = ("/types/", "/__tests__/", "/tests/", "/mocks/",
                               "/mock/", "/fixtures/", "/stubs/", "/__mocks__/",
-                              "/.storybook/", "/dist/", "/build/")
+                              "/.storybook/", "/dist/", "/build/",
+                              "/components/", "/hooks/")
         out: List[str] = []
         for f in tree:
             if Path(f).name not in ENTRIES:
@@ -264,6 +267,8 @@ class RepoLensAgent(BaseAgent):
         if not any("readme" in f.lower() for f in tree): s -= 7
         if ".env" in tree: s -= 15
         if not any(".gitignore" in f for f in tree): s -= 5
-        critical = sum(1 for r in risks if r.impact == "critical")
-        s -= min(20, critical * 10)
+        # Severity-weighted risk deductions: one critical > five lows
+        _RISK_WEIGHTS = {"critical": 15, "high": 7, "medium": 3, "low": 2}
+        risk_penalty = sum(_RISK_WEIGHTS.get(r.impact, 2) for r in risks)
+        s -= min(30, risk_penalty)
         return max(0, min(100, s))
