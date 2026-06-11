@@ -5,6 +5,26 @@ from .base_agent import BaseAgent
 from ..schemas.agent_schemas import GuardRailOutput, SecurityFinding, Severity
 from ..services.llm_service import LLMService
 
+# ── Test-file classifier ──────────────────────────────────────────────────────
+# Skip secret/injection scans for test files — fixtures and mock credentials
+# are intentional and produce chronic false positives. Dependency manifests
+# (requirements.txt, package.json) are NOT test files and are still scanned.
+_TEST_FILE_PATTERNS = re.compile(
+    r"(^|/)tests?/|/(__|)tests?/|"
+    r"(^|.+/)test_[^/]+\.py$|[^/]+_test\.py$|"
+    r"[^/]+\.test\.(ts|tsx|js|jsx)$|[^/]+\.spec\.(ts|tsx|js|jsx|py|rb)$|"
+    r"(^|/)spec/",
+    re.IGNORECASE,
+)
+
+
+def _is_test_file(path: str) -> bool:
+    """Return True when *path* is a test/spec file that should be excluded from
+    secret and injection heuristic scans. Dependency manifests are NOT excluded
+    even if they live in a tests/ sibling directory."""
+    return bool(_TEST_FILE_PATTERNS.search(path))
+
+
 # ── Code-aware injection detection ───────────────────────────────────────────
 # A naive substring scan for "eval(" / "__import__" produces chronic false
 # positives, because a *defensive* codebase mentions those tokens precisely to
@@ -172,6 +192,8 @@ class GuardRailAgent(BaseAgent):
         for filename, content in kf.items():
             if not content:
                 continue
+            if _is_test_file(filename):
+                continue  # fixture/mock credentials are intentional
             for pattern, label in _SECRET_PATTERNS:
                 if re.search(pattern, content):
                     exposed_secrets.append(f"{label} in {filename}")
@@ -264,7 +286,13 @@ class GuardRailAgent(BaseAgent):
         # CALL counts, never a detection regex, denylist entry, comment, or test.
         # (A security codebase mentions these tokens precisely to BLOCK them; the
         # old substring check flagged its own anti-injection middleware.)
-        if any(_has_real_dynamic_exec(c) for c in kf.values() if c):
+        # Test files are excluded — eval() in a test is deliberately exercising
+        # the security path, not a production vulnerability.
+        if any(
+            _has_real_dynamic_exec(c)
+            for fname, c in kf.items()
+            if c and not _is_test_file(fname)
+        ):
             findings.append(SecurityFinding(
                 id=f"SEC-{fid:03d}",
                 title="Dynamic code execution detected",
