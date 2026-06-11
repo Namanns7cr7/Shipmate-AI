@@ -172,6 +172,7 @@ class ShipMateOrchestrator:
             next_actions=next_actions,
             generated_at=datetime.now(timezone.utc).isoformat(),
             ai_enhanced=ai_enhanced,
+            score_explanation=score_breakdown.get("score_explanation", []),
         )
 
     def _filter_findings(self, repo_context, plan_forge_out, guardrail_out, testpilot_out):

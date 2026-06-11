@@ -76,6 +76,15 @@ function DeploymentReadinessCard({ report, onView }: { report: ShipMateReport; o
             </div>
           </div>
 
+          {/* Score explanation */}
+          {report.score_explanation && report.score_explanation.length > 0 && (
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+              {report.score_explanation.map((e, i) => (
+                <span key={i} className="chip tone-amber" style={{ fontFamily: 'JetBrains Mono, ui-monospace, monospace', fontSize: 11 }}>{e}</span>
+              ))}
+            </div>
+          )}
+
           {/* Score breakdown bars */}
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gap: 14 }}>
             {breakdown.map(b => {
