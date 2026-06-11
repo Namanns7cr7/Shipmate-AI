@@ -95,6 +95,7 @@ class TestMilestoneSuppression:
                 title="Brand new milestone", description="d",
                 estimated_days=2, priority="medium", category="feature",
                 rationale="backend/app/main.py",
+                file="backend/app/main.py",  # evidence gate: must be in file_tree
             )],
             blockers=[],
         )

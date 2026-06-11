@@ -398,7 +398,7 @@ class LLMService:
                 schema_class=PlanForgeDiscovery,
                 deployment_hint="smart",  # discovery is the slow + smart pass
             )
-            merged = _merge_plan_discovery(base, discovery)
+            merged = _merge_plan_discovery(base, discovery, context)
             # Suppress dismissed/shipped MILESTONES (the recurring ones the user
             # sees) AND blockers. Both flow through the journal/actuate path.
             # Distinct kinds so a milestone and a blocker with the same title get
@@ -460,7 +460,7 @@ class LLMService:
                 schema_class=GuardRailDiscovery,
                 deployment_hint="smart",
             )
-            merged = _merge_guardrail_discovery(base, discovery)
+            merged = _merge_guardrail_discovery(base, discovery, context)
             # Critic + journal suppression on the COMPLETE finding set (heuristic
             # + LLM-discovered), judged against the same code_blob the agent saw.
             merged.findings = cls._refine_findings(
@@ -518,7 +518,7 @@ class LLMService:
                 schema_class=TestPilotDiscovery,
                 deployment_hint="smart",
             )
-            return _merge_testpilot_discovery(base, discovery)
+            return _merge_testpilot_discovery(base, discovery, context)
         except Exception as e:
             logger.warning("TestPilot discovery failed (%s); using base output", e)
             _maybe_invalidate_provider(e)
@@ -598,6 +598,7 @@ class _DiscoveredMilestone(BaseModel):
     priority: str = Field(..., description="One of: critical, high, medium, low.")
     category: str = Field(..., description="One of: feature, testing, security, ci_cd, infra, docs.")
     rationale: str = Field(..., description="WHY this matters — cite at least one file path or code construct from the repo.")
+    file: Optional[str] = Field(None, description="A file path from the repo file tree that grounds this milestone. REQUIRED — if you cannot name a real file, omit the milestone.")
 
 
 class _DiscoveredBlocker(BaseModel):
@@ -607,6 +608,7 @@ class _DiscoveredBlocker(BaseModel):
     resolution: str = Field(..., description="2-3 concrete steps to unblock.")
     category: str = Field(..., description="e.g. ci_cd, testing, security, docs, structure, deps, config.")
     rationale: str = Field(..., description="Cite specific files/constructs that prove this blocker exists.")
+    file: Optional[str] = Field(None, description="A file path from the repo file tree that grounds this blocker. REQUIRED — if you cannot name a real file, omit the blocker.")
 
 
 class PlanForgeDiscovery(BaseModel):
@@ -799,7 +801,11 @@ _DISCOVERY_PLAN_SYSTEM = (
     "developer-facing gaps. Emit blockers ONLY for issues that genuinely "
     "BLOCK shipping (broken paths, severe gaps); features and tweaks should "
     "be milestones, not blockers. Bias toward NOVELTY — fewer balanced, "
-    "not-already-done items beat five obvious ones."
+    "not-already-done items beat five obvious ones.\n\n"
+    "EVIDENCE RULE: Every item MUST include a `file` field containing a path "
+    "from the repo file tree. If you cannot name a real file from the tree "
+    "shown, omit the item entirely. Do not reproduce items already listed in "
+    "the heuristic base."
 )
 
 _DISCOVERY_GUARDRAIL_SYSTEM = (
@@ -818,7 +824,11 @@ _DISCOVERY_GUARDRAIL_SYSTEM = (
     "  - generic OWASP advice not grounded in this repo's code\n"
     "  - false positives — only emit if you can point to a specific construct\n\n"
     "Every finding MUST cite the file/function/line in its rationale. "
-    "If the heuristic base already covers the area, skip it."
+    "If the heuristic base already covers the area, skip it.\n\n"
+    "EVIDENCE RULE: Every finding MUST include a non-null `file` field "
+    "containing a path that appears in the repo file tree. If you cannot "
+    "name a real file from the tree, omit the finding. Do not reproduce "
+    "findings already listed in the heuristic base."
 )
 
 _DISCOVERY_TESTPILOT_SYSTEM = (
@@ -854,7 +864,10 @@ _DISCOVERY_TESTPILOT_SYSTEM = (
     "Every test MUST have a specific target_file + rationale citing a "
     "concrete function/branch. The test name MUST encode the case under "
     "test (test_<thing>_<condition>_<expected>). Skip generic happy-path "
-    "tests entirely — those are heuristic territory."
+    "tests entirely — those are heuristic territory.\n\n"
+    "EVIDENCE RULE: Every test MUST include a `target_file` field containing "
+    "a path that appears in the repo file tree. If you cannot name a real "
+    "file, omit the test. Do not reproduce tests already in the heuristic list."
 )
 
 _DISCOVERY_OPPORTUNITY_SYSTEM = (
@@ -1164,16 +1177,51 @@ def _norm_title(s: str) -> str:
     return "".join(c for c in s.lower() if c.isalnum())
 
 
+def _word_overlap_dup(new_title: str, existing_titles: List[str], threshold: float = 0.70) -> bool:
+    """True when new_title shares >= threshold fraction of word tokens with any existing title.
+    Both sides are lowercased. Used to catch rephrased duplicates (e.g. 'Add CI pipeline' vs
+    'Set up CI/CD pipeline') that _norm_title exact-match misses."""
+    words_new = set(new_title.lower().split())
+    if not words_new:
+        return False
+    for existing in existing_titles:
+        words_ex = set(existing.lower().split())
+        if not words_ex:
+            continue
+        overlap = len(words_new & words_ex) / max(len(words_new), len(words_ex))
+        if overlap >= threshold:
+            return True
+    return False
+
+
+def _evidence_confidence(file: Optional[str], file_tree_set: set) -> str:
+    """Return 'medium' when file is non-null and present in the repo tree, else 'low'."""
+    if file and file in file_tree_set:
+        return "medium"
+    return "low"
+
+
 def _merge_plan_discovery(
     base: PlanForgeOutput, disc: PlanForgeDiscovery,
+    context: Optional[Dict[str, Any]] = None,
 ) -> PlanForgeOutput:
+    file_tree_set = set(context.get("file_tree") or []) if context else set()
     base_titles = {_norm_title(m.title) for m in base.milestones}
     base_block_titles = {_norm_title(b.title) for b in base.blockers}
+    all_milestone_titles = [m.title for m in base.milestones]
+    all_blocker_titles = [b.title for b in base.blockers]
 
     new_milestones: List[Milestone] = []
     for d in disc.milestones[:5]:
         if _norm_title(d.title) in base_titles:
-            continue  # dedup against heuristic
+            continue  # exact normalized dedup
+        if _word_overlap_dup(d.title, all_milestone_titles):
+            logger.debug("PlanForge discovery: dropped word-overlap dup milestone %r", d.title)
+            continue
+        conf = _evidence_confidence(getattr(d, "file", None), file_tree_set)
+        if conf == "low":
+            logger.debug("PlanForge discovery: dropped no-evidence milestone %r (file=%r)", d.title, getattr(d, "file", None))
+            continue
         try:
             new_milestones.append(Milestone(
                 title=d.title.strip()[:120],
@@ -1185,6 +1233,7 @@ def _merge_plan_discovery(
                     {"feature", "testing", "security", "ci_cd", "infra", "docs"} else "feature",
                 source="discovery",
                 rationale=d.rationale.strip()[:600],
+                confidence=conf,
             ))
         except Exception as e:
             logger.warning("Skipping malformed discovered milestone (%s)", e)
@@ -1193,6 +1242,13 @@ def _merge_plan_discovery(
     new_blockers: List[Blocker] = []
     for d in disc.blockers[:3]:
         if _norm_title(d.title) in base_block_titles:
+            continue
+        if _word_overlap_dup(d.title, all_blocker_titles):
+            logger.debug("PlanForge discovery: dropped word-overlap dup blocker %r", d.title)
+            continue
+        conf = _evidence_confidence(getattr(d, "file", None), file_tree_set)
+        if conf == "low":
+            logger.debug("PlanForge discovery: dropped no-evidence blocker %r (file=%r)", d.title, getattr(d, "file", None))
             continue
         try:
             new_blockers.append(Blocker(
@@ -1205,6 +1261,7 @@ def _merge_plan_discovery(
                 category=d.category.strip().lower() or "structure",
                 source="discovery",
                 rationale=d.rationale.strip()[:600],
+                confidence=conf,
             ))
             next_bid += 1
         except Exception as e:
@@ -1224,11 +1281,14 @@ _VALID_GR_CATEGORY = {"secrets", "auth", "cors", "injection", "deps", "exposure"
 
 def _merge_guardrail_discovery(
     base: GuardRailOutput, disc: GuardRailDiscovery,
+    context: Optional[Dict[str, Any]] = None,
 ) -> GuardRailOutput:
+    file_tree_set = set(context.get("file_tree") or []) if context else set()
     base_keys = {(_norm_title(f.title), f.file or "") for f in base.findings}
+    base_file_cats = {(f.file or "", f.category) for f in base.findings}
+    all_finding_titles = [f.title for f in base.findings]
 
     next_id = 1
-    # Find next sec id by parsing existing ones
     for f in base.findings:
         if f.id.startswith("SEC-"):
             try:
@@ -1241,6 +1301,19 @@ def _merge_guardrail_discovery(
     for d in disc.findings[:5]:
         key = (_norm_title(d.title), d.file or "")
         if key in base_keys:
+            continue
+        # Same file+category as an existing finding → duplicate
+        file_cat = (d.file or "", d.category.lower() if d.category else "")
+        if file_cat[0] and (file_cat[0], file_cat[1]) in base_file_cats:
+            logger.debug("GuardRail discovery: dropped same-file+category dup %r", d.title)
+            continue
+        if _word_overlap_dup(d.title, all_finding_titles):
+            logger.debug("GuardRail discovery: dropped word-overlap dup %r", d.title)
+            continue
+        # Evidence gating: file must exist in the repo tree
+        conf = _evidence_confidence(d.file, file_tree_set)
+        if conf == "low":
+            logger.debug("GuardRail discovery: dropped no-evidence finding %r (file=%r)", d.title, d.file)
             continue
         sev_str = d.severity.lower()
         if sev_str not in _VALID_SEVERITY:
@@ -1259,6 +1332,7 @@ def _merge_guardrail_discovery(
                 file=d.file,
                 source="discovery",
                 rationale=d.rationale.strip()[:600],
+                confidence=conf,
             ))
             next_id += 1
         except Exception as e:
@@ -1267,8 +1341,6 @@ def _merge_guardrail_discovery(
     if not new_findings:
         return base
 
-    # Re-sort the combined list by severity so discovery findings interleave
-    # naturally with heuristic ones.
     SEV_ORDER = {Severity.CRITICAL: 0, Severity.HIGH: 1, Severity.MEDIUM: 2,
                  Severity.LOW: 3, Severity.INFO: 4}
     combined = list(base.findings) + new_findings
@@ -1291,17 +1363,27 @@ _TEMPLATE_TEST_NAMES = {
 
 def _merge_testpilot_discovery(
     base: TestPilotOutput, disc: TestPilotDiscovery,
+    context: Optional[Dict[str, Any]] = None,
 ) -> TestPilotOutput:
+    file_tree_set = set(context.get("file_tree") or []) if context else set()
     base_names = {_norm_title(t.name) for t in base.suggested_tests}
+    all_test_names = [t.name for t in base.suggested_tests]
 
     new_tests: List[SuggestedTest] = []
     for d in disc.suggested_tests[:5]:
         norm = _norm_title(d.name)
         if norm in base_names:
             continue
-        # Block obvious template-name leakage even though the prompt forbids it.
         if any(_norm_title(tpl) == norm for tpl in _TEMPLATE_TEST_NAMES):
             logger.info("TestPilot discovery: dropped template-shaped name %r", d.name)
+            continue
+        if _word_overlap_dup(d.name, all_test_names):
+            logger.debug("TestPilot discovery: dropped word-overlap dup test %r", d.name)
+            continue
+        # Evidence gating: target_file must exist in the repo tree
+        conf = _evidence_confidence(d.target_file, file_tree_set)
+        if conf == "low":
+            logger.debug("TestPilot discovery: dropped no-evidence test %r (target_file=%r)", d.name, d.target_file)
             continue
         ttype = d.type.lower()
         if ttype not in _VALID_TEST_TYPE:
@@ -1318,6 +1400,7 @@ def _merge_testpilot_discovery(
                 target_file=d.target_file,
                 source="discovery",
                 rationale=d.rationale.strip()[:600],
+                confidence=conf,
             ))
         except Exception as e:
             logger.warning("Skipping malformed discovered test (%s)", e)
