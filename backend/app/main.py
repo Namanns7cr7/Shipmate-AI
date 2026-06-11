@@ -8,8 +8,9 @@ import json
 import hmac
 import hashlib
 import logging
+import unicodedata
 from contextlib import asynccontextmanager
-from typing import Callable
+from typing import Any, Callable
 from urllib.parse import urlparse
 
 logger = logging.getLogger("shipmate.main")
@@ -27,6 +28,7 @@ from app.api.routes.branches import router as branches_router
 from app.api.routes.findings import router as findings_router
 from app.api.routes.auto_fix import router as auto_fix_router
 from app.api.routes.history import router as history_router
+from app.api.routes.build import router as build_router
 
 # ---------------------------------------------------------------------------
 # Rate Limiting: Token Bucket Implementation
@@ -58,7 +60,10 @@ class _RateLimiter:
     def __init__(self, capacity: int, refill_rate: float):
         self.capacity = capacity
         self.refill_rate = refill_rate
+        # Plain dict — is_allowed() creates buckets on demand via an explicit
+        # key check below.
         self.buckets: dict[str, _TokenBucket] = {}
+
 
     def is_allowed(self, client_ip: str) -> bool:
         if client_ip not in self.buckets:
@@ -258,8 +263,43 @@ _DANGEROUS_PATTERNS: list[re.Pattern] = [
 _SKIP_HEADERS = {"authorization", "cookie"}
 
 
+def _normalize_for_scanning(text: str, max_passes: int = 3) -> str:
+    """Defeat common blocklist-evasion encodings before pattern matching.
+
+    An attacker can hide `eval(` as `eval%2528` (double URL-encode), `ev%61l(`
+    (partial), or via Unicode compatibility forms. We:
+      1. Recursively URL-decode until the string stops changing (bounded passes,
+         so a pathological input can't loop) — catches multi-layer %-encoding.
+      2. Apply Unicode NFKC normalization — folds compatibility/full-width
+         variants (e.g. ﹙ -> '(') to their canonical ASCII so the regexes match.
+    Returns the most-decoded form; callers scan BOTH this and the raw text."""
+    from urllib.parse import unquote_plus
+
+    prev = text
+    for _ in range(max_passes):
+        decoded = unquote_plus(prev)
+        if decoded == prev:
+            break
+        prev = decoded
+    try:
+        prev = unicodedata.normalize("NFKC", prev)
+    except Exception:
+        pass
+    return prev
+
+
 def _contains_dangerous_pattern(text: str) -> bool:
-    return any(p.search(text) for p in _DANGEROUS_PATTERNS)
+    """Return True if *text* matches any known code-injection pattern.
+
+    Scans BOTH the raw text and an encoding-normalized form (recursive
+    URL-decode + Unicode NFKC) so blocklist-evasion via %-encoding or Unicode
+    compatibility variants can't slip a payload past the regexes."""
+    if any(p.search(text) for p in _DANGEROUS_PATTERNS):
+        return True
+    normalized = _normalize_for_scanning(text)
+    if normalized != text and any(p.search(normalized) for p in _DANGEROUS_PATTERNS):
+        return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -274,10 +314,13 @@ async def _lifespan(app: "FastAPI"):
     Shutdown: nothing to flush — sqlite commits are synchronous per write."""
     # --- startup ---
     try:
-        from app.services import inflight_registry as _ir
-        _ir.init_db()
+        # One call creates every registered sqlite store (inflight, reports,
+        # oauth) with the shared connection/PRAGMA/location policy. The route
+        # imports above have already executed each store module's register().
+        from app.services import sqlite_store as _store
+        _store.init_all()
     except Exception as e:  # pragma: no cover - startup best-effort
-        logger.warning("inflight_registry init failed: %s", e)
+        logger.warning("sqlite_store init_all failed: %s", e)
     try:
         from app.services.ci_watcher import CIWatcher
         resumed = CIWatcher.resume_from_db()
@@ -290,18 +333,16 @@ async def _lifespan(app: "FastAPI"):
     # --- shutdown --- (no-op; sqlite is durable per-commit)
 
 
-# ---------------------------------------------------------------------------
-# Application
-# ---------------------------------------------------------------------------
-
-_is_dev = os.getenv("ENVIRONMENT", "production").lower() == "development"
+_ENVIRONMENT = os.getenv("ENVIRONMENT", "development").strip().lower()
+_IS_PRODUCTION = _ENVIRONMENT in ("production", "prod")
 
 app = FastAPI(
     title="ShipMate AI",
     description="AI-native multi-agent release readiness platform",
     version="2.0.0",
-    docs_url="/docs" if _is_dev else None,
-    redoc_url="/redoc" if _is_dev else None,
+    docs_url=None if _IS_PRODUCTION else "/docs",
+    redoc_url=None if _IS_PRODUCTION else "/redoc",
+    openapi_url=None if _IS_PRODUCTION else "/openapi.json",
     lifespan=_lifespan,
 )
 
@@ -423,15 +464,23 @@ async def strict_cors_middleware(request: Request, call_next):
     return await call_next(request)
 
 
+_HSTS_ENABLED = os.getenv("ENABLE_HSTS", "false").strip().lower() in ("1", "true", "yes")
+
+
 @app.middleware("http")
-async def _security_headers(request: Request, call_next: Callable):
+async def security_headers_middleware(request: Request, call_next: Callable):
+    """Attach hardening response headers. HSTS gated on ENABLE_HSTS (never pin
+    a plain-http dev origin to https); plus always-safe headers for clickjacking,
+    MIME-sniffing, and referrer leakage."""
     response = await call_next(request)
-    response.headers.update({
-        "X-Content-Type-Options": "nosniff",
-        "X-Frame-Options": "DENY",
-        "Referrer-Policy": "no-referrer",
-        "X-XSS-Protection": "0",
-    })
+    if _HSTS_ENABLED:
+        response.headers.setdefault(
+            "Strict-Transport-Security",
+            "max-age=31536000; includeSubDomains",
+        )
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
     return response
 
 
@@ -443,6 +492,7 @@ app.include_router(branches_router, prefix="/api")
 app.include_router(findings_router, prefix="/api")
 app.include_router(auto_fix_router, prefix="/api")
 app.include_router(history_router, prefix="/api")
+app.include_router(build_router, prefix="/api")
 
 
 @app.get("/")

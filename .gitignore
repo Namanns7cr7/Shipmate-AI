@@ -155,3 +155,9 @@ design_handoff_shipmate_ui/
 
 # Ephemeral task/planning files
 tasks/
+
+# ShipMate runtime artifacts (sqlite state written at runtime, never committed)
+oauth_state.db
+*.sqlite
+shipmate_*.db
+coder_loop_state.json

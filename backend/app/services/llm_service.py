@@ -32,12 +32,14 @@ import asyncio
 import json
 import logging
 import os
+import re
+import threading
 from typing import Any, Dict, List, Optional, Type, TypeVar
 
 from pydantic import BaseModel, Field
 
 from app.schemas.agent_schemas import (
-    Blocker, GuardRailOutput, Milestone, PlanForgeOutput,
+    Blocker, GuardRailOutput, Milestone, Opportunity, PlanForgeOutput,
     SecurityFinding, Severity, SuggestedTest, TestPilotOutput,
 )
 
@@ -49,45 +51,38 @@ logger = logging.getLogger("shipmate.llm_service")
 # so subsequent enhance() calls cheaply short-circuit.
 _provider: Optional[Any] = None
 _provider_init_attempted = False
+# The agents run via asyncio.to_thread, so _get_provider() / _maybe_invalidate
+# can be entered from multiple worker THREADS concurrently. A plain
+# check-then-set on the module globals is a TOCTOU race that can construct the
+# provider (and its boto3/Azure client) twice. A threading.Lock — NOT an
+# asyncio.Lock, because these call sites are synchronous — serializes init and
+# invalidation. Double-checked locking keeps the hot path lock-free once the
+# provider is resolved.
+_provider_lock = threading.Lock()
 
 
 def _get_provider():
-    """Return an LLM provider singleton, or None if unavailable.
+    """Return the configured LLM provider singleton, or None if unavailable.
 
-    Priority:
-      LLM_PROVIDER=bedrock   → BedrockProvider (AWS Bedrock / Converse API)
-      LLM_PROVIDER=anthropic → AnthropicProvider (Anthropic API, needs ANTHROPIC_API_KEY)
-      unset / other          → enhancements disabled
-    """
+    Routed through the factory so SHIPMATE_LLM_PROVIDER selects Bedrock,
+    Azure OpenAI, or Anthropic. None-tolerant: any failure disables prose
+    enhancement gracefully; deterministic scores/verdicts are unaffected.
+
+    Thread-safe via double-checked locking."""
     global _provider, _provider_init_attempted
     if _provider_init_attempted:
         return _provider
-    _provider_init_attempted = True
-
-    kind = os.getenv("LLM_PROVIDER", "").lower()
-
-    if kind == "bedrock":
+    with _provider_lock:
+        if _provider_init_attempted:
+            return _provider
         try:
-            from app.services.bedrock_provider import BedrockProvider
-            _provider = BedrockProvider()
-            logger.info("LLMService: BedrockProvider ready")
+            from app.services.llm_provider import get_provider, provider_kind
+            _provider = get_provider()
+            logger.info("LLMService: %s provider ready", provider_kind())
         except Exception as e:
-            logger.warning("LLMService: BedrockProvider init failed (%s); enhancements disabled", e)
+            logger.warning("LLMService: provider init failed (%s); enhancements disabled", e)
             _provider = None
-
-    elif kind == "anthropic":
-        try:
-            from app.services.anthropic_provider import AnthropicProvider
-            _provider = AnthropicProvider()
-            logger.info("LLMService: AnthropicProvider ready")
-        except Exception as e:
-            logger.warning("LLMService: AnthropicProvider init failed (%s); enhancements disabled", e)
-            _provider = None
-
-    else:
-        logger.info("LLMService: LLM_PROVIDER=%r → enhancements disabled", kind or "(unset)")
-        _provider = None
-
+        _provider_init_attempted = True
     return _provider
 
 
@@ -116,8 +111,19 @@ def _maybe_invalidate_provider(err: BaseException) -> None:
             "analyze call should succeed.",
             type(err).__name__,
         )
-        _provider = None
-        _provider_init_attempted = False
+        # Reset under the same lock _get_provider uses, so an invalidation can't
+        # race a concurrent re-init into an inconsistent (attempted=True,
+        # provider=None-but-being-built) state.
+        with _provider_lock:
+            _provider = None
+            _provider_init_attempted = False
+        # Also drop the factory's cached singleton so the rebuild actually
+        # constructs a fresh client (the factory is what we now build through).
+        try:
+            from app.services.llm_provider import reset_provider
+            reset_provider()
+        except Exception:
+            pass
 
 
 # ── Per-agent enhancement schemas ────────────────────────────────────────────
@@ -287,13 +293,21 @@ _MERGERS = {
 class LLMService:
     """Static helpers that 3 agents call after their heuristic compute."""
 
-    _enabled: Optional[bool] = None
-
     @classmethod
     def is_available(cls) -> bool:
-        if cls._enabled is None:
-            cls._enabled = _get_provider() is not None
-        return cls._enabled
+        """Whether the LLM provider is currently constructible. Reflects the
+        LIVE provider state (not a one-time cache) so that after a transient
+        auth failure invalidates the provider — or after creds are refreshed —
+        the answer is current. _get_provider() does its own per-process caching,
+        so this stays cheap."""
+        return _get_provider() is not None
+
+    @classmethod
+    def provider(cls):
+        """The live LLM provider singleton (or None). Public accessor for
+        callers outside this module that need to pass the provider into a critic
+        pass (e.g. opportunity_critic.verify_opportunities). None-tolerant."""
+        return _get_provider()
 
     @classmethod
     def enhance(cls, agent_name: str, context: Dict[str, Any], base_output: T) -> T:
@@ -362,15 +376,40 @@ class LLMService:
             return base
 
         try:
-            code_blob = _repo_code_blob(context, max_files=5, max_chars_per_file=3500)
-            user = _user_prompt_plan_discovery(context, base, code_blob)
+            # Wider corpus + capability digest + journaled exclusions — same
+            # recurrence defenses the Opportunity (Build) path already has. The
+            # narrow 5-file blob + no digest is why milestones kept recurring in
+            # Reports→PlanForge: the model never saw what already exists and had
+            # no memory of what it proposed before.
+            code_blob = _repo_code_blob(
+                context, max_files=8, max_chars_per_file=3500,
+                prefer=("routes", "main", "api", "service", "agent",
+                        "orchestrator", "components", "pages", "hooks", "lib"),
+            )
+            capability_digest = _capability_digest(context)
+            exclude_titles = _journaled_milestone_titles(context)
+            user = _user_prompt_plan_discovery(
+                context, base, code_blob,
+                capability_digest=capability_digest, exclude_titles=exclude_titles,
+            )
             discovery = provider.invoke_structured_sync(
                 system_prompt=_DISCOVERY_PLAN_SYSTEM,
                 user_prompt=user,
                 schema_class=PlanForgeDiscovery,
                 deployment_hint="smart",  # discovery is the slow + smart pass
             )
-            return _merge_plan_discovery(base, discovery)
+            merged = _merge_plan_discovery(base, discovery)
+            # Suppress dismissed/shipped MILESTONES (the recurring ones the user
+            # sees) AND blockers. Both flow through the journal/actuate path.
+            # Distinct kinds so a milestone and a blocker with the same title get
+            # separate journal rows.
+            merged.milestones = cls._refine_findings(
+                merged.milestones, "milestone", context, code_blob, provider,
+            )
+            merged.blockers = cls._refine_findings(
+                merged.blockers, "blocker", context, code_blob, provider,
+            )
+            return merged
         except Exception as e:
             logger.warning("PlanForge discovery failed (%s); using base output", e)
             _maybe_invalidate_provider(e)
@@ -393,6 +432,11 @@ class LLMService:
                 "Refresh ADA + restart the backend to enable AI discovery.",
                 os.getenv("LLM_PROVIDER", "(unset)"),
             )
+            # Even with no LLM, still apply journal suppression (it's local +
+            # free) so dismissed findings don't recur in pure-heuristic mode.
+            base.findings = cls._refine_findings(
+                base.findings, "guardrail", context, "", None,
+            )
             return base
 
         try:
@@ -400,18 +444,48 @@ class LLMService:
                 context, max_files=6, max_chars_per_file=3500,
                 prefer=("auth", "cors", "main", "security", ".env", "config", "routes"),
             )
-            user = _user_prompt_guardrail_discovery(context, base, code_blob)
+            # Recurrence-aware (same as PlanForge/Opportunity discovery): tell the
+            # LLM what already exists (capability digest) and what's already
+            # shipped/dismissed (journaled guardrail+blocker titles) so it stops
+            # re-inventing fixed findings under new wording.
+            capability_digest = _capability_digest(context)
+            exclude_titles = _journaled_titles(context, ("guardrail::", "blocker::"))
+            user = _user_prompt_guardrail_discovery(
+                context, base, code_blob,
+                capability_digest=capability_digest, exclude_titles=exclude_titles,
+            )
             discovery = provider.invoke_structured_sync(
                 system_prompt=_DISCOVERY_GUARDRAIL_SYSTEM,
                 user_prompt=user,
                 schema_class=GuardRailDiscovery,
                 deployment_hint="smart",
             )
-            return _merge_guardrail_discovery(base, discovery)
+            merged = _merge_guardrail_discovery(base, discovery)
+            # Critic + journal suppression on the COMPLETE finding set (heuristic
+            # + LLM-discovered), judged against the same code_blob the agent saw.
+            merged.findings = cls._refine_findings(
+                merged.findings, "guardrail", context, code_blob, provider,
+            )
+            return merged
         except Exception as e:
             logger.warning("GuardRail discovery failed (%s); using base output", e)
             _maybe_invalidate_provider(e)
             return base
+
+    @staticmethod
+    def _refine_findings(findings, kind, context, code_blob, provider):
+        """Shared post-processing for a finding list: drop journal-suppressed
+        (dismissed/shipped) findings, then run the critic verifier against the
+        exact code that was analyzed. Both fail-open — a failure here returns
+        the findings unchanged rather than hiding anything."""
+        try:
+            from app.services import finding_critic as fc
+            repo_full = (context.get("repo_info") or {}).get("full_name", "") or ""
+            findings = fc.filter_suppressed(findings, kind, repo_full)
+            findings = fc.verify_findings(findings, code_blob, provider)
+        except Exception as e:  # pragma: no cover - defensive
+            logger.debug("_refine_findings failed (%s); keeping findings as-is", e)
+        return findings
 
     @classmethod
     def discover_testpilot(
@@ -449,6 +523,67 @@ class LLMService:
             logger.warning("TestPilot discovery failed (%s); using base output", e)
             _maybe_invalidate_provider(e)
             return base
+
+    # ── Opportunity discovery (Phase 1A — self-improvement work for the repo) ──
+
+    @staticmethod
+    def opportunity_code_blob(context: Dict[str, Any]) -> str:
+        """The exact code blob shown to the opportunity discoverer. Exposed so
+        the 1B critic (verify_opportunities) can judge against the SAME evidence
+        the discoverer saw — same contract as finding_critic using the agent's
+        code_blob."""
+        return _repo_code_blob(
+            context, max_files=8, max_chars_per_file=3500,
+            prefer=("routes", "main", "api", "service", "agent",
+                    "orchestrator", "components", "pages", "hooks", "lib"),
+        )
+
+    @classmethod
+    def discover_opportunities(
+        cls, context: Dict[str, Any], max_opportunities: int = 8,
+        *, exclude_titles: Optional[List[str]] = None,
+    ) -> List[Opportunity]:
+        """Read the repo's actual code and propose a BALANCED set of
+        self-improvement opportunities (features / improvements / tweaks / bugs),
+        each grounded in cited files. This is the PlanForge-enrichment pass
+        re-aimed at "what should we build next" rather than "what blocks
+        shipping". Returns raw (un-ranked, un-suppressed) Opportunity objects;
+        the OpportunityService applies the critic + ranker + journal join.
+
+        `exclude_titles`: opportunities already shipped/dismissed/in-flight (from
+        the journal) — fed to the prompt as DO-NOT-PROPOSE so the stateless model
+        stops re-surfacing them every run.
+
+        Fail-open: returns [] if the provider is unavailable (callers treat an
+        empty list as ai_enhanced=False, never as "repo is perfect")."""
+        provider = _get_provider()
+        if provider is None:
+            logger.warning(
+                "Opportunity discovery skipped: LLM provider unavailable "
+                "(LLM_PROVIDER=%r). Refresh ADA + restart the backend.",
+                os.getenv("LLM_PROVIDER", "(unset)"),
+            )
+            return []
+
+        try:
+            code_blob = cls.opportunity_code_blob(context)
+            capability_digest = _capability_digest(context)
+            user = _user_prompt_opportunity_discovery(
+                context, code_blob, max_opportunities,
+                capability_digest=capability_digest,
+                exclude_titles=exclude_titles or [],
+            )
+            discovery = provider.invoke_structured_sync(
+                system_prompt=_DISCOVERY_OPPORTUNITY_SYSTEM,
+                user_prompt=user,
+                schema_class=OpportunityDiscovery,
+                deployment_hint="smart",
+            )
+            return _coerce_opportunities(discovery, max_opportunities)
+        except Exception as e:
+            logger.warning("Opportunity discovery failed (%s); returning none", e)
+            _maybe_invalidate_provider(e)
+            return []
 
 
 # ─── Discovery — schemas ─────────────────────────────────────────────────────
@@ -522,6 +657,27 @@ class TestPilotDiscovery(BaseModel):
     missing_coverage_areas: List[str] = Field(
         default_factory=list,
         description="Up to 3 specific code regions (file path + function/concern) currently uncovered. e.g. 'backend/app/orchestrator/shipmate_orchestrator.py — RepoLens enrichment merge logic'.",
+    )
+
+
+class _DiscoveredOpportunity(BaseModel):
+    title: str = Field(..., description="Concise opportunity title — 4-9 words. e.g. 'Cache repo file tree across analyze runs'.")
+    category: str = Field(..., description="One of: feature, improvement, tweak, bug.")
+    description: str = Field(..., description="2-3 sentences: what this opportunity is, concretely, for THIS repo.")
+    impact: str = Field(..., description="One sentence: what measurably gets better (UX, perf, reliability, coverage) if shipped.")
+    effort: str = Field(..., description="Rough t-shirt size: one of S, M, L.")
+    estimated_days: int = Field(..., ge=1, le=21, description="Realistic effort in working days.")
+    target_files: List[str] = Field(default_factory=list, description="1-4 EXISTING file paths this work would touch. Use paths visible in the file tree / code shown.")
+    suggested_approach: List[str] = Field(default_factory=list, description="2-4 high-level steps (NOT a full plan). e.g. ['add an in-memory LRU keyed by repo+branch', 'invalidate on push webhook'].")
+    evidence: List[str] = Field(default_factory=list, description="1-3 SPECIFIC file paths or code constructs from the repo that prove this opportunity is real (e.g. 'backend/app/services/repo_analysis_service.py:_fetch_files — no caching').")
+    rationale: str = Field(..., description="WHY this matters for THIS repo, citing at least one real file/construct from the code shown.")
+
+
+class OpportunityDiscovery(BaseModel):
+    """LLM-discovered self-improvement opportunities, grounded in real code."""
+    opportunities: List[_DiscoveredOpportunity] = Field(
+        default_factory=list,
+        description="A BALANCED mix across feature/improvement/tweak/bug. Each MUST cite real files in evidence. Quality over quantity.",
     )
 
 
@@ -616,19 +772,23 @@ _DISCOVERY_PLAN_SYSTEM = (
     "  • CODE-QUALITY TWEAKS — refactors that reduce duplication or risk "
     "    (extract a shared client, type-narrow returns, replace magic strings).\n"
     "  • BUGS — concrete defects in the actual code paths.\n\n"
-    "Examples of GOOD discoveries (one per bucket — aim for this ratio):\n"
-    "  [FEATURE]      'no /api/repos/{repo}/history endpoint — store past "
-    "                  reports so the dashboard can show readiness over time'\n"
-    "  [IMPROVEMENT]  'analyze flow batches all 4 agents into one HTTP "
-    "                  response — stream per-agent results via SSE so the "
-    "                  AnalysisPage progress bar reflects real backend state'\n"
-    "  [TWEAK]        'api.ts duplicates the Authorization header in every "
-    "                  method — extract an axios client with default headers'\n"
-    "  [BUG]          'analyzer.py uses asyncio.gather without a timeout, "
-    "                  one slow agent can hang the whole request'\n"
-    "  [FEATURE]      'OAuth state is stored in-memory; persist to SQLite or "
-    "                  Redis so users don\\'t lose their session on uvicorn reload'\n\n"
+    "Examples of GOOD discoveries (SHAPE only — judge against THIS repo's code "
+    "AND the ALREADY-EXISTS lists in the user message; NEVER propose something "
+    "those lists show is done):\n"
+    "  [FEATURE]      'function/endpoint X in <file> has no batch variant — "
+    "                  callers loop one-at-a-time; add a bulk path'\n"
+    "  [IMPROVEMENT]  'handler Y in <file> retries on every error incl. 4xx — "
+    "                  only retry 5xx/timeout to stop hammering a failing dep'\n"
+    "  [TWEAK]        'two functions in <file> duplicate the same parse block — "
+    "                  extract a shared helper'\n"
+    "  [BUG]          'coro in <file> calls asyncio.gather without a timeout; "
+    "                  one slow task hangs the whole request'\n\n"
     "Examples of BAD discoveries (DO NOT EMIT):\n"
+    "  - ANYTHING in the ALREADY-EXISTS routes/modules lists given in the user "
+    "message (history endpoints, SSE streaming, axios client, OAuth-state "
+    "persistence, caching, provider factories, etc. may ALREADY be built — "
+    "CHECK the lists first).\n"
+    "  - anything in the DO-NOT-PROPOSE list (already shipped/dismissed/in-flight).\n"
     "  - 'add tests' / 'set up CI/CD' / 'write docs' / 'containerize' — already in heuristic base\n"
     "  - vague advice not tied to specific code\n"
     "  - duplicates of milestones already listed\n"
@@ -638,8 +798,8 @@ _DISCOVERY_PLAN_SYSTEM = (
     "'infra' for product-improvement tweaks, 'docs' only for genuine "
     "developer-facing gaps. Emit blockers ONLY for issues that genuinely "
     "BLOCK shipping (broken paths, severe gaps); features and tweaks should "
-    "be milestones, not blockers. Quality over quantity — fewer balanced "
-    "items beats five bug-only ones."
+    "be milestones, not blockers. Bias toward NOVELTY — fewer balanced, "
+    "not-already-done items beat five obvious ones."
 )
 
 _DISCOVERY_GUARDRAIL_SYSTEM = (
@@ -697,39 +857,115 @@ _DISCOVERY_TESTPILOT_SYSTEM = (
     "tests entirely — those are heuristic territory."
 )
 
+_DISCOVERY_OPPORTUNITY_SYSTEM = (
+    "You are a senior staff engineer and product-minded tech lead doing a "
+    "'what should we build next' review of a repo. You are given the file tree "
+    "and the contents of the most important files. Your job: propose concrete, "
+    "high-VALUE self-improvement opportunities that a coding agent could then "
+    "implement.\n\n"
+    "Produce a BALANCED mix across these four categories — do NOT emit only "
+    "bugs or only features:\n"
+    "  • feature      — a genuinely new capability the product is missing "
+    "(new endpoint, new page, new agent pass, integration, batch flow).\n"
+    "  • improvement  — make an EXISTING feature better (streaming where it "
+    "batches, persistence where it's in-memory, caching, retry/timeout, "
+    "smarter defaults, better error UX).\n"
+    "  • tweak        — a focused code-quality refactor that reduces real risk "
+    "or duplication (extract a shared client, type-narrow, kill magic strings).\n"
+    "  • bug          — a concrete defect in an actual code path you can point to.\n\n"
+    "Every opportunity MUST:\n"
+    "  1. Cite REAL files in `evidence` — paths that appear in the tree/code "
+    "shown. An opportunity with no real evidence is worthless; do not emit it.\n"
+    "  2. Name `target_files` that EXIST in the repo (the work would touch them).\n"
+    "  3. Have a `rationale` that quotes a specific construct/function/gap.\n"
+    "  4. Be IMPLEMENTABLE in <=21 days by one engineer — not a rewrite.\n\n"
+    "Examples of GOOD opportunities (SHAPE only — judge against THIS repo's "
+    "code and its ALREADY-EXISTS lists; never propose something the lists show "
+    "is done):\n"
+    "  [improvement] 'function X in <file> retries on every error including 4xx "
+    "client errors — only retry on 5xx/timeout to avoid hammering a failing "
+    "dependency.'\n"
+    "  [bug]         'handler Y in <file> catches Exception and returns 200, "
+    "masking real failures from the caller.'\n"
+    "  [tweak]       'two functions in <file> duplicate the same 15-line parse "
+    "block — extract a shared helper.'\n\n"
+    "Examples of BAD opportunities (DO NOT EMIT):\n"
+    "  - ANYTHING already present in the ALREADY-EXISTS routes/modules lists "
+    "given in the user message (caching, history endpoints, provider factories, "
+    "body sanitization, etc. may ALREADY be done — CHECK the lists first).\n"
+    "  - 'add tests' / 'set up CI/CD' / 'write docs' / 'containerize' — generic.\n"
+    "  - vague advice ('improve performance') with no file cited.\n"
+    "  - speculative rewrites or future architecture not justified by the code.\n"
+    "  - anything you cannot tie to a file in `evidence`.\n\n"
+    "Bias HARD toward grounding, NOVELTY, and value. Five sharply-grounded, "
+    "not-already-done opportunities beat ten obvious ones."
+)
+
 
 # ─── Discovery — user prompt builders ────────────────────────────────────────
 
 def _user_prompt_plan_discovery(
     context: Dict[str, Any], base: PlanForgeOutput, code_blob: str,
+    *, capability_digest: str = "", exclude_titles: Optional[List[str]] = None,
 ) -> str:
     base_titles = [m.title for m in base.milestones]
     base_blocker_titles = [b.title for b in base.blockers]
+    exclude_titles = exclude_titles or []
+    digest_block = f"\n\n# {capability_digest}" if capability_digest else ""
+    exclude_block = ""
+    if exclude_titles:
+        exclude_block = (
+            "\n\n# ALREADY SHIPPED / DISMISSED / IN-FLIGHT milestones — DO NOT "
+            "propose these again or anything overlapping them:\n"
+            + "\n".join(f"- {t}" for t in exclude_titles[:60])
+        )
     return (
-        f"# Repo summary\n{_repo_summary(context)}\n\n"
+        f"# Repo summary\n{_repo_summary(context)}"
+        f"{digest_block}"
+        f"{exclude_block}\n\n"
         f"# Heuristic milestones already covered (DO NOT duplicate)\n"
         + ("\n".join(f"- {t}" for t in base_titles) or "(none)")
         + f"\n\n# Heuristic blockers already covered (DO NOT duplicate)\n"
         + ("\n".join(f"- {t}" for t in base_blocker_titles) or "(none)")
         + f"\n\n# Repo code\n{code_blob[:18000]}\n\n"
         "Now emit up to 5 NEW milestones and up to 3 NEW blockers that the "
-        "heuristic missed. Each item MUST cite a specific file path or code "
-        "construct in its rationale. Skip anything generic. Return ONLY the "
+        "heuristic missed AND that are NOT in the ALREADY-EXISTS / DO-NOT-PROPOSE "
+        "lists above. Each item MUST cite a specific file path or code construct "
+        "in its rationale. Skip anything generic or already done. Return ONLY the "
         "PlanForgeDiscovery schema."
     )
 
 
 def _user_prompt_guardrail_discovery(
     context: Dict[str, Any], base: GuardRailOutput, code_blob: str,
+    *, capability_digest: str = "", exclude_titles: Optional[List[str]] = None,
 ) -> str:
     base_titles = [f.title for f in base.findings]
+    exclude_titles = exclude_titles or []
+    digest_block = f"\n\n# {capability_digest}" if capability_digest else ""
+    exclude_block = ""
+    if exclude_titles:
+        exclude_block = (
+            "\n\n# ALREADY SHIPPED / DISMISSED security findings — the control "
+            "these ask for is ALREADY PRESENT. DO NOT propose them again or "
+            "anything overlapping (e.g. don't re-flag 'token in query param' if "
+            "a header/session auth dependency already exists):\n"
+            + "\n".join(f"- {t}" for t in exclude_titles[:60])
+        )
     return (
-        f"# Repo summary\n{_repo_summary(context)}\n\n"
+        f"# Repo summary\n{_repo_summary(context)}"
+        f"{digest_block}"
+        f"{exclude_block}\n\n"
         f"# Heuristic findings already covered (DO NOT duplicate)\n"
         + ("\n".join(f"- {t}" for t in base_titles) or "(none)")
         + f"\n\n# Repo code\n{code_blob[:18000]}\n\n"
         "Read the code carefully. Emit up to 5 NEW findings the regex pass "
-        "missed. Cite the file + specific construct in each rationale. "
+        "missed AND that are NOT in the ALREADY-PRESENT / DO-NOT-PROPOSE lists "
+        "above. A finding is only valid if the control it demands is genuinely "
+        "ABSENT from the code shown — if the code already implements it (a "
+        "session/header auth dependency, a sqlite-backed state store, a "
+        "save_report call, a sanitiser, a security-headers middleware), DO NOT "
+        "emit it. Cite the file + specific construct in each rationale. "
         "Return ONLY the GuardRailDiscovery schema."
     )
 
@@ -751,6 +987,173 @@ def _user_prompt_testpilot_discovery(
         "a target_file and rationale citing a real construct in this repo. "
         "Also emit up to 3 missing_coverage_areas naming concrete code regions. "
         "Return ONLY the TestPilotDiscovery schema."
+    )
+
+
+def _capability_digest(context: Dict[str, Any]) -> str:
+    """A deterministic 'what this repo ALREADY does' digest, built from the full
+    corpus (every fetched file body + the tree). Two parts:
+      • ROUTES — every HTTP route declared via FastAPI/Flask decorators or an
+        axios/fetch call, so the model won't propose adding an endpoint that
+        exists.
+      • MODULES — notable service/agent/component file names, so the model won't
+        propose creating a file/capability that's already present.
+    This is the single biggest lever against recurrence: the model is stateless,
+    so we MUST tell it what's done. Cheap regex, no LLM."""
+    key_files: Dict[str, str] = context.get("key_files") or {}
+    file_tree: List[str] = context.get("file_tree") or []
+
+    routes: set = set()
+    # FastAPI/Flask: @router.get("/path") / @app.post('/path')
+    deco_re = re.compile(r"@\w+\.(?:get|post|put|patch|delete)\(\s*[\"']([^\"']+)[\"']", re.IGNORECASE)
+    # Frontend: gh.get('/path') / axios.post("/path") / fetch(`${BASE}/path`)
+    call_re = re.compile(r"\b(?:get|post|put|patch|delete)\(\s*[`\"']([^`\"']+)[`\"']", re.IGNORECASE)
+    for body in key_files.values():
+        if not body:
+            continue
+        for m in deco_re.finditer(body):
+            routes.add(m.group(1))
+        for m in call_re.finditer(body):
+            p = m.group(1)
+            if p.startswith("/") or "/api/" in p:
+                routes.add(p)
+
+    # Notable modules: service/agent/route/component file basenames from the tree.
+    mod_tokens = ("/services/", "/agents/", "/routes/", "/orchestrator/",
+                  "/components/", "/pages/", "/hooks/")
+    modules: set = set()
+    for p in file_tree:
+        lp = p.lower()
+        if any(t in lp for t in mod_tokens) and lp.endswith((".py", ".ts", ".tsx")):
+            modules.add(p.split("/")[-1])
+
+    route_list = sorted(r for r in routes if len(r) > 3)[:60]
+    mod_list = sorted(modules)[:80]
+    controls = _detect_security_controls(key_files, file_tree)
+    parts = []
+    if route_list:
+        parts.append("## Routes/endpoints that ALREADY EXIST (do NOT propose adding these)\n"
+                     + "\n".join(f"- {r}" for r in route_list))
+    if mod_list:
+        parts.append("## Service/agent/component modules that ALREADY EXIST "
+                     "(do NOT propose creating these)\n"
+                     + "\n".join(f"- {m}" for m in mod_list))
+    if controls:
+        parts.append("## Security controls ALREADY IMPLEMENTED — do NOT flag these "
+                     "as missing (the proof is in the codebase, even if it's in a "
+                     "file outside the snippet you were shown):\n"
+                     + "\n".join(f"- {c}" for c in controls))
+    return "\n\n".join(parts) if parts else "(no capability digest available)"
+
+
+# (human-readable control statement, regex proving it exists in the full corpus).
+# This is the generation-time fix for the GuardRail recurrence: the LLM only
+# sees ~6 files in its discovery blob, so a control whose proof lives elsewhere
+# (e.g. _consume_state in github_auth_service.py) looks "missing" to it. We scan
+# the WHOLE corpus deterministically and TELL the model the control exists, so
+# it never invents the finding — no matter how it would have phrased it.
+_SECURITY_CONTROL_PROOFS = (
+    ("OAuth `state` is validated server-side via a persistent (sqlite) single-use "
+     "store — CSRF state survives restarts, NOT in-memory-only",
+     re.compile(r"oauth_states|_consume_state|_store_state", re.IGNORECASE)),
+    ("GitHub tokens are vaulted server-side (session_store): the client holds an "
+     "opaque session id, never the raw token — no client-exposed token",
+     re.compile(r"session_store|shipmate_sess_|def mint\(", re.IGNORECASE)),
+    ("Auth credential is taken from the Authorization header only "
+     "(resolve_access_token) — NOT from a URL query parameter",
+     re.compile(r"resolve_access_token", re.IGNORECASE)),
+    ("Repo write-access is verified before any mutating GitHub call "
+     "(verify_repo_write_access)",
+     re.compile(r"verify_repo_write_access", re.IGNORECASE)),
+    ("Request bodies are sanitized for injection patterns by a middleware",
+     re.compile(r"sanitize_input_middleware|_contains_dangerous_pattern", re.IGNORECASE)),
+    ("CORS uses an explicit, validated origin allowlist (no wildcard with credentials)",
+     re.compile(r"_validate_origin|_is_origin_allowed", re.IGNORECASE)),
+    ("Security response headers (HSTS/X-Frame-Options/nosniff) are set by a middleware",
+     re.compile(r"security_headers_middleware|x-frame-options|strict-transport-security", re.IGNORECASE)),
+    ("Incoming GitHub webhooks are authenticated via HMAC signature verification",
+     re.compile(r"_verify_github_webhook_signature|x-hub-signature|hmac\.compare_digest", re.IGNORECASE)),
+    ("Analysis results are persisted to a sqlite store (report_store.save_report)",
+     re.compile(r"save_report\(|report_store\.", re.IGNORECASE)),
+)
+
+
+def _detect_security_controls(key_files: Dict[str, str], file_tree: List[str]) -> List[str]:
+    """Return plain-English statements for every security control whose proof is
+    present anywhere in the full corpus. Fed to the discovery digest so GuardRail
+    stops re-proposing already-implemented controls (the soft recurrence)."""
+    blob_parts: List[str] = list(file_tree or [])
+    blob_parts.extend(v for v in (key_files or {}).values() if v)
+    blob = "\n".join(blob_parts)
+    if not blob:
+        return []
+    return [statement for statement, proof in _SECURITY_CONTROL_PROOFS if proof.search(blob)]
+
+
+def _journaled_titles(context: Dict[str, Any], namespaces: tuple) -> List[str]:
+    """Titles already in the journal (dismissed / shipped / in_progress) for this
+    repo, restricted to the given signature `namespaces` (e.g. ('milestone::',)
+    or ('guardrail::', 'blocker::')). Fed to a discovery prompt as DO-NOT-PROPOSE
+    so the stateless LLM stops re-inventing shipped work under new wording.
+    Unlike filter_suppressed (which only HIDES dismissed/shipped from the visible
+    list), this also excludes in_progress so a finding with an open PR isn't
+    re-proposed mid-flight. Best-effort: [] on any error or missing repo."""
+    repo_full = (context.get("repo_info") or {}).get("full_name", "") or ""
+    if not repo_full:
+        return []
+    try:
+        from app.services import inflight_registry as ir
+        rows = ir.journal_list(repo_full_name=repo_full)
+        titles: List[str] = []
+        for r in rows:
+            sig = str(r.get("finding_sig", ""))
+            if not any(sig.startswith(ns) for ns in namespaces):
+                continue
+            parts = sig.split("::")
+            if len(parts) >= 2 and parts[1]:
+                titles.append(parts[1])
+        return titles
+    except Exception as e:  # pragma: no cover - defensive
+        logger.debug("_journaled_titles failed (%s)", e)
+        return []
+
+
+def _journaled_milestone_titles(context: Dict[str, Any]) -> List[str]:
+    """Milestone-namespace journaled titles (back-compat wrapper)."""
+    return _journaled_titles(context, ("milestone::",))
+
+
+def _user_prompt_opportunity_discovery(
+    context: Dict[str, Any], code_blob: str, max_opportunities: int,
+    *, capability_digest: str = "", exclude_titles: Optional[List[str]] = None,
+) -> str:
+    exclude_titles = exclude_titles or []
+    exclude_block = ""
+    if exclude_titles:
+        exclude_block = (
+            "\n\n# ALREADY PROPOSED / SHIPPED / DISMISSED — DO NOT propose any of "
+            "these again, or anything that overlaps them:\n"
+            + "\n".join(f"- {t}" for t in exclude_titles[:60])
+        )
+    digest_block = f"\n\n# {capability_digest}" if capability_digest else ""
+    return (
+        f"# Repo summary\n{_repo_summary(context)}"
+        f"{digest_block}"
+        f"{exclude_block}\n\n"
+        f"# Repo code\n{code_blob[:20000]}\n\n"
+        f"Propose up to {max_opportunities} self-improvement opportunities for "
+        "THIS repo, balanced across feature / improvement / tweak / bug. HARD "
+        "RULES:\n"
+        "  • Do NOT propose anything in the ALREADY-EXISTS lists above — if a "
+        "route or module is listed, that capability is DONE. Check before "
+        "proposing.\n"
+        "  • Do NOT propose anything overlapping the DO-NOT-PROPOSE list.\n"
+        "  • Every opportunity MUST cite real file paths in `evidence` and name "
+        "existing `target_files`.\n"
+        "  • Skip anything generic or not tied to a specific file.\n"
+        "Prefer DEEPER, less-obvious improvements (specific functions, edge "
+        "cases, perf hotspots, missing error handling) over broad scaffolding. "
+        "Return ONLY the OpportunityDiscovery schema."
     )
 
 
@@ -931,3 +1334,56 @@ def _merge_testpilot_discovery(
         "suggested_tests": list(base.suggested_tests) + new_tests,
         "missing_coverage_areas": list(base.missing_coverage_areas) + new_gaps,
     })
+
+
+# ─── Opportunity — coerce / sanitize ─────────────────────────────────────────
+
+_VALID_OPP_CATEGORY = {"feature", "improvement", "tweak", "bug"}
+_VALID_OPP_EFFORT = {"S", "M", "L"}
+
+
+def _coerce_opportunities(
+    disc: "OpportunityDiscovery", max_opportunities: int,
+) -> List[Opportunity]:
+    """Turn the LLM discovery payload into validated Opportunity objects.
+    Sanitizes enums, clamps numbers, assigns ids, dedups by normalized title.
+    Ranking/grounding/journal-join happen later in OpportunityService — this
+    only produces clean candidates. Malformed items are skipped, not fatal."""
+    out: List[Opportunity] = []
+    seen_titles: set = set()
+    next_id = 1
+    for d in (disc.opportunities or [])[: max_opportunities * 2]:  # room before dedup
+        title = (d.title or "").strip()
+        if not title:
+            continue
+        norm = _norm_title(title)
+        if norm in seen_titles:
+            continue
+        cat = (d.category or "").strip().lower()
+        if cat not in _VALID_OPP_CATEGORY:
+            cat = "improvement"
+        eff = (d.effort or "").strip().upper()
+        if eff not in _VALID_OPP_EFFORT:
+            eff = "M"
+        try:
+            out.append(Opportunity(
+                id=f"OPP-{next_id:03d}",
+                title=title[:120],
+                category=cat,
+                description=(d.description or "").strip(),
+                impact=(d.impact or "").strip(),
+                effort=eff,
+                estimated_days=max(1, min(21, d.estimated_days)),
+                target_files=[t.strip() for t in (d.target_files or []) if t.strip()][:4],
+                suggested_approach=[s.strip() for s in (d.suggested_approach or []) if s.strip()][:4],
+                evidence=[e.strip() for e in (d.evidence or []) if e.strip()][:3],
+                rationale=(d.rationale or "").strip()[:600],
+                source="discovery",
+            ))
+            seen_titles.add(norm)
+            next_id += 1
+        except Exception as e:
+            logger.warning("Skipping malformed discovered opportunity (%s)", e)
+        if len(out) >= max_opportunities:
+            break
+    return out

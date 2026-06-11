@@ -26,6 +26,7 @@ from typing import List, Optional
 from pydantic import BaseModel, Field
 
 from app.services.bedrock_provider import BedrockProvider
+from app.services.llm_provider import get_provider
 
 logger = logging.getLogger("shipmate.decomposer")
 
@@ -133,8 +134,10 @@ class Decomposer:
         self._provider = provider
 
     def _get_provider(self) -> BedrockProvider:
+        # Routed through the factory so SHIPMATE_LLM_PROVIDER=azure swaps in the
+        # AzureOpenAIProvider (same invoke_structured contract).
         if self._provider is None:
-            self._provider = BedrockProvider()
+            self._provider = get_provider()
         return self._provider
 
     def plan(

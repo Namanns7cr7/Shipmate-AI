@@ -27,6 +27,7 @@ from pydantic import BaseModel, Field
 
 import os
 from app.services.bedrock_provider import BedrockProvider
+from app.services.llm_provider import get_provider
 
 logger = logging.getLogger("shipmate.coder_agent")
 
@@ -277,14 +278,11 @@ class CoderAgent:
     def __init__(self, provider: Optional[BedrockProvider] = None) -> None:
         self._provider = provider
 
-    def _get_provider(self):
+    def _get_provider(self) -> BedrockProvider:
+        # Routed through the factory so SHIPMATE_LLM_PROVIDER selects Bedrock,
+        # Azure OpenAI, or Anthropic. Type hint stays BedrockProvider for back-compat.
         if self._provider is None:
-            kind = os.getenv("LLM_PROVIDER", "bedrock").lower()
-            if kind == "anthropic":
-                from app.services.anthropic_provider import AnthropicProvider
-                self._provider = AnthropicProvider()
-            else:
-                self._provider = BedrockProvider()
+            self._provider = get_provider()
         return self._provider
 
     def run(

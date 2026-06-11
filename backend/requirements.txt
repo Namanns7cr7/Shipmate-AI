@@ -7,3 +7,7 @@ aiofiles>=23.0.0
 python-multipart>=0.0.6
 anyio>=4.0.0
 anthropic>=0.40.0
+# Azure OpenAI provider (active when SHIPMATE_LLM_PROVIDER=azure).
+openai>=1.40,<2
+# Bedrock provider (SHIPMATE_LLM_PROVIDER=bedrock).
+boto3>=1.34,<2

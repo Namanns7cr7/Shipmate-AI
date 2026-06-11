@@ -191,6 +191,10 @@ export interface ShipMateReport {
   key_blockers: string[];
   next_actions: string[];
   generated_at: string;
+  /** False when the run degraded to pure heuristics (LLM provider
+   *  unavailable) — the UI shows a heuristic-only banner. Optional for
+   *  back-compat with older payloads. */
+  ai_enhanced?: boolean;
 }
 
 export interface AnalyzeResponse {
@@ -313,6 +317,86 @@ export interface ScorePoint {
   branch: string;
   recorded_at: string;
   breakdown: { repo?: number; delivery?: number; security?: number; test?: number };
+}
+
+// ── Opportunity Planner (Build tab) ─────────────────────────────────────────────
+
+export interface Opportunity {
+  id: string;
+  title: string;
+  category: 'feature' | 'improvement' | 'tweak' | 'bug' | string;
+  description: string;
+  impact: string;
+  effort: 'S' | 'M' | 'L' | string;
+  estimated_days: number;
+  target_files: string[];
+  suggested_approach: string[];
+  evidence: string[];
+  rationale: string;
+  value_score: number;
+  priority: 'critical' | 'high' | 'medium' | 'low' | string;
+  grounded: boolean;
+  worth_doing: boolean;
+  verify_reason?: string | null;
+  journal_state?: string | null;
+  source: string;
+}
+
+export interface BuildPlanResponse {
+  owner: string;
+  repo: string;
+  branch: string;
+  opportunities: Opportunity[];
+  total_found: number;
+  grounded_count: number;
+  verified_count: number;
+  ai_enhanced: boolean;
+  generated_at: string;
+}
+
+export interface BuildStep {
+  index: number;
+  title: string;
+  description: string;
+  target_files: string[];
+  depends_on: number[];
+  kind: string;
+  rationale: string;
+}
+
+export interface ExecutionPlan {
+  opportunity_id: string;
+  opportunity_title: string;
+  summary: string;
+  steps: BuildStep[];
+  estimated_days: number;
+  grounded: boolean;
+  notes: string[];
+}
+
+export interface PlanCritique {
+  approved: boolean;
+  coherent: boolean;
+  complete: boolean;
+  in_scope: boolean;
+  issues: string[];
+  reason: string;
+}
+
+export interface BuildExecuteResponse {
+  owner: string;
+  repo: string;
+  branch: string;
+  opportunity_id: string;
+  plan?: ExecutionPlan | null;
+  critique?: PlanCritique | null;
+  executed: boolean;
+  pr_url?: string | null;
+  files_changed: string[];
+  status: 'planned' | 'plan_rejected' | 'executed' | 'execute_failed' | 'degraded' | string;
+  summary: string;
+  ai_enhanced: boolean;
+  generated_at: string;
 }
 
 // ── App state ─────────────────────────────────────────────────────────────────

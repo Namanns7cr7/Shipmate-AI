@@ -1,5 +1,5 @@
 import { useState, useCallback, useEffect, useRef } from 'react';
-import { Zap, Bell, BookOpen, Clock, Sparkles } from 'lucide-react';
+import { Zap, Bell, Clock, Sparkles } from 'lucide-react';
 import { useGithubAuth } from './hooks/useGithubAuth';
 import { api } from './lib/api';
 import { LandingPage } from './components/landing/LandingPage';
@@ -7,12 +7,30 @@ import { AppSidebar } from './components/app/AppSidebar';
 import { DashboardPage } from './pages/DashboardPage';
 import { RepositoriesPage } from './pages/RepositoriesPage';
 import { AnalysisPage } from './pages/AnalysisPage';
+import { BuildPage } from './pages/BuildPage';
 import { ReportsPage } from './pages/ReportsPage';
 import { Spinner } from './components/ui/GitHubConnectButton';
 import { BranchPicker } from './components/ui/BranchPicker';
+import { RepoPicker } from './components/ui/RepoPicker';
 import { AutoFixDrawer } from './components/ui/AutoFixDrawer';
 import type { Page } from './components/app/AppSidebar';
+import type { LogLine } from './components/ui/LiveActivityLog';
 import type { AgentProgress, GitHubRepo, GitHubPR, ShipMateReport } from './types';
+
+// Pretty per-agent labels + tones for the live Activity Log (maps SSE
+// agent.done events to the LiveActivityLog line shape).
+const AGENT_LOG_META: Record<string, { label: string; tone: string }> = {
+  repo_lens:  { label: 'RepoLens',  tone: 'emerald' },
+  plan_forge: { label: 'PlanForge', tone: 'purple'  },
+  guardrail:  { label: 'GuardRail', tone: 'amber'   },
+  testpilot:  { label: 'TestPilot', tone: 'cyan'    },
+};
+
+function _nowHMS(): string {
+  const d = new Date();
+  return [d.getHours(), d.getMinutes(), d.getSeconds()]
+    .map(n => String(n).padStart(2, '0')).join(':');
+}
 
 const INITIAL_AGENTS: AgentProgress[] = [
   { id: 'repo_lens',  label: 'RepoLens',  icon: '🔍', status: 'idle', description: 'Repo structure, tech stack & architecture risks' },
@@ -123,11 +141,20 @@ function useAgentSimulation(analyzing: boolean) {
     setOverallPct(100);
   }
 
+  // Snap a single agent to complete when its REAL SSE agent.done event fires,
+  // keeping the progress bars in sync with the live Activity Log instead of the
+  // fixed 32s timer. The ticker still drives smooth in-between motion and the
+  // overall %; real completion events are authoritative for per-agent state.
+  function markAgentComplete(id: AgentProgress['id']) {
+    setAgents(prev => prev.map(a => a.id === id ? { ...a, status: 'complete' } : a));
+    setProgressByAgent(prev => ({ ...prev, [id]: 100 }));
+  }
+
   function markAllError() {
     setAgents(prev => prev.map(a => ({ ...a, status: a.status === 'running' ? 'error' : a.status })));
   }
 
-  return { agents, progressByAgent, overallPct, markAllComplete, markAllError };
+  return { agents, progressByAgent, overallPct, markAllComplete, markAgentComplete, markAllError };
 }
 
 export default function App() {
@@ -142,8 +169,10 @@ export default function App() {
   const [report, setReport]                 = useState<ShipMateReport | null>(null);
   const [analyzing, setAnalyzing]           = useState(false);
   const [autoFixOpen, setAutoFixOpen]       = useState(false);
+  // Real per-agent activity-log lines from the SSE stream (empty until events arrive).
+  const [liveLines, setLiveLines]           = useState<LogLine[]>([]);
 
-  const { agents, progressByAgent, overallPct, markAllComplete, markAllError } = useAgentSimulation(analyzing);
+  const { agents, progressByAgent, overallPct, markAllComplete, markAgentComplete, markAllError } = useAgentSimulation(analyzing);
 
   useEffect(() => {
     if (!auth.isAuthenticated || !auth.accessToken) return;
@@ -171,26 +200,57 @@ export default function App() {
 
     setAnalyzing(true);
     setReport(null);
+    setLiveLines([]);
     setPage('analysis');
 
     const [owner, repoName] = target.full_name.split('/');
+    const params = {
+      owner, repo: repoName,
+      branch: selectedBranch,
+      access_token: auth.accessToken,
+      pr_number: selectedPull?.number,
+    };
+
+    const pushLine = (line: LogLine) => setLiveLines(prev => [...prev, line]);
+
     try {
-      const res = await api.analyze({
-        owner, repo: repoName,
-        branch: selectedBranch,
-        access_token: auth.accessToken,
-        pr_number: selectedPull?.number,
+      pushLine({ agent: 'system', text: `Cloning ${target.full_name} @ ${selectedBranch}…`, tone: 'slate', time: _nowHMS() });
+      // Stream per-agent results so the Activity Log fills live. The final
+      // report.done event carries the assembled report.
+      const finalReport = await api.streamAnalyze(params, (evt) => {
+        if (evt.event === 'agent.done' && evt.agent) {
+          const meta = AGENT_LOG_META[evt.agent] ?? { label: evt.agent, tone: 'slate' };
+          pushLine({ agent: meta.label, text: 'analysis complete ✓', tone: meta.tone, time: _nowHMS() });
+          // Snap this agent's progress bar to complete — keeps bars in sync
+          // with the log (issue: bars were on a fixed timer, decoupled).
+          markAgentComplete(evt.agent as AgentProgress['id']);
+        } else if (evt.event === 'report.done') {
+          pushLine({ agent: 'system', text: '✓ Readiness score computed — shipping report', tone: 'emerald', time: _nowHMS() });
+        } else if (evt.event === 'error') {
+          pushLine({ agent: 'system', text: `⚠ ${evt.detail ?? 'analysis error'}`, tone: 'red', time: _nowHMS() });
+        }
       });
+      if (!finalReport) throw new Error('stream ended without a report');
       markAllComplete();
-      setReport(res.report);
+      setReport(finalReport as ShipMateReport);
       setAnalyzing(false);
       setPage('reports');
     } catch {
-      markAllError();
-      setAnalyzing(false);
-      setPage('repos');
+      // Fall back to the batch endpoint if streaming isn't available (older
+      // backend / proxy buffering). Same result, just no live progress.
+      try {
+        const res = await api.analyze(params);
+        markAllComplete();
+        setReport(res.report);
+        setAnalyzing(false);
+        setPage('reports');
+      } catch {
+        markAllError();
+        setAnalyzing(false);
+        setPage('repos');
+      }
     }
-  }, [selectedRepo, selectedBranch, selectedPull, auth.accessToken, markAllComplete, markAllError, handleSelectRepo]);
+  }, [selectedRepo, selectedBranch, selectedPull, auth.accessToken, markAllComplete, markAgentComplete, markAllError, handleSelectRepo]);
 
   if (!auth.isAuthenticated) {
     return <LandingPage onLogin={auth.login} loading={auth.loading} error={auth.error} />;
@@ -232,9 +292,16 @@ export default function App() {
             </div>
             <span style={{ width: 1, height: 18, background: 'var(--line-2)' }} />
             <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              {repos.length > 0 && (
+                <RepoPicker
+                  repos={repos}
+                  selected={selectedRepo}
+                  onSelect={r => { handleSelectRepo(r); }}
+                  disabled={analyzing}
+                />
+              )}
               {selectedRepo && (
                 <>
-                  <span className="mono chip tone-slate"><BookOpen size={12} /> {selectedRepo.name}</span>
                   <BranchPicker
                     repoFullName={selectedRepo.full_name}
                     defaultBranch={selectedRepo.default_branch}
@@ -307,7 +374,15 @@ export default function App() {
             selectedPull={selectedPull} agents={agents}
             progressByAgent={progressByAgent}
             overallPct={overallPct}
+            liveLines={liveLines}
             onCancel={() => { setAnalyzing(false); setPage('repos'); }}
+          />
+        )}
+        {activePage === 'build' && (
+          <BuildPage
+            selectedRepo={selectedRepo}
+            selectedBranch={selectedBranch}
+            accessToken={auth.accessToken}
           />
         )}
         {activePage === 'reports' && report && (

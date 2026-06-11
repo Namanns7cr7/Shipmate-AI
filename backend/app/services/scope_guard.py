@@ -88,6 +88,14 @@ _IGNORABLE_NAMES = {"_", "__all__"}
 _MASS_DELETE_FRACTION = 0.40
 _MASS_DELETE_MIN_LINES = 30
 
+# Mass-DROP of module-level defs: even with declared removal intent, dropping
+# this many top-level definitions (or this fraction of the file's API) is too
+# large to be an incidental cleanup, so the guard still fires. Closes the
+# self-exempt hole where one "refactor" keyword in the Coder-authored rationale
+# waived the check entirely. Either condition trips.
+_MASS_DROP_MIN_DEFS = 8
+_MASS_DROP_FRACTION = 0.50
+
 
 def _is_protected_nonpy(path: str) -> bool:
     low = path.lower()
@@ -155,16 +163,38 @@ def check_file(
     removal_ok = bool(_REMOVAL_INTENT_RE.search(intent_text))
 
     if path.endswith(".py"):
-        if removal_ok:
-            return []  # Coder declared a cleanup/refactor — trust + let pytest gate verify
         before = _module_level_names(original)
         after = _module_level_names(new_content)
         if before is None or after is None:
             return []  # un-parseable on either side — defer to ast_lint / smoke
         dropped = sorted(before - after)
         if dropped:
+            # Removal-intent relaxes the guard for SMALL, declared cleanups, but
+            # does NOT waive a mass-deletion: the Coder controls the rationale
+            # text, so a single "refactor" keyword must not be a blank cheque to
+            # drop the whole file's API. Above the threshold we reject even with
+            # declared intent (the drop is too large to be incidental).
+            # Mass-drop requires a meaningful ABSOLUTE count AND a large
+            # fraction — mirrors _MASS_DELETE so tiny files (drop 1 of 2 defs)
+            # and small declared cleanups never false-fire, while a "refactor"
+            # that guts most of a real module still trips.
+            frac = len(dropped) / len(before) if before else 0.0
+            mass_drop = (
+                len(dropped) >= _MASS_DROP_MIN_DEFS
+                and frac >= _MASS_DROP_FRACTION
+            )
+            if removal_ok and not mass_drop:
+                return []  # small declared cleanup — trust + let pytest gate verify
             shown = ", ".join(dropped[:8])
             more = f" (+{len(dropped) - 8} more)" if len(dropped) > 8 else ""
+            if removal_ok and mass_drop:
+                return [
+                    f"{path}: rewrite DROPS {len(dropped)} top-level definition(s) "
+                    f"({shown}{more}) — too many to be an incidental cleanup even "
+                    f"with stated removal intent. Split into a focused patch that "
+                    f"preserves the untouched API, or remove symbols explicitly one "
+                    f"at a time."
+                ]
             return [
                 f"{path}: whole-file rewrite DROPS {len(dropped)} pre-existing "
                 f"top-level definition(s): {shown}{more}. If this removal is "

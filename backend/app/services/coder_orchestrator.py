@@ -24,7 +24,11 @@ import logging
 import os
 import re
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import Awaitable, Callable, Dict, List, Optional, Tuple
+
+# Optional progress sink: an async callback the streaming route passes in to
+# receive per-phase events. None (the default) ⇒ the batch path, unchanged.
+EventSink = Optional[Callable[[dict], Awaitable[None]]]
 
 from app.agents.coder_agent import CoderAgent, CoderBrief, CoderFile, CoderOutput
 from app.schemas.api_schemas import (
@@ -46,6 +50,10 @@ logger = logging.getLogger("shipmate.coder_orchestrator")
 # so the gate is a no-op there. Controlled by env so CI / hosted deploys
 # can disable it.
 _PYTEST_GATE_ENABLED = os.getenv("SHIPMATE_PYTEST_GATE", "1") == "1"
+
+# Hard ceiling on the parallel file-content fetch so a hung GitHub connection
+# can't pin the actuate worker thread indefinitely (the gather had no timeout).
+_FETCH_TIMEOUT_S = float(os.getenv("SHIPMATE_FETCH_TIMEOUT_S", "45"))
 
 # The repo this backend checkout corresponds to. The pytest gate only fires
 # when the actuate target matches — otherwise we'd be running ShipMate's own
@@ -272,7 +280,21 @@ async def _fetch_current_contents(
                 logger.warning("Could not fetch %s: %s — treating as new file", path, e)
                 return path, ""
 
-    pairs = await asyncio.gather(*[fetch(p) for p in paths])
+    # Overall timeout guard: without it a single hung GitHub connection pins this
+    # gather (and the worker thread behind the actuate call) indefinitely. On
+    # timeout we degrade to empty contents — Coder treats missing files as
+    # new-file creations, same as the per-file except above.
+    try:
+        pairs = await asyncio.wait_for(
+            asyncio.gather(*[fetch(p) for p in paths]),
+            timeout=_FETCH_TIMEOUT_S,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "fetch_current_contents timed out after %ss for %s/%s (%d paths) — "
+            "proceeding with empty contents", _FETCH_TIMEOUT_S, owner, repo, len(paths),
+        )
+        return {p: "" for p in paths}
     return {p: c for p, c in pairs}
 
 
@@ -415,6 +437,17 @@ _NEW_TEST_THEATER_PATTERNS = (
     re.compile(r"^\s*assert\s+True\s*$", re.MULTILINE),
 )
 
+# Dynamic-execution sinks the inbound sanitize middleware blocks. We reject a
+# patch that INTRODUCES one (vs the original). The negative-lookbehind avoids
+# matching method calls like `ast.literal_eval(` / `self.exec(`.
+_CODER_INJECTION_PATTERNS = (
+    re.compile(r"(?<![\w.])eval\s*\("),
+    re.compile(r"(?<![\w.])exec\s*\("),
+    re.compile(r"(?<![\w.])__import__\s*\("),
+    re.compile(r"\bos\.system\s*\("),
+    re.compile(r"\bsubprocess\.(?:call|run|Popen)\s*\([^)]*shell\s*=\s*True"),
+)
+
 
 def _looks_like_test_path(path: str) -> bool:
     name = path.rsplit("/", 1)[-1]
@@ -487,6 +520,20 @@ def _lint_coder_output(
                 f"{cf.path}: .gitkeep inside an ignored/build directory "
                 "(theater pattern — preserves a dir the patch claims to remove)"
             )
+
+        # Back-door symmetry: the Coder must not INTRODUCE a dynamic-execution
+        # sink that the inbound sanitize middleware blocks. Flag a real
+        # eval/exec/__import__ CALL the patch ADDS that wasn't in the original
+        # (pre-existing ones aren't this patch's fault). Closes the asymmetry
+        # where the front door rejects eval( but our own generator could write it.
+        if cf.path.endswith(".py"):
+            for pat in _CODER_INJECTION_PATTERNS:
+                if pat.search(cf.new_content) and not pat.search(original):
+                    issues.append(
+                        f"{cf.path}: patch introduces a dynamic-execution call "
+                        f"(`{pat.pattern}`) not present in the original — the same "
+                        "pattern the inbound sanitizer blocks. Use a safe alternative."
+                    )
     return issues
 
 
@@ -604,11 +651,30 @@ class CoderOrchestrator:
         )
 
     @classmethod
-    async def run_actuation(cls, req: ActuateRequest) -> ActuateResponse:
+    async def run_actuation(
+        cls, req: ActuateRequest, on_event: EventSink = None,
+    ) -> ActuateResponse:
+        """Run the full actuate pipeline. When `on_event` is supplied (by the
+        SSE route), it's awaited at each phase boundary with a small dict so the
+        UI sees live progress; otherwise this is the unchanged batch path. The
+        SAME gates (lint → scope → pytest → resolution → PR) run in both modes —
+        streaming is purely observational, never a second code path."""
         ctx = req.context or RepoLensSummary()
         branch_name = _branch_name(req.finding)
 
+        async def _emit(stage: str, **fields) -> None:
+            if on_event is None:
+                return
+            try:
+                await on_event({"event": stage, **fields})
+            except Exception as e:  # never let a slow/broken client break actuate
+                logger.debug("on_event(%s) raised %s; continuing", stage, e)
+
+        await _emit("actuate.start", finding_id=req.finding.id,
+                    kind=req.finding.kind, title=req.finding.title)
+
         # 1. Get the file tree once so target resolution can probe it.
+        await _emit("resolve.start")
         try:
             file_tree = await GitHubAPIService.get_file_tree(
                 req.access_token, req.owner, req.repo, req.branch,
@@ -629,8 +695,10 @@ class CoderOrchestrator:
             req.access_token, req.owner, req.repo, target_paths,
             ref=req.branch,
         )
+        await _emit("resolve.done", paths=target_paths)
 
         # 3. Run Coder (sync, on a worker thread).
+        await _emit("coding.start", paths=target_paths)
         brief = CoderBrief(
             task=_build_task(req.finding),
             repo_full_name=f"{req.owner}/{req.repo}",
@@ -652,9 +720,11 @@ class CoderOrchestrator:
             coder_out = await asyncio.to_thread(
                 agent.run, brief, _deployment_hint(req.finding), _mode,
             )
+        await _emit("coding.done", files=[cf.path for cf in coder_out.files])
 
         if not coder_out.files:
             # Coder decided no change is needed (or skipped everything).
+            await _emit("done", status="no_change", pr_url=None)
             return ActuateResponse(
                 status="no_change",
                 pr_url=None,
@@ -668,6 +738,7 @@ class CoderOrchestrator:
         # This is the second line of defense after the system prompt — if Coder
         # invents imports despite rule #1, we catch it here and return a clean
         # error instead of opening a bogus PR.
+        await _emit("gate.start", phase="lint")
         lint_issues = _lint_coder_output(coder_out, target_files, file_tree)
         if lint_issues:
             # One auto-retry with the issues fed back to Coder before giving
@@ -693,6 +764,7 @@ class CoderOrchestrator:
                 "Coder output still rejected after lint-feedback retry for %s/%s: %s",
                 req.finding.kind, req.finding.id, lint_issues,
             )
+            await _emit("done", status="lint_rejected", pr_url=None)
             return ActuateResponse(
                 status="lint_rejected",
                 pr_url=None,
@@ -721,6 +793,7 @@ class CoderOrchestrator:
                     holder = ir.get_path_claim(repo_full, req.branch, cf.path)
                     held_by = (holder or {}).get("claimed_by", "another actuate")
                     logger.info("path_busy: %s held by %s", cf.path, held_by)
+                    await _emit("done", status="path_busy", pr_url=None)
                     return ActuateResponse(
                         status="path_busy",
                         pr_url=None,
@@ -745,12 +818,38 @@ class CoderOrchestrator:
                  "rationale": cf.rationale}
                 for cf in coder_out.files
             ]
+            await _emit("gate.start", phase="scope")
             scope_issues = sg.check_patch(serialized, target_files, coder_out.summary)
             if scope_issues:
+                # One auto-retry feeding the scope violations back to the Coder
+                # before giving up — same rationale as the lint-feedback retry:
+                # a whole-file rewrite that dropped an untested def is often
+                # fixed when the model is told exactly which lines it must
+                # preserve, cheaper than a wasted human round-trip. (Previously
+                # only lint failures got a retry; scope failures hard-rejected.)
                 logger.warning(
-                    "scope guard rejected %s/%s: %s",
+                    "scope guard rejected %s/%s: %s — retrying once with feedback",
                     req.finding.kind, req.finding.id, "; ".join(scope_issues),
                 )
+                try:
+                    coder_out = await asyncio.to_thread(
+                        agent.run_with_lint_feedback, brief, scope_issues,
+                        _deployment_hint(req.finding),
+                    )
+                    serialized = [
+                        {"path": cf.path, "new_content": cf.new_content,
+                         "rationale": cf.rationale}
+                        for cf in coder_out.files
+                    ]
+                    scope_issues = sg.check_patch(serialized, target_files, coder_out.summary)
+                except Exception as e:
+                    logger.warning("scope-feedback retry raised %s; keeping first output", e)
+            if scope_issues:
+                logger.warning(
+                    "scope guard still rejected %s/%s after feedback retry: %s",
+                    req.finding.kind, req.finding.id, "; ".join(scope_issues),
+                )
+                await _emit("done", status="scope_rejected", pr_url=None)
                 return ActuateResponse(
                     status="scope_rejected",
                     pr_url=None,
@@ -772,13 +871,43 @@ class CoderOrchestrator:
             gate_ran = False
             if _PYTEST_GATE_ENABLED and repo_full == _SELF_REPO:
                 gate_ran = True
+                await _emit("gate.start", phase="pytest")
                 result, snap = await asyncio.to_thread(vg.gate_patch, serialized)
                 if not result.passed:
                     await asyncio.to_thread(vg.restore_snapshot, snap)
+                    # Feed the actual test failure back to the Coder and retry
+                    # once — a regression is often a one-line miss the model
+                    # fixes when shown which tests broke (previously the pytest
+                    # gate hard-rejected with no retry).
                     logger.warning(
-                        "pytest gate rejected %s/%s: %s",
+                        "pytest gate rejected %s/%s: %s — retrying once with feedback",
                         req.finding.kind, req.finding.id, result.reason,
                     )
+                    try:
+                        coder_out = await asyncio.to_thread(
+                            agent.run_with_lint_feedback, brief,
+                            [f"Your patch broke the test suite: {result.reason}. "
+                             "Fix the regression while still addressing the finding."],
+                            _deployment_hint(req.finding),
+                        )
+                        serialized = [
+                            {"path": cf.path, "new_content": cf.new_content,
+                             "rationale": cf.rationale}
+                            for cf in coder_out.files
+                        ]
+                        # Re-lint + re-scope the retry output before re-gating.
+                        if _lint_coder_output(coder_out, target_files, file_tree) or \
+                                sg.check_patch(serialized, target_files, coder_out.summary):
+                            result, snap = (result, snap)  # keep failed result
+                        else:
+                            result, snap = await asyncio.to_thread(vg.gate_patch, serialized)
+                            if result.passed:
+                                await asyncio.to_thread(vg.restore_snapshot, snap)
+                    except Exception as e:
+                        logger.warning("pytest-feedback retry raised %s; keeping rejection", e)
+                if not result.passed:
+                    await asyncio.to_thread(vg.restore_snapshot, snap)
+                    await _emit("done", status="pytest_rejected", pr_url=None)
                     return ActuateResponse(
                         status="pytest_rejected",
                         pr_url=None,
@@ -786,9 +915,9 @@ class CoderOrchestrator:
                         files_changed=[],
                         skipped=[cf.path for cf in coder_out.files],
                         summary=(
-                            f"Patch passed lint but failed the local pytest gate: "
-                            f"{result.reason}. The working tree was restored and no "
-                            f"PR was created. Coder summary: {coder_out.summary[:200]}"
+                            f"Patch failed the local pytest gate (incl. one feedback "
+                            f"retry): {result.reason}. The working tree was restored "
+                            f"and no PR was created. Coder summary: {coder_out.summary[:200]}"
                         ),
                     )
                 # Gate passed — restore the tree (GitHub commit is the source of
@@ -801,7 +930,72 @@ class CoderOrchestrator:
                     req.finding.kind, req.finding.id, result.before, result.after,
                 )
 
+            # 3d-ii. TARGET-REPO gate — for repos that AREN'T ShipMate's own
+            # checkout. Clones the user's repo, applies the patch, runs THEIR
+            # test command in a sandboxed subprocess. OFF by default
+            # (SHIPMATE_TARGET_REPO_GATE=1) because it runs untrusted code.
+            # Without it, "Build It" on an external repo opens PRs with zero
+            # local validation — this closes that gap when explicitly enabled.
+            elif vg.target_repo_gate_enabled() and repo_full != _SELF_REPO:
+                gate_ran = True
+                await _emit("gate.start", phase="target-pytest")
+                tgt = await asyncio.to_thread(
+                    vg.gate_patch_target_repo,
+                    req.owner, req.repo, req.branch, serialized, req.access_token,
+                )
+                if not tgt.passed:
+                    await _emit("done", status="pytest_rejected", pr_url=None)
+                    return ActuateResponse(
+                        status="pytest_rejected",
+                        pr_url=None,
+                        branch_name=branch_name,
+                        files_changed=[],
+                        skipped=[cf.path for cf in coder_out.files],
+                        summary=(
+                            f"Patch failed the target-repo test gate: {tgt.reason}. "
+                            f"No PR was created. Coder summary: {coder_out.summary[:200]}"
+                        ),
+                    )
+                logger.info(
+                    "target-repo gate passed for %s/%s (%df failing)",
+                    req.owner, req.repo, tgt.failed,
+                )
+
+            # 3e. Fix-resolution check — for detectable finding categories, the
+            # patch must actually REMOVE the offending pattern. 'shipped' should
+            # mean the issue is gone, not merely that tests still pass. A patch
+            # that leaves the pattern in place is rejected (resolution_failed)
+            # rather than opening a PR that doesn't fix anything. None/unknown
+            # categories fall through to the test/lint gate (fail-open).
+            try:
+                from app.services import finding_critic as fc
+                resolved = fc.is_finding_resolved(
+                    getattr(req.finding, "category", "") or req.finding.kind,
+                    [cf.new_content for cf in coder_out.files],
+                )
+            except Exception:
+                resolved = None
+            if resolved is False:
+                logger.warning(
+                    "resolution check FAILED for %s/%s: offending pattern still present",
+                    req.finding.kind, req.finding.id,
+                )
+                await _emit("done", status="resolution_failed", pr_url=None)
+                return ActuateResponse(
+                    status="resolution_failed",
+                    pr_url=None,
+                    branch_name=branch_name,
+                    files_changed=[],
+                    skipped=[cf.path for cf in coder_out.files],
+                    summary=(
+                        "Patch passed lint/tests but did NOT remove the issue it "
+                        "targets (the offending pattern is still present), so no PR "
+                        f"was opened. Coder summary: {coder_out.summary[:200]}"
+                    ),
+                )
+
             # 4. Create the branch.
+            await _emit("branch.start", branch=branch_name)
             base_sha = await GitHubPRService.get_branch_sha(
                 req.access_token, req.owner, req.repo, req.branch,
             )
@@ -838,11 +1032,13 @@ class CoderOrchestrator:
                         ) from e
                     raise
                 committed.append(ActuatedFile(path=cf.path, rationale=cf.rationale))
+            await _emit("commit.done", files=[c.path for c in committed])
 
             # 6. Open PR (optional).
             pr_url: Optional[str] = None
             pr_number: Optional[int] = None
             if req.open_pr:
+                await _emit("pr.start")
                 pr_url, pr_number = await GitHubPRService.create_pull_request(
                     req.access_token,
                     req.owner,
@@ -883,6 +1079,8 @@ class CoderOrchestrator:
                 except Exception as e:
                     logger.debug("journal_set_state failed (non-fatal): %s", e)
 
+            await _emit("done", status="complete", pr_url=pr_url,
+                        files=[c.path for c in committed])
             return ActuateResponse(
                 status="complete",
                 pr_url=pr_url,
