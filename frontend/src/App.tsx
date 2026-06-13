@@ -440,6 +440,7 @@ export default function App() {
             progressByAgent={progressByAgent}
             overallPct={overallPct}
             liveLines={liveLines}
+            isMobile={isMobile}
             onCancel={() => { setAnalyzing(false); setPage('repos'); }}
           />
         )}

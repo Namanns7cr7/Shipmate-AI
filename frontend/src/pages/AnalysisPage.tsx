@@ -10,8 +10,8 @@ import type { LogLine } from '../components/ui/LiveActivityLog';
 import type { GitHubRepo, GitHubPR, AgentProgress } from '../types';
 
 /* ---------- Pipeline Radar ---------- */
-function PipelineRadar({ statuses }: { statuses: string[] }) {
-  const size = 300, c = size / 2, R = 110;
+function PipelineRadar({ statuses, size = 300 }: { statuses: string[]; size?: number }) {
+  const c = size / 2, R = size * 0.367;
   const positions = AGENTS.map((_, i) => {
     const ang = (-90 + i * 90) * Math.PI / 180;
     return { x: c + R * Math.cos(ang), y: c + R * Math.sin(ang) };
@@ -148,17 +148,14 @@ interface Props {
   selectedBranch: string;
   selectedPull: GitHubPR | null;
   agents: AgentProgress[];
-  /** 0..100 per agent id — matches the time-driven simulation in App.tsx. */
   progressByAgent?: Record<AgentProgress['id'], number>;
-  /** 0..100 overall, capped at 95 until API resolves. */
   overallPct?: number;
-  /** Real per-agent log lines from the SSE stream. When non-empty, these
-   *  replace the scripted simulation so the Activity Log shows live events. */
   liveLines?: LogLine[];
+  isMobile?: boolean;
   onCancel: () => void;
 }
 
-export function AnalysisPage({ selectedRepo, selectedBranch, agents, progressByAgent, overallPct, liveLines, onCancel }: Props) {
+export function AnalysisPage({ selectedRepo, selectedBranch, agents, progressByAgent, overallPct, liveLines, isMobile = false, onCancel }: Props) {
   // Use the real SSE-driven lines when present; fall back to the scripted
   // simulation only when no live lines have arrived yet (e.g. batch mode).
   const scriptedLogs = useActivityLog(!liveLines || liveLines.length === 0);
@@ -180,30 +177,30 @@ export function AnalysisPage({ selectedRepo, selectedBranch, agents, progressByA
     <motion.div initial={{ opacity: 0, y: 14 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.55, ease: [0.2,0.7,0.2,1] }}
       className="page-content" style={{ padding: 'var(--page-py) var(--page-px)', maxWidth: 1180, margin: '0 auto', width: '100%' }}>
       {/* Header */}
-      <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', flexWrap: 'wrap', gap: 12, marginBottom: 22 }}>
-        <div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-            <h1 style={{ fontSize: 25, fontWeight: 840, margin: 0, letterSpacing: '-0.025em', color: '#fff' }}>
-              {overall >= 100 ? 'Analysis Complete' : 'Analysis in Progress'}
+      <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', flexWrap: 'wrap', gap: 10, marginBottom: 22 }}>
+        <div style={{ minWidth: 0 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+            <h1 style={{ fontSize: isMobile ? 20 : 25, fontWeight: 840, margin: 0, letterSpacing: '-0.025em', color: '#fff' }}>
+              {overall >= 100 ? 'Analysis Complete' : 'Analysis Running'}
             </h1>
             {overall < 100 && <span className="chip tone-blue"><Spinner size={11} dark={false} /> running</span>}
           </div>
           {selectedRepo && (
-            <p className="mono muted" style={{ fontSize: 13, margin: '6px 0 0' }}>
+            <p className="mono muted" style={{ fontSize: 12, margin: '5px 0 0', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
               {selectedRepo.owner.login}/{selectedRepo.name} · {selectedBranch}
             </p>
           )}
         </div>
-        <button className="btn btn-danger" onClick={onCancel}>
-          <X size={14} /> Cancel Analysis
+        <button className="btn btn-danger btn-sm" onClick={onCancel} style={{ flexShrink: 0 }}>
+          <X size={14} /> {isMobile ? 'Cancel' : 'Cancel Analysis'}
         </button>
       </div>
 
-      {/* Two-column layout */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0,1fr) 340px', gap: 20 }}>
+      {/* Two-column layout — stacks to single col on mobile */}
+      <div className="analysis-grid" style={{ display: 'grid', gridTemplateColumns: 'minmax(0,1fr) 340px', gap: 20 }}>
         {/* Left: radar + log */}
         <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-          <div className="card glow-border" style={{ position: 'relative', overflow: 'hidden', padding: '30px 20px' }}>
+          <div className="card glow-border radar-card" style={{ position: 'relative', overflow: 'hidden', padding: '30px 20px' }}>
             <RadarBg sweep={false} rings={false} blobs style={{ opacity: 0.5 }} />
             <div style={{ position: 'relative' }}>
               {/* Active agent pill */}
@@ -214,7 +211,7 @@ export function AnalysisPage({ selectedRepo, selectedBranch, agents, progressByA
                 </span>
               </div>
 
-              <PipelineRadar statuses={statuses} />
+              <PipelineRadar statuses={statuses} size={isMobile ? 240 : 300} />
 
               {/* Progress bar */}
               <div style={{ marginTop: 20 }}>
@@ -233,7 +230,7 @@ export function AnalysisPage({ selectedRepo, selectedBranch, agents, progressByA
         </div>
 
         {/* Right: per-agent cards */}
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+        <div className="mobile-full" style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
           {AGENTS.map((agent, i) => {
             const st = statuses[i] as 'pending' | 'running' | 'complete' | 'error';
             const agentMatch = agents.find(a => ID_TO_INDEX[a.id] === i);
