@@ -6,6 +6,8 @@ changed-source-without-tests, size, score → level mapping, and graceful emptie
 The optional LLM prose pass is forced off via the provider patch so the suite is
 hermetic and fast.
 """
+import asyncio
+
 import pytest
 
 from app.agents.pr_risk_agent import PRRiskAgent
@@ -223,7 +225,7 @@ def test_orchestrator_attaches_pr_risk_when_present(monkeypatch):
     from app.orchestrator.shipmate_orchestrator import ShipMateOrchestrator
     orch = ShipMateOrchestrator()
     _stub_repo_agents(monkeypatch, orch)
-    report = orch.run(_run_ctx([_f("backend/app/api/routes/auth.py", additions=50)]))
+    report = asyncio.run(orch.run(_run_ctx([_f("backend/app/api/routes/auth.py", additions=50)])))
     assert report.pr_risk is not None
     assert report.pr_risk.pr_number == 7
     # Survives a full serialize/validate round-trip (the report_store path).
@@ -235,7 +237,7 @@ def test_orchestrator_omits_pr_risk_for_branch_analysis(monkeypatch):
     from app.orchestrator.shipmate_orchestrator import ShipMateOrchestrator
     orch = ShipMateOrchestrator()
     _stub_repo_agents(monkeypatch, orch)
-    report = orch.run(_run_ctx([]))  # no PR files → no PR-risk card
+    report = asyncio.run(orch.run(_run_ctx([])))  # no PR files → no PR-risk card
     assert report.pr_risk is None
     assert orch._has_pr({"pr_files": []}) is False
     assert orch._has_pr({"pr_files": [{"filename": "x"}]}) is True
