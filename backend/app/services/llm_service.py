@@ -702,6 +702,36 @@ class LLMService:
             _maybe_invalidate_provider(e)
             return []
 
+    @classmethod
+    def research_codebase(
+        cls, context: Dict[str, Any], graph_summary: Dict[str, Any],
+        *, question: str = "", max_findings: int = 8,
+    ) -> Optional["_ResearchDiscovery"]:
+        """Codebase deep-research pass: answer a question and/or surface
+        dataflow-cleanup findings (dead code, cycles, god-modules, coupling),
+        GROUNDED on the reference-graph summary so the model reasons about real
+        edges, not guesses. Returns a _ResearchDiscovery (answer + findings) or
+        None when the provider is unavailable (fail-open)."""
+        provider = _get_provider()
+        if provider is None:
+            return None
+        try:
+            code_blob = cls.opportunity_code_blob(context)
+            user = _user_prompt_research(
+                context, code_blob, graph_summary,
+                question=question, max_findings=max_findings,
+            )
+            return provider.invoke_structured_sync(
+                system_prompt=_RESEARCH_SYSTEM,
+                user_prompt=user,
+                schema_class=_ResearchDiscovery,
+                deployment_hint="smart",
+            )
+        except Exception as e:
+            logger.warning("Codebase research failed (%s); returning none", e)
+            _maybe_invalidate_provider(e)
+            return None
+
 
 # ─── Discovery — schemas ─────────────────────────────────────────────────────
 # These are what Bedrock fills in. They're separate from PlanForgeOutput etc.
@@ -795,6 +825,25 @@ class OpportunityDiscovery(BaseModel):
     opportunities: List[_DiscoveredOpportunity] = Field(
         default_factory=list,
         description="A BALANCED mix across feature/improvement/tweak/bug. Each MUST cite real files in evidence. Quality over quantity.",
+    )
+
+
+class _ResearchFinding(BaseModel):
+    title: str = Field(..., description="Concise finding title — 4-9 words.")
+    kind: str = Field(..., description="One of: dataflow, dead_code, coupling, risk, observation.")
+    severity: str = Field(..., description="One of: high, medium, low.")
+    detail: str = Field(..., description="2-3 sentences: what it is, concretely, for THIS repo.")
+    evidence: List[str] = Field(default_factory=list, description="1-3 REAL file paths / constructs that prove it.")
+    suggested_action: str = Field(default="", description="One concrete next step (NOT a full plan).")
+    graph_signal: str = Field(default="", description="Which reference-graph signal backs this, verbatim (e.g. 'fan_in=11', 'cycle a<->b', 'unreferenced export: foo'). Empty if not graph-derived.")
+
+
+class _ResearchDiscovery(BaseModel):
+    """LLM codebase-research output: a narrative answer + grounded findings."""
+    answer: str = Field(default="", description="Narrative answer to the asked question. Empty when no question was asked (open audit).")
+    findings: List[_ResearchFinding] = Field(
+        default_factory=list,
+        description="Grounded loops/holes/tweaks/dataflow issues. Each MUST cite real files; prefer findings the reference-graph summary supports.",
     )
 
 
@@ -1156,6 +1205,37 @@ _DISCOVERY_INNOVATION_SYSTEM = (
 )
 
 
+_RESEARCH_SYSTEM = (
+    "You are a staff engineer doing a DEEP CODEBASE RESEARCH pass. You are given "
+    "the repo summary, the most important file bodies, and a REFERENCE-GRAPH "
+    "SUMMARY computed from the real import/symbol edges (god modules by fan-in, "
+    "import cycles, orphan modules, and unreferenced exports).\n\n"
+    "Your job: answer the user's question (if one is asked) AND surface concrete "
+    "findings — loops/holes/tweaks and messy DATAFLOW — that a maintainer should "
+    "act on. Findings kinds:\n"
+    "  • dataflow    — tangled/duplicated data paths, signature drift, a value "
+    "threaded through many layers, redundant transforms.\n"
+    "  • dead_code   — an unreferenced export / orphan module the graph flags "
+    "(confirm it's truly unused, not an entry point or dynamically used).\n"
+    "  • coupling    — a god-module the graph shows high fan-in to, or an import "
+    "cycle; explain the concrete risk it creates.\n"
+    "  • risk        — a latent bug / missing error path / unsafe assumption in "
+    "an actual code path.\n"
+    "  • observation — a noteworthy fact that isn't yet actionable.\n\n"
+    "GROUNDING RULES (non-negotiable):\n"
+    "  1. Every finding MUST cite REAL file paths in `evidence`.\n"
+    "  2. When a finding is backed by the graph summary, put the exact signal in "
+    "`graph_signal` (e.g. 'fan_in=11', 'cycle: a.py<->b.py', 'unreferenced "
+    "export: parse_foo'). Prefer graph-supported findings — they're verifiable.\n"
+    "  3. Do NOT invent edges the graph/code doesn't show. If the graph says a "
+    "module is a god-module, trust it over a guess.\n"
+    "  4. A dead_code finding the graph did NOT flag is suspect — say why you "
+    "still believe it (e.g. 'defined but only referenced in a comment').\n\n"
+    "Be specific and honest. A few sharp, graph-grounded findings beat a long "
+    "list of vague ones."
+)
+
+
 # ─── Discovery — user prompt builders ────────────────────────────────────────
 
 def _user_prompt_plan_discovery(
@@ -1444,6 +1524,30 @@ def _user_prompt_innovation_discovery(
         "Favour bold, high-ceiling ideas over safe ones — but every one must be "
         "anchored in this repo's actual code. Return ONLY the OpportunityDiscovery "
         "schema."
+    )
+
+
+def _user_prompt_research(
+    context: Dict[str, Any], code_blob: str, graph_summary: Dict[str, Any],
+    *, question: str = "", max_findings: int = 8,
+) -> str:
+    graph_json = json.dumps(graph_summary or {}, default=list)[:8000]
+    q_block = (
+        f"# Question to answer\n{question.strip()}\n\n"
+        if (question or "").strip()
+        else "# No specific question — do an open dataflow/cleanup audit.\n\n"
+    )
+    return (
+        f"# Repo summary\n{_repo_summary(context)}\n\n"
+        f"{q_block}"
+        f"# Reference-graph summary (computed from REAL import/symbol edges)\n"
+        f"{graph_json}\n\n"
+        f"# Repo code\n{code_blob[:20000]}\n\n"
+        f"Answer the question (if any) and surface up to {max_findings} grounded "
+        "findings (loops/holes/tweaks/dataflow). HARD RULES: every finding cites "
+        "real files in `evidence`; when backed by the graph summary, put the exact "
+        "signal in `graph_signal`; prefer graph-supported findings; do NOT invent "
+        "edges. Return ONLY the _ResearchDiscovery schema."
     )
 
 
