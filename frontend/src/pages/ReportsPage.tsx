@@ -579,11 +579,29 @@ export function ReportsPage({ report, onReRun, accessToken }: Props) {
 
   return (
     <motion.div initial={{ opacity: 0, y: 14 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.55, ease: [0.2,0.7,0.2,1] }}
-      style={{ padding: '28px 32px', maxWidth: 1180, margin: '0 auto', width: '100%' }}>
+      className="page-content" style={{ padding: 'var(--page-py) var(--page-px)', maxWidth: 1180, margin: '0 auto', width: '100%' }}>
       <ExecutiveReportHeader report={report} onReRun={onReRun} />
 
       {/* PR Risk — shown only for a PR-scoped analysis (report.pr_risk present) */}
       {report.pr_risk && <PRRiskCard pr={report.pr_risk} />}
+
+      {/* Heuristic-only banner: when the LLM discovery path didn't run (expired
+          creds / unreachable provider), findings are generic heuristics — say
+          so instead of letting the user wonder why they look template-y. */}
+      {report.ai_enhanced === false && (
+        <div className="card" style={{
+          marginTop: 16, padding: '12px 16px', display: 'flex', alignItems: 'center', gap: 10,
+          background: 'rgba(245,158,11,0.08)', borderColor: 'rgba(245,158,11,0.3)',
+        }}>
+          <span className="dot" style={{ background: '#f59e0b' }} />
+          <span style={{ fontSize: 13, color: 'var(--ink-2)' }}>
+            <strong style={{ color: '#fbbf24' }}>Heuristic-only mode</strong> — AI
+            discovery was unavailable for this run (LLM provider not reachable),
+            so findings are deterministic heuristics rather than code-grounded AI
+            analysis. Refresh credentials and re-run for the full analysis.
+          </span>
+        </div>
+      )}
 
       {/* Tab bar */}
       <div style={{ display: 'flex', gap: 16, borderBottom: '1px solid var(--line)', margin: '22px 0', overflowX: 'auto' }}>

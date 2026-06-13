@@ -5,6 +5,150 @@ from .base_agent import BaseAgent
 from ..schemas.agent_schemas import GuardRailOutput, SecurityFinding, Severity
 from ..services.llm_service import LLMService
 
+# ── Test-file classifier ──────────────────────────────────────────────────────
+# Skip secret/injection scans for test files — fixtures and mock credentials
+# are intentional and produce chronic false positives. Dependency manifests
+# (requirements.txt, package.json) are NOT test files and are still scanned.
+_TEST_FILE_PATTERNS = re.compile(
+    r"(^|/)tests?/|/(__|)tests?/|"
+    r"(^|.+/)test_[^/]+\.py$|[^/]+_test\.py$|"
+    r"[^/]+\.test\.(ts|tsx|js|jsx)$|[^/]+\.spec\.(ts|tsx|js|jsx|py|rb)$|"
+    r"(^|/)spec/",
+    re.IGNORECASE,
+)
+
+
+def _is_test_file(path: str) -> bool:
+    """Return True when *path* is a test/spec file that should be excluded from
+    secret and injection heuristic scans. Dependency manifests are NOT excluded
+    even if they live in a tests/ sibling directory."""
+    return bool(_TEST_FILE_PATTERNS.search(path))
+
+
+# ── Code-aware injection detection ───────────────────────────────────────────
+# A naive substring scan for "eval(" / "__import__" produces chronic false
+# positives, because a *defensive* codebase mentions those tokens precisely to
+# block them: a regex literal `re.compile(r"eval\s*\(")`, a denylist string
+# `"eval"`, a sanitiser comment, or a security test. Flagging that as "dynamic
+# code execution detected" is the single biggest source of recurring noise.
+#
+# These regexes match a REAL dynamic-execution CALL — the token followed by an
+# opening paren that is NOT itself inside a string/regex literal context. We
+# additionally drop any line that is clearly a pattern definition, denylist, or
+# comment (see _is_detection_or_defensive_line). Bias: prefer a false NEGATIVE
+# (miss a contrived case) over the false POSITIVE that trains users to ignore
+# the agent entirely.
+# The call token must NOT be preceded by a quote, word char, dot, or BACKTICK
+# (backtick guards against Markdown/docstring prose like `eval(`).
+_EVAL_CALL_RE = re.compile(r"(?<![\"'`\w.])eval\s*\(")
+_EXEC_CALL_RE = re.compile(r"(?<![\"'`\w.])exec\s*\(")
+_DYN_IMPORT_CALL_RE = re.compile(r"(?<![\"'`\w.])__import__\s*\(")
+
+# Markers that mean a line is defining/blocking these tokens rather than calling
+# them: a regex literal, a denylist entry, a detection helper, or a comment.
+# Kept to STRUCTURAL signals only — prose-word heuristics (e.g. "payload") were
+# tried and rejected because they collide with legitimate variable names. The
+# backtick check below handles documentation/Markdown prose instead.
+_DEFENSIVE_LINE_MARKERS = (
+    "re.compile", "re.search", "re.match", "re.findall",
+    "_dangerous", "dangerous_pattern", "blocklist", "denylist",
+    "_risky", "sanitize", "sanitiz", "detect", "pattern",
+)
+
+
+def _has_real_dynamic_exec(content: str) -> bool:
+    """True only if *content* contains a genuine eval/exec/__import__ CALL that
+    is not part of a detection pattern, denylist, comment, docstring prose, or
+    string literal.
+
+    Walks line-by-line so one defensive line (e.g. the anti-injection regex or
+    the documentation in main.py) can't poison the whole-file check the way the
+    old `"eval(" in combined` did. Bias toward false-negative: when a line looks
+    even slightly like prose/defense, skip it — the pytest gate and human review
+    catch a genuinely-missed call, but a false positive trains users to ignore
+    the agent entirely."""
+    for raw in content.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        # Skip pure comment lines and docstring delimiters (prose, not calls).
+        if line.startswith("#") or line.startswith('"""') or line.startswith("'''"):
+            continue
+        # Skip lines where the token is wrapped in backticks anywhere — Markdown
+        # / docstring prose like `eval(` that documents rather than executes.
+        if "`" in line:
+            continue
+        lowered = line.lower()
+        # Skip lines that are clearly defining/blocking these tokens (regex
+        # literal, denylist, detection helper).
+        if any(marker in lowered for marker in _DEFENSIVE_LINE_MARKERS):
+            continue
+        if _EVAL_CALL_RE.search(line) or _EXEC_CALL_RE.search(line) or _DYN_IMPORT_CALL_RE.search(line):
+            return True
+    return False
+
+
+# A non-local http:// URL (anything but localhost/127.0.0.1/0.0.0.0/::1/*.local).
+_NONLOCAL_HTTP_RE = re.compile(
+    r"http://(?!localhost|127\.0\.0\.1|0\.0\.0\.0|\[?::1\]?|[\w-]+\.local\b)[\w.-]+",
+    re.IGNORECASE,
+)
+
+
+def _has_insecure_http_with_auth(combined_lower: str) -> bool:
+    """True only if a NON-local http:// URL coexists with auth/token handling.
+
+    The old check fired on any `http://` (including localhost dev servers and
+    the OAuth redirect to localhost:5173), which is not a real TLS risk and made
+    the finding chronic noise. We require a remote http endpoint."""
+    if not ("token" in combined_lower or "auth" in combined_lower):
+        return False
+    return _NONLOCAL_HTTP_RE.search(combined_lower) is not None
+
+
+# A genuine JWT signing call from a real JWT library — NOT the bare substring
+# "jwt". The old check (`"jwt" in combined and "secret" in combined`) fired on
+# any file that merely mentioned the word jwt (a comment, a doc, even GuardRail's
+# own finding text), producing a chronic false positive in repos that don't use
+# JWT at all (ShipMate uses GitHub OAuth, no JWT anywhere).
+_JWT_SIGN_RE = re.compile(
+    r"\bjwt\.(?:encode|sign)\s*\(|"          # pyjwt: jwt.encode(...)
+    r"\bjsonwebtoken\b|\.sign\s*\([^)]*\bsecret\b|"  # node jsonwebtoken
+    r"\bfrom\s+jose\b|\bimport\s+jwt\b|\brequire\(['\"]jsonwebtoken['\"]\)",
+    re.IGNORECASE,
+)
+# A hardcoded secret literal feeding a sign call: `secret="..."` / `algorithm=`
+# alongside the sign. Conservative — only flag when both a real sign call AND a
+# string-literal secret are present (env-loaded secrets are the correct pattern).
+_JWT_LITERAL_SECRET_RE = re.compile(
+    r"(?:secret|secret_key|signing_key)\s*[=:]\s*[\"'][^\"']{6,}[\"']",
+    re.IGNORECASE,
+)
+
+
+def _has_real_jwt_secret_issue(content: str) -> bool:
+    """True only if the code genuinely SIGNS a JWT with a hardcoded (string-
+    literal) secret rather than an env-loaded one. Line-by-line + defensive-
+    marker skipping, same false-negative bias as _has_real_dynamic_exec: a bare
+    mention of 'jwt'/'secret' in prose or a denylist never trips this."""
+    has_sign = False
+    has_literal_secret = False
+    for raw in content.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "`" in line:
+            continue
+        lowered = line.lower()
+        if any(marker in lowered for marker in _DEFENSIVE_LINE_MARKERS):
+            continue
+        if _JWT_SIGN_RE.search(line):
+            has_sign = True
+        if _JWT_LITERAL_SECRET_RE.search(line) and "os.environ" not in lowered \
+                and "getenv" not in lowered and "process.env" not in lowered:
+            has_literal_secret = True
+    # Require BOTH a real signing call and a literal-secret assignment. A repo
+    # that signs JWTs but loads the secret from env is doing it RIGHT.
+    return has_sign and has_literal_secret
+
 # Patterns that suggest hardcoded secrets
 _SECRET_PATTERNS = [
     (r'(?i)(password|passwd|pwd)\s*=\s*["\'][^"\']{6,}["\']', "Hardcoded password"),
@@ -48,6 +192,8 @@ class GuardRailAgent(BaseAgent):
         for filename, content in kf.items():
             if not content:
                 continue
+            if _is_test_file(filename):
+                continue  # fixture/mock credentials are intentional
             for pattern, label in _SECRET_PATTERNS:
                 if re.search(pattern, content):
                     exposed_secrets.append(f"{label} in {filename}")
@@ -102,38 +248,57 @@ class GuardRailAgent(BaseAgent):
         # ── Auth risks ─────────────────────────────────────────────────────
         combined = " ".join(kf.values()).lower()
 
-        if "jwt" in combined and "secret" in combined and "env" not in combined[:500]:
+        # JWT: only flag a GENUINE signing call with a hardcoded literal secret.
+        # The old `"jwt" in combined and "secret" in combined` substring test
+        # fired in repos with no JWT at all (e.g. this one — GitHub OAuth, zero
+        # JWT) whenever any file merely mentioned the words, producing a chronic
+        # false positive. _has_real_jwt_secret_issue requires jwt.encode/sign +
+        # a string-literal secret that isn't env-loaded.
+        if any(_has_real_jwt_secret_issue(c) for c in kf.values() if c):
             auth_risks.append("JWT secret may not be loaded from environment variables")
             findings.append(SecurityFinding(
                 id=f"SEC-{fid:03d}",
                 title="JWT secret not loaded from environment",
                 severity=Severity.HIGH,
                 category="auth",
-                description="JWT secret appears to be hardcoded rather than injected via environment variable.",
+                description="A JWT is signed with a hardcoded string-literal secret rather than one injected via environment variable.",
                 recommendation="Load JWT secret exclusively from `os.environ` / `process.env` and never commit it.",
             ))
             fid += 1
 
-        if "http://" in combined and ("token" in combined or "auth" in combined):
+        # Plain-HTTP-with-tokens: only flag a NON-localhost http:// URL. Localhost
+        # http (dev servers, OAuth redirect to localhost:5173, the vite proxy) is
+        # not a TLS risk, and flagging it trained users to ignore this finding.
+        if _has_insecure_http_with_auth(combined):
             auth_risks.append("Tokens may be transmitted over plain HTTP")
             findings.append(SecurityFinding(
                 id=f"SEC-{fid:03d}",
                 title="Auth tokens potentially sent over plain HTTP",
                 severity=Severity.MEDIUM,
                 category="auth",
-                description="HTTP (non-TLS) URLs combined with auth token usage detected. "
-                            "Tokens transmitted over HTTP are vulnerable to interception.",
+                description="A non-local `http://` (non-TLS) URL appears alongside auth/token "
+                            "handling. Tokens transmitted over HTTP are vulnerable to interception.",
                 recommendation="Enforce HTTPS everywhere. Use HSTS headers in production.",
             ))
             fid += 1
 
-        if "eval(" in combined or "__import__" in combined:
+        # Dynamic code execution: code-aware — only a REAL eval/exec/__import__
+        # CALL counts, never a detection regex, denylist entry, comment, or test.
+        # (A security codebase mentions these tokens precisely to BLOCK them; the
+        # old substring check flagged its own anti-injection middleware.)
+        # Test files are excluded — eval() in a test is deliberately exercising
+        # the security path, not a production vulnerability.
+        if any(
+            _has_real_dynamic_exec(c)
+            for fname, c in kf.items()
+            if c and not _is_test_file(fname)
+        ):
             findings.append(SecurityFinding(
                 id=f"SEC-{fid:03d}",
                 title="Dynamic code execution detected",
                 severity=Severity.HIGH,
                 category="injection",
-                description="`eval()` or `__import__()` usage detected. "
+                description="A genuine `eval()`, `exec()`, or `__import__()` call was found. "
                             "If user input reaches these calls, arbitrary code execution is possible.",
                 recommendation="Replace dynamic execution with safe alternatives. "
                                "Never pass untrusted input to eval/exec/__import__.",

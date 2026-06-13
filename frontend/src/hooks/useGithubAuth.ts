@@ -1,5 +1,5 @@
 import { useState, useCallback, useEffect } from 'react';
-import { api } from '../lib/api';
+import { api, setAuthToken } from '../lib/api';
 import type { GitHubUser } from '../types';
 
 export interface AuthState {
@@ -23,6 +23,7 @@ export function useGithubAuth() {
     const token = localStorage.getItem('github_access_token');
     const user = localStorage.getItem('github_user');
     if (token && user) {
+      setAuthToken(token);  // OPP-001: prime the axios interceptor on reload
       setState({ isAuthenticated: true, user: JSON.parse(user), accessToken: token, loading: false, error: null });
     } else {
       setState(s => ({ ...s, loading: false }));
@@ -35,6 +36,7 @@ export function useGithubAuth() {
         const { access_token, user } = e.data;
         localStorage.setItem('github_access_token', access_token);
         localStorage.setItem('github_user', JSON.stringify(user));
+        setAuthToken(access_token);  // OPP-001: header instead of query param
         setState({ isAuthenticated: true, user, accessToken: access_token, loading: false, error: null });
       }
     };

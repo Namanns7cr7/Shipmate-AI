@@ -1,5 +1,5 @@
 import { useState, useCallback, useEffect, useRef } from 'react';
-import { Zap, Bell, GitBranch, BookOpen, Clock } from 'lucide-react';
+import { Zap, Bell, Clock, Sparkles, Menu } from 'lucide-react';
 import { useGithubAuth } from './hooks/useGithubAuth';
 import { api } from './lib/api';
 import { LandingPage } from './components/landing/LandingPage';
@@ -7,10 +7,30 @@ import { AppSidebar } from './components/app/AppSidebar';
 import { DashboardPage } from './pages/DashboardPage';
 import { RepositoriesPage } from './pages/RepositoriesPage';
 import { AnalysisPage } from './pages/AnalysisPage';
+import { BuildPage } from './pages/BuildPage';
 import { ReportsPage } from './pages/ReportsPage';
 import { Spinner } from './components/ui/GitHubConnectButton';
+import { BranchPicker } from './components/ui/BranchPicker';
+import { RepoPicker } from './components/ui/RepoPicker';
+import { AutoFixDrawer } from './components/ui/AutoFixDrawer';
 import type { Page } from './components/app/AppSidebar';
+import type { LogLine } from './components/ui/LiveActivityLog';
 import type { AgentProgress, GitHubRepo, GitHubPR, ShipMateReport } from './types';
+
+// Pretty per-agent labels + tones for the live Activity Log (maps SSE
+// agent.done events to the LiveActivityLog line shape).
+const AGENT_LOG_META: Record<string, { label: string; tone: string }> = {
+  repo_lens:  { label: 'RepoLens',  tone: 'emerald' },
+  plan_forge: { label: 'PlanForge', tone: 'purple'  },
+  guardrail:  { label: 'GuardRail', tone: 'amber'   },
+  testpilot:  { label: 'TestPilot', tone: 'cyan'    },
+};
+
+function _nowHMS(): string {
+  const d = new Date();
+  return [d.getHours(), d.getMinutes(), d.getSeconds()]
+    .map(n => String(n).padStart(2, '0')).join(':');
+}
 
 const INITIAL_AGENTS: AgentProgress[] = [
   { id: 'repo_lens',  label: 'RepoLens',  icon: '🔍', status: 'idle', description: 'Repo structure, tech stack & architecture risks' },
@@ -121,11 +141,20 @@ function useAgentSimulation(analyzing: boolean) {
     setOverallPct(100);
   }
 
+  // Snap a single agent to complete when its REAL SSE agent.done event fires,
+  // keeping the progress bars in sync with the live Activity Log instead of the
+  // fixed 32s timer. The ticker still drives smooth in-between motion and the
+  // overall %; real completion events are authoritative for per-agent state.
+  function markAgentComplete(id: AgentProgress['id']) {
+    setAgents(prev => prev.map(a => a.id === id ? { ...a, status: 'complete' } : a));
+    setProgressByAgent(prev => ({ ...prev, [id]: 100 }));
+  }
+
   function markAllError() {
     setAgents(prev => prev.map(a => ({ ...a, status: a.status === 'running' ? 'error' : a.status })));
   }
 
-  return { agents, progressByAgent, overallPct, markAllComplete, markAllError };
+  return { agents, progressByAgent, overallPct, markAllComplete, markAgentComplete, markAllError };
 }
 
 export default function App() {
@@ -139,8 +168,23 @@ export default function App() {
   const [selectedPull]                      = useState<GitHubPR | null>(null);
   const [report, setReport]                 = useState<ShipMateReport | null>(null);
   const [analyzing, setAnalyzing]           = useState(false);
+  const [autoFixOpen, setAutoFixOpen]       = useState(false);
+  const [sidebarOpen, setSidebarOpen]       = useState(false);
+  const [isMobile, setIsMobile]             = useState(() => window.innerWidth < 768);
+  // Real per-agent activity-log lines from the SSE stream (empty until events arrive).
+  const [liveLines, setLiveLines]           = useState<LogLine[]>([]);
 
-  const { agents, progressByAgent, overallPct, markAllComplete, markAllError } = useAgentSimulation(analyzing);
+  // Track viewport width for responsive layout
+  useEffect(() => {
+    const handler = () => setIsMobile(window.innerWidth < 768);
+    window.addEventListener('resize', handler);
+    return () => window.removeEventListener('resize', handler);
+  }, []);
+
+  // Close drawer on page navigation (mobile)
+  useEffect(() => { setSidebarOpen(false); }, [page]);
+
+  const { agents, progressByAgent, overallPct, markAllComplete, markAgentComplete, markAllError } = useAgentSimulation(analyzing);
 
   useEffect(() => {
     if (!auth.isAuthenticated || !auth.accessToken) return;
@@ -155,14 +199,11 @@ export default function App() {
 
   const handleSelectRepo = useCallback(async (repo: GitHubRepo) => {
     setSelectedRepo(repo);
+    // Pick the default branch on repo switch. The BranchPicker dropdown
+    // lets the user override before analyze fires; once the user picks
+    // a non-default branch it stays sticky until they switch repos.
     setSelectedBranch(repo.default_branch || 'main');
-    if (!auth.accessToken) return;
-    const [owner, repoName] = repo.full_name.split('/');
-    try {
-      const branches = await api.getBranches(owner, repoName, auth.accessToken);
-      setSelectedBranch(repo.default_branch || branches[0]?.name || 'main');
-    } catch (e) { console.error('Failed to load repo data', e); }
-  }, [auth.accessToken]);
+  }, []);
 
   const handleAnalyze = useCallback(async (repo?: GitHubRepo) => {
     const target = repo ?? selectedRepo;
@@ -171,26 +212,57 @@ export default function App() {
 
     setAnalyzing(true);
     setReport(null);
+    setLiveLines([]);
     setPage('analysis');
 
     const [owner, repoName] = target.full_name.split('/');
+    const params = {
+      owner, repo: repoName,
+      branch: selectedBranch,
+      access_token: auth.accessToken,
+      pr_number: selectedPull?.number,
+    };
+
+    const pushLine = (line: LogLine) => setLiveLines(prev => [...prev, line]);
+
     try {
-      const res = await api.analyze({
-        owner, repo: repoName,
-        branch: selectedBranch,
-        access_token: auth.accessToken,
-        pr_number: selectedPull?.number,
+      pushLine({ agent: 'system', text: `Cloning ${target.full_name} @ ${selectedBranch}…`, tone: 'slate', time: _nowHMS() });
+      // Stream per-agent results so the Activity Log fills live. The final
+      // report.done event carries the assembled report.
+      const finalReport = await api.streamAnalyze(params, (evt) => {
+        if (evt.event === 'agent.done' && evt.agent) {
+          const meta = AGENT_LOG_META[evt.agent] ?? { label: evt.agent, tone: 'slate' };
+          pushLine({ agent: meta.label, text: 'analysis complete ✓', tone: meta.tone, time: _nowHMS() });
+          // Snap this agent's progress bar to complete — keeps bars in sync
+          // with the log (issue: bars were on a fixed timer, decoupled).
+          markAgentComplete(evt.agent as AgentProgress['id']);
+        } else if (evt.event === 'report.done') {
+          pushLine({ agent: 'system', text: '✓ Readiness score computed — shipping report', tone: 'emerald', time: _nowHMS() });
+        } else if (evt.event === 'error') {
+          pushLine({ agent: 'system', text: `⚠ ${evt.detail ?? 'analysis error'}`, tone: 'red', time: _nowHMS() });
+        }
       });
+      if (!finalReport) throw new Error('stream ended without a report');
       markAllComplete();
-      setReport(res.report);
+      setReport(finalReport as ShipMateReport);
       setAnalyzing(false);
       setPage('reports');
     } catch {
-      markAllError();
-      setAnalyzing(false);
-      setPage('repos');
+      // Fall back to the batch endpoint if streaming isn't available (older
+      // backend / proxy buffering). Same result, just no live progress.
+      try {
+        const res = await api.analyze(params);
+        markAllComplete();
+        setReport(res.report);
+        setAnalyzing(false);
+        setPage('reports');
+      } catch {
+        markAllError();
+        setAnalyzing(false);
+        setPage('repos');
+      }
     }
-  }, [selectedRepo, selectedBranch, selectedPull, auth.accessToken, markAllComplete, markAllError, handleSelectRepo]);
+  }, [selectedRepo, selectedBranch, selectedPull, auth.accessToken, markAllComplete, markAgentComplete, markAllError, handleSelectRepo]);
 
   if (!auth.isAuthenticated) {
     return <LandingPage onLogin={auth.login} loading={auth.loading} error={auth.error} />;
@@ -200,7 +272,16 @@ export default function App() {
   const lastScan = report ? new Date(report.generated_at).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : null;
 
   return (
-    <div style={{ display: 'flex', minHeight: '100vh', background: 'var(--bg)', color: 'var(--ink)' }}>
+    <div style={{ display: 'flex', minHeight: '100vh', background: 'var(--bg)', color: 'var(--ink)', position: 'relative' }}>
+
+      {/* Mobile backdrop */}
+      {isMobile && sidebarOpen && (
+        <div
+          onClick={() => setSidebarOpen(false)}
+          style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.65)', zIndex: 90, backdropFilter: 'blur(3px)' }}
+        />
+      )}
+
       <AppSidebar
         activePage={activePage}
         onNavigate={p => { if (p === 'analysis' && !analyzing) return; setPage(p); }}
@@ -210,63 +291,129 @@ export default function App() {
         selectedRepo={selectedRepo}
         onSelectRepo={r => { handleSelectRepo(r); }}
         hasReport={!!report}
+        isMobile={isMobile}
+        mobileOpen={sidebarOpen}
+        onMobileClose={() => setSidebarOpen(false)}
+        selectedBranch={selectedBranch}
+        onBranchChange={setSelectedBranch}
+        accessToken={auth.accessToken}
+        analyzing={analyzing}
+        onAnalyze={() => handleAnalyze()}
+        onAutoFix={() => setAutoFixOpen(true)}
       />
 
-      <main style={{ flex: 1, height: '100vh', overflowY: 'auto', display: 'flex', flexDirection: 'column' }}>
+      <main style={{ flex: 1, minHeight: '100vh', height: isMobile ? 'auto' : '100vh', overflowY: 'auto', display: 'flex', flexDirection: 'column' }}>
         {/* Topbar */}
         <div style={{
           position: 'sticky', top: 0, zIndex: 40, height: 60,
-          background: 'rgba(7,12,24,0.82)', backdropFilter: 'blur(16px)',
+          background: 'rgba(7,12,24,0.92)', backdropFilter: 'blur(16px)',
           borderBottom: '1px solid var(--line)',
-          display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '0 28px',
-          flexShrink: 0,
+          display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+          padding: isMobile ? '0 14px' : '0 28px',
+          flexShrink: 0, gap: 8,
         }}>
-          {/* Left: breadcrumb + chips */}
-          <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13 }}>
-              <span className="muted">ShipMate</span>
-              <span style={{ color: 'var(--ink-4)' }}>›</span>
-              <span style={{ color: '#fff', fontWeight: 600, textTransform: 'capitalize' }}>
+
+          {/* Left section */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: isMobile ? 10 : 12, minWidth: 0 }}>
+            {/* Hamburger — mobile only */}
+            {isMobile && (
+              <button
+                onClick={() => setSidebarOpen(o => !o)}
+                style={{ padding: 7, borderRadius: 9, background: 'rgba(255,255,255,0.05)', border: '1px solid var(--line)', color: 'var(--ink-2)', cursor: 'pointer', display: 'flex', alignItems: 'center', flexShrink: 0 }}
+                aria-label="Open navigation"
+              >
+                <Menu size={18} />
+              </button>
+            )}
+
+            {/* Breadcrumb — desktop only */}
+            {!isMobile && (
+              <>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13 }}>
+                  <span className="muted">ShipMate</span>
+                  <span style={{ color: 'var(--ink-4)' }}>›</span>
+                  <span style={{ color: '#fff', fontWeight: 600, textTransform: 'capitalize' }}>
+                    {activePage === 'repos' ? 'Repositories' : activePage}
+                  </span>
+                </div>
+                <span style={{ width: 1, height: 18, background: 'var(--line-2)', flexShrink: 0 }} />
+              </>
+            )}
+
+            {/* Page title — mobile only */}
+            {isMobile && (
+              <span style={{ fontSize: 15, fontWeight: 700, color: '#fff', textTransform: 'capitalize', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                 {activePage === 'repos' ? 'Repositories' : activePage}
               </span>
-            </div>
-            <span style={{ width: 1, height: 18, background: 'var(--line-2)' }} />
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-              {selectedRepo && (
-                <>
-                  <span className="mono chip tone-slate"><BookOpen size={12} /> {selectedRepo.name}</span>
-                  <span className="mono chip tone-slate"><GitBranch size={12} /> {selectedBranch}</span>
-                </>
-              )}
-              <span className="chip tone-slate">
-                <Clock size={12} /> {lastScan ? `scanned ${lastScan}` : 'never scanned'}
-              </span>
-            </div>
+            )}
+
+            {/* Repo + Branch pickers — desktop only */}
+            {!isMobile && (
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                {repos.length > 0 && (
+                  <RepoPicker
+                    repos={repos}
+                    selected={selectedRepo}
+                    onSelect={r => { handleSelectRepo(r); }}
+                    disabled={analyzing}
+                  />
+                )}
+                {selectedRepo && (
+                  <BranchPicker
+                    repoFullName={selectedRepo.full_name}
+                    defaultBranch={selectedRepo.default_branch}
+                    selected={selectedBranch}
+                    onChange={setSelectedBranch}
+                    accessToken={auth.accessToken}
+                    disabled={analyzing}
+                  />
+                )}
+                <span className="chip tone-slate">
+                  <Clock size={12} /> {lastScan ? `scanned ${lastScan}` : 'never scanned'}
+                </span>
+              </div>
+            )}
           </div>
 
-          {/* Right: run button + bell + user */}
-          <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+          {/* Right section */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: isMobile ? 8 : 12, flexShrink: 0 }}>
             <button
               className="btn btn-primary btn-sm"
               onClick={() => handleAnalyze()}
               disabled={analyzing || !selectedRepo}
+              style={isMobile ? { padding: '0 12px', gap: 6, fontSize: 12 } : {}}
             >
-              {analyzing ? <><Spinner size={13} /> Running…</> : <><Zap size={14} /> Run Analysis</>}
+              {analyzing
+                ? <><Spinner size={13} />{!isMobile && 'Running…'}</>
+                : <><Zap size={14} />{!isMobile && 'Run Analysis'}</>
+              }
             </button>
-            <button style={{ padding: 8, borderRadius: 8, background: 'none', border: 'none', color: 'var(--ink-3)', cursor: 'pointer' }}>
-              <Bell size={16} />
-            </button>
-            {auth.user && (
-              <div className="pill" style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '5px 5px 5px 11px' }}>
-                <span className="dot dot-pulse" style={{ background: '#34d399' }} />
-                <span className="mono" style={{ fontSize: 11.5, color: 'var(--ink-2)' }}>@{auth.user.login}</span>
-                {auth.user.avatar_url
-                  ? <img src={auth.user.avatar_url} alt="" style={{ width: 24, height: 24, borderRadius: 7, objectFit: 'cover' }} />
-                  : <div style={{ width: 24, height: 24, borderRadius: 7, background: 'linear-gradient(135deg,#8b5cf6,#3b82f6)', display: 'grid', placeItems: 'center', fontSize: 10, fontWeight: 700, color: '#fff' }}>
-                      {auth.user.login.slice(0, 2).toUpperCase()}
-                    </div>
-                }
-              </div>
+            {!isMobile && (
+              <>
+                <button
+                  className="btn btn-secondary btn-sm"
+                  onClick={() => setAutoFixOpen(true)}
+                  disabled={analyzing || !selectedRepo}
+                  title="Run the autonomous fix loop: analyze → fix → pytest gate → PR → watch CI"
+                >
+                  <Sparkles size={14} /> Auto-fix
+                </button>
+                <button style={{ padding: 8, borderRadius: 8, background: 'none', border: 'none', color: 'var(--ink-3)', cursor: 'pointer' }}>
+                  <Bell size={16} />
+                </button>
+                {auth.user && (
+                  <div className="pill" style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '5px 5px 5px 11px' }}>
+                    <span className="dot dot-pulse" style={{ background: '#34d399' }} />
+                    <span className="mono" style={{ fontSize: 11.5, color: 'var(--ink-2)' }}>@{auth.user.login}</span>
+                    {auth.user.avatar_url
+                      ? <img src={auth.user.avatar_url} alt="" style={{ width: 24, height: 24, borderRadius: 7, objectFit: 'cover' }} />
+                      : <div style={{ width: 24, height: 24, borderRadius: 7, background: 'linear-gradient(135deg,#8b5cf6,#3b82f6)', display: 'grid', placeItems: 'center', fontSize: 10, fontWeight: 700, color: '#fff' }}>
+                          {auth.user.login.slice(0, 2).toUpperCase()}
+                        </div>
+                    }
+                  </div>
+                )}
+              </>
             )}
           </div>
         </div>
@@ -292,7 +439,16 @@ export default function App() {
             selectedPull={selectedPull} agents={agents}
             progressByAgent={progressByAgent}
             overallPct={overallPct}
+            liveLines={liveLines}
+            isMobile={isMobile}
             onCancel={() => { setAnalyzing(false); setPage('repos'); }}
+          />
+        )}
+        {activePage === 'build' && (
+          <BuildPage
+            selectedRepo={selectedRepo}
+            selectedBranch={selectedBranch}
+            accessToken={auth.accessToken}
           />
         )}
         {activePage === 'reports' && report && (
@@ -313,6 +469,17 @@ export default function App() {
           </div>
         )}
       </main>
+
+      {selectedRepo && (
+        <AutoFixDrawer
+          open={autoFixOpen}
+          onClose={() => setAutoFixOpen(false)}
+          owner={selectedRepo.full_name.split('/')[0]}
+          repo={selectedRepo.name}
+          branch={selectedBranch}
+          accessToken={auth.accessToken}
+        />
+      )}
     </div>
   );
 }

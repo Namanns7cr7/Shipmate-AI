@@ -1,11 +1,19 @@
 import { useState } from 'react';
 import { Wand2, Loader2, ExternalLink, AlertCircle, Check, ChevronDown, ChevronUp, Copy } from 'lucide-react';
 import { api } from '../../lib/api';
+import { CIWatchPanel } from './CIWatchPanel';
 import type {
   FindingPayload, RepoLensSummary, ActuateResponse,
 } from '../../types';
 
-type Status = 'idle' | 'running' | 'done' | 'error' | 'no_change';
+/** Extract the PR number from a GitHub PR url, e.g. .../pull/42 -> 42. */
+function prNumberFromUrl(url: string | null | undefined): number | null {
+  if (!url) return null;
+  const m = url.match(/\/pull\/(\d+)/);
+  return m ? Number(m[1]) : null;
+}
+
+type Status = 'idle' | 'running' | 'done' | 'error' | 'no_change' | 'lint_rejected';
 
 interface Props {
   owner: string;
@@ -68,7 +76,11 @@ export function ActuateButton({
         finding, context, open_pr: true,
       });
       setResponse(res);
-      setStatus(res.status === 'no_change' ? 'no_change' : 'done');
+      if (res.status === 'no_change') setStatus('no_change');
+      else if (res.status === 'lint_rejected') {
+        setStatus('lint_rejected');
+        setErrMsg(res.summary || 'Patch rejected by quality lint.');
+      } else setStatus('done');
     } catch (e: unknown) {
       let msg = 'Coder failed';
       if (e && typeof e === 'object' && 'response' in e) {
@@ -82,24 +94,30 @@ export function ActuateButton({
     }
   }
 
-  // ── DONE — green pill, links to the PR ─────────────────────────────────
+  // ── DONE — green pill links to the PR + live CI watcher panel below ────
   if (status === 'done' && response?.pr_url) {
+    const prNum = prNumberFromUrl(response.pr_url);
     return (
-      <a
-        href={response.pr_url}
-        target="_blank"
-        rel="noopener noreferrer"
-        style={{
-          ...PILL_BASE,
-          padding, fontSize: font,
-          color: '#0b1220',
-          background: 'linear-gradient(135deg,#34d399,#10b981)',
-          border: '1px solid #10b981',
-          boxShadow: '0 4px 14px rgba(16,185,129,0.25)',
-        }}
-      >
-        <Check size={font} /> View PR <ExternalLink size={font - 2} />
-      </a>
+      <span style={{ display: 'inline-flex', flexDirection: 'column', alignItems: 'flex-end', gap: 6, maxWidth: '100%' }}>
+        <a
+          href={response.pr_url}
+          target="_blank"
+          rel="noopener noreferrer"
+          style={{
+            ...PILL_BASE,
+            padding, fontSize: font,
+            color: '#0b1220',
+            background: 'linear-gradient(135deg,#34d399,#10b981)',
+            border: '1px solid #10b981',
+            boxShadow: '0 4px 14px rgba(16,185,129,0.25)',
+          }}
+        >
+          <Check size={font} /> View PR <ExternalLink size={font - 2} />
+        </a>
+        {prNum !== null && (
+          <CIWatchPanel owner={owner} repo={repo} prNumber={prNum} />
+        )}
+      </span>
     );
   }
 
@@ -113,6 +131,57 @@ export function ActuateButton({
         border: '1px solid var(--line)',
       }}>
         <Check size={font} /> No change needed
+      </span>
+    );
+  }
+
+  // ── LINT REJECTED — amber pill, expandable reasoning + retry ──────────
+  // The Coder agent produced a patch but the post-Coder quality lint
+  // rejected it (hallucinated imports, missing symbols, .gitkeep theater,
+  // NEW test theater). NO branch / commit / PR was created.
+  if (status === 'lint_rejected') {
+    return (
+      <span style={{ display: 'inline-flex', flexDirection: 'column', alignItems: 'flex-end', gap: 6, maxWidth: '100%' }}>
+        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+          <button
+            onClick={run}
+            title="Retry"
+            style={{
+              ...PILL_BASE,
+              padding, fontSize: font,
+              color: '#1a1300',
+              background: 'linear-gradient(135deg,#fbbf24,#f59e0b)',
+              border: '1px solid #f59e0b',
+            }}
+          >
+            <AlertCircle size={font} /> Patch rejected — Retry
+          </button>
+          <button
+            onClick={() => setErrorExpanded(v => !v)}
+            title={errorExpanded ? 'Hide reason' : 'Show reason'}
+            style={{
+              ...PILL_BASE, padding: '4px 6px', fontSize: font,
+              color: 'var(--ink-3)', background: 'transparent',
+              border: '1px solid var(--line)',
+            }}
+          >
+            {errorExpanded ? <ChevronUp size={font} /> : <ChevronDown size={font} />}
+          </button>
+        </span>
+        {errorExpanded && (
+          <div style={{
+            maxWidth: 520, padding: '8px 10px', borderRadius: 8,
+            background: 'rgba(245,158,11,0.08)',
+            border: '1px solid rgba(245,158,11,0.3)',
+            fontSize: font - 1, color: 'var(--ink-2)', lineHeight: 1.4,
+            whiteSpace: 'normal', wordBreak: 'break-word',
+          }}>
+            <div style={{ fontWeight: 700, color: '#fbbf24', marginBottom: 4 }}>
+              Why ShipMate refused to ship this:
+            </div>
+            {errMsg}
+          </div>
+        )}
       </span>
     );
   }

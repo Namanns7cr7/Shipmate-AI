@@ -1,5 +1,21 @@
 name: CI/CD Pipeline
 
+# Three-tier gating, fastest-fails-first:
+#
+#   quick-gate       (<60s)  — syntax / typecheck / secret-scan. Fast red signal
+#                              for the auto-fix loop on syntax errors so it
+#                              doesn't wait 5 min for full pytest.
+#   test-gate        (2-5m)  — pytest (+cov +JUnit XML), flake8, frontend lint,
+#                              bandit security. Blocks merge. Uploads JUnit XML
+#                              + coverage as artifacts — CIWatcher consumes the
+#                              JUnit XML to feed STRUCTURED failures back to Coder.
+#   integration-gate (PR +   — docker build + boot smoke (GET /health). No
+#                     main)    registry push, no deploy (quality-only per scope).
+#
+# The CIWatcher's collect_failure_context fetches failed-job logs via the
+# Actions API; with junit.xml uploaded it can also pull the parsed test
+# results (test name / file / line / exception) instead of raw stdout.
+
 on:
   push:
     branches:
@@ -16,57 +32,103 @@ on:
       - feat/**
       - fix/**
 
-jobs:
-  # ──────────────────────────────────────────────
-  # JavaScript / TypeScript — lint & test
-  # ──────────────────────────────────────────────
-  frontend:
-    name: Frontend (Node / TypeScript)
-    runs-on: ubuntu-latest
+# A newer push to the same ref cancels the older in-flight run — keeps the
+# auto-fix loop's wall-clock bounded (it pushes a fix, the prior CI is moot).
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.11"
+  NODE_VERSION: "20"
+  # Coverage floor. Current backend coverage is ~68% (445 tests). 60 is an
+  # 8-point-headroom ratchet that locks in what we have while tolerating normal
+  # churn. Ratchet this UP as coverage grows — do not lower.
+  COV_FAIL_UNDER: "60"
+
+jobs:
+  # ════════════════════════════════════════════════════════════════════
+  # QUICK GATE — <60s. Syntax, typecheck, secrets. Fail fast.
+  # ════════════════════════════════════════════════════════════════════
+  backend-syntax:
+    name: quick-gate · backend syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Compile-check every .py (syntax errors -> hard fail)
+        working-directory: backend
+        run: python -m compileall -q app scripts
+
+      - name: flake8 — undefined names / syntax (E9,F63,F7,F82)
+        working-directory: backend
+        run: |
+          pip install flake8
+          # Scope to OUR code only — never scan venv/site-packages.
+          flake8 app scripts tests \
+            --count --select=E9,F63,F7,F82 --show-source --statistics
+
+  frontend-typecheck:
+    name: quick-gate · frontend typecheck
+    runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: frontend
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: ${{ env.NODE_VERSION }}
           cache: 'npm'
           cache-dependency-path: frontend/package-lock.json
 
       - name: Install dependencies
         run: npm ci
 
-      - name: Lint
-        run: npm run lint --if-present
+      - name: TypeScript — type-check only (no emit)
+        run: npx tsc --noEmit
 
-      - name: Run tests
-        run: npm test --if-present -- --ci --passWithNoTests
-
-  # ──────────────────────────────────────────────
-  # Python — lint & test
-  # ──────────────────────────────────────────────
-  backend:
-    name: Backend (Python / pytest)
+  secret-scan:
+    name: quick-gate · secret scan
     runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # gitleaks diffs history on PRs; full clone gives it the base commits.
+          fetch-depth: 0
 
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ════════════════════════════════════════════════════════════════════
+  # TEST GATE — 2-5m. pytest + cov + JUnit, lint, security. Blocks merge.
+  # ════════════════════════════════════════════════════════════════════
+  backend-test:
+    name: test-gate · backend pytest
+    runs-on: ubuntu-latest
+    needs: [backend-syntax]
     defaults:
       run:
         working-directory: backend
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: ${{ env.PYTHON_VERSION }}
           cache: 'pip'
 
       - name: Install dependencies
@@ -74,39 +136,129 @@ jobs:
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
           if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt; fi
-          pip install pytest pytest-cov flake8
+          pip install pytest pytest-cov pytest-timeout
 
-      - name: Lint with flake8
+      - name: pytest (+coverage +JUnit XML)
+        # Hard caps so a single hung test can NEVER wedge the whole job (which
+        # was leaving the run in_progress for 30+ min and blocking the CI
+        # watcher). --timeout kills any test exceeding 60s and dumps its stack
+        # (faulthandler) so the culprit is visible in the log; the job-level
+        # timeout-minutes is a belt-and-suspenders backstop. The suite runs in
+        # ~1.5s locally, so 60s/test + 8min/job is enormous headroom.
+        timeout-minutes: 8
         run: |
-          # Stop the build on syntax errors or undefined names;
-          # treat all other issues as warnings.
-          flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
-          flake8 . --count --exit-zero --max-line-length=120 --statistics
+          mkdir -p reports
+          # --timeout kills any test exceeding 60s and dumps its stack so a
+          # single hang can't wedge the whole job (see conftest anyio_backend
+          # fixture for the root cause that made this necessary). -rfE names
+          # any failures/errors in the summary without full verbosity.
+          PYTHONPATH=. pytest \
+            --tb=short -rfE \
+            --timeout=60 --timeout-method=thread \
+            --cov=app --cov-report=xml:reports/coverage.xml --cov-report=term \
+            --cov-fail-under=${{ env.COV_FAIL_UNDER }} \
+            --junitxml=reports/junit.xml \
+            --continue-on-collection-errors \
+            -q
 
-      - name: Run tests with pytest
-        run: PYTHONPATH=. pytest --tb=short --ignore=tests/integration -q
+      - name: Upload test reports (CIWatcher consumes junit.xml)
+        if: always()  # upload even on failure — the watcher needs the failures
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-test-reports
+          path: backend/reports/
+          retention-days: 7
 
-  # ──────────────────────────────────────────────
-  # Docker — build both images to catch integration issues
-  # ──────────────────────────────────────────────
-  docker:
-    name: Docker Build
+  backend-lint:
+    name: test-gate · backend flake8 (style)
     runs-on: ubuntu-latest
-    needs: [frontend, backend]
-
+    needs: [backend-syntax]
+    defaults:
+      run:
+        working-directory: backend
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: flake8 (style — warnings only, non-blocking)
+        run: |
+          pip install flake8
+          flake8 app scripts tests --count --exit-zero --max-line-length=120 --statistics
+
+  frontend-lint:
+    name: test-gate · frontend lint
+    runs-on: ubuntu-latest
+    needs: [frontend-typecheck]
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: ESLint
+        run: npm run lint --if-present
+
+      - name: Run tests (if a runner is configured)
+        run: npm test --if-present -- --run --passWithNoTests
+
+  bandit-security:
+    name: test-gate · bandit (eval / __import__)
+    runs-on: ubuntu-latest
+    needs: [backend-syntax]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install bandit
+        run: pip install bandit
+
+      - name: Run bandit (B307 eval, B302 __import__)
+        # Promoted from the standalone bandit-lint.yml. -ll = report MEDIUM+
+        # severity. We block on findings here (no --exit-zero) — these two
+        # checks map directly to the patterns sanitize_input_middleware guards.
+        run: bandit -r backend/app/ -t B307,B302 -ll
+
+  # ════════════════════════════════════════════════════════════════════
+  # INTEGRATION GATE — PR + main. Docker build + boot smoke. No push/deploy.
+  # ════════════════════════════════════════════════════════════════════
+  docker-smoke:
+    name: integration-gate · docker build + boot smoke
+    runs-on: ubuntu-latest
+    needs: [backend-test, frontend-lint, bandit-security]
+    steps:
+      - uses: actions/checkout@v4
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build backend Docker image
+      - name: Build backend image
         uses: docker/build-push-action@v5
         with:
-          context: .
+          # Context is backend/ — the Dockerfile is self-contained (COPY paths
+          # are relative to backend/) so the same image builds via Azure
+          # Container Apps `--source backend`. Keep these in lockstep.
+          context: backend
           file: backend/Dockerfile
           push: false
+          load: true                 # keep image in the local daemon for `docker run`
           tags: shipmate-backend:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
@@ -120,3 +272,22 @@ jobs:
           tags: shipmate-frontend:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Boot smoke — container answers GET /health
+        run: |
+          docker run -d --name shipmate-ci -p 8000:8000 shipmate-backend:ci
+          echo "Waiting for /health to come up..."
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:8000/health >/dev/null 2>&1; then
+              echo "✓ /health is up after ${i}s"
+              curl -fsS http://localhost:8000/health
+              echo
+              docker rm -f shipmate-ci
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "✗ /health never came up — container logs:"
+          docker logs shipmate-ci
+          docker rm -f shipmate-ci
+          exit 1

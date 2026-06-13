@@ -59,6 +59,8 @@ export interface ArchitectureRisk {
   risk: string;
   impact: string;
   category: string;
+  evidence?: string;
+  confidence?: string;
 }
 
 export interface RepoLensOutput {
@@ -85,6 +87,7 @@ export interface Milestone {
   category: string;
   source?: 'heuristic' | 'discovery';
   rationale?: string | null;
+  confidence?: 'high' | 'medium' | 'low';
 }
 
 export interface Blocker {
@@ -96,6 +99,7 @@ export interface Blocker {
   category: string;
   source?: 'heuristic' | 'discovery';
   rationale?: string | null;
+  confidence?: 'high' | 'medium' | 'low';
 }
 
 export interface PlanForgeOutput {
@@ -118,6 +122,7 @@ export interface SecurityFinding {
   cve?: string;
   source?: 'heuristic' | 'discovery';
   rationale?: string | null;
+  confidence?: 'high' | 'medium' | 'low';
 }
 
 export interface GuardRailOutput {
@@ -144,6 +149,7 @@ export interface SuggestedTest {
   target_file?: string;
   source?: 'heuristic' | 'discovery';
   rationale?: string | null;
+  confidence?: 'high' | 'medium' | 'low';
 }
 
 export interface TestPilotOutput {
@@ -223,6 +229,12 @@ export interface ShipMateReport {
   generated_at: string;
   // Present ONLY when a PR (pr_number) was analyzed; null for a branch analysis.
   pr_risk?: PRRiskOutput | null;
+  /** False when the run degraded to pure heuristics (LLM provider
+   *  unavailable) — the UI shows a heuristic-only banner. Optional for
+   *  back-compat with older payloads. */
+  ai_enhanced?: boolean;
+  /** Human-readable score deduction list (e.g. "-20 repo_score: no test files detected"). */
+  score_explanation?: string[];
 }
 
 export interface AnalyzeResponse {
@@ -265,6 +277,166 @@ export interface ActuateResponse {
   files_changed: ActuatedFile[];
   skipped: string[];
   summary: string;
+}
+
+// ── CI watcher (closed-loop CI feedback on a Coder-opened PR) ───────────────────
+
+export interface WatcherState {
+  owner: string;
+  repo: string;
+  pr_number: number;
+  pr_url?: string | null;
+  branch: string;
+  status: 'watching' | 'fixing' | 'passed' | 'gave_up' | 'crashed';
+  attempts: number;
+  max_attempts: number;
+  history: Array<{ attempt: number; files_changed: string[]; summary: string; patch_hash: string }>;
+  last_error?: string | null;
+  started_ago_s: number;
+  last_event_ago_s: number;
+  finding_id: string;
+  finding_title: string;
+}
+
+export interface WatcherLogLine {
+  id: number;
+  ts: number;
+  level: 'info' | 'warn' | 'error';
+  msg: string;
+}
+
+// ── Finding journal ─────────────────────────────────────────────────────────────
+
+export type JournalState = 'in_progress' | 'shipped' | 'dismissed' | 'parked';
+
+export interface JournalRow {
+  finding_sig: string;
+  repo_full_name: string;
+  state: JournalState;
+  last_attempt_at: number;
+  attempt_count: number;
+  pr_url?: string | null;
+  notes?: string | null;
+}
+
+export interface JournalResponse {
+  repo: string;
+  rows: JournalRow[];
+  state_map: Record<string, JournalState>;
+}
+
+// ── Auto-fix SSE events ─────────────────────────────────────────────────────────
+
+export interface AutoFixEvent {
+  event:
+    | 'loop.start' | 'analyze.start' | 'analyze.done' | 'finding.picked'
+    | 'actuate.start' | 'actuate.done' | 'round.done' | 'loop.done'
+    | 'error' | 'heartbeat';
+  round?: number;
+  rounds?: number;
+  score?: number | null;
+  picked?: number;
+  kind?: string;
+  title?: string;
+  signature?: string;
+  status?: string;
+  pr_url?: string | null;
+  files_changed?: (string | null)[];
+  good?: number;
+  skipped?: number;
+  actuated?: number;
+  note?: string;
+  message?: string;
+}
+
+// ── Score history ───────────────────────────────────────────────────────────────
+
+export interface ScorePoint {
+  id: number;
+  score: number;
+  branch: string;
+  recorded_at: string;
+  breakdown: { repo?: number; delivery?: number; security?: number; test?: number };
+}
+
+// ── Opportunity Planner (Build tab) ─────────────────────────────────────────────
+
+export interface Opportunity {
+  id: string;
+  title: string;
+  category: 'feature' | 'improvement' | 'tweak' | 'bug' | string;
+  description: string;
+  impact: string;
+  effort: 'S' | 'M' | 'L' | string;
+  estimated_days: number;
+  target_files: string[];
+  suggested_approach: string[];
+  evidence: string[];
+  rationale: string;
+  value_score: number;
+  priority: 'critical' | 'high' | 'medium' | 'low' | string;
+  grounded: boolean;
+  worth_doing: boolean;
+  verify_reason?: string | null;
+  journal_state?: string | null;
+  source: string;
+}
+
+export interface BuildPlanResponse {
+  owner: string;
+  repo: string;
+  branch: string;
+  opportunities: Opportunity[];
+  total_found: number;
+  grounded_count: number;
+  verified_count: number;
+  ai_enhanced: boolean;
+  generated_at: string;
+}
+
+export interface BuildStep {
+  index: number;
+  title: string;
+  description: string;
+  target_files: string[];
+  depends_on: number[];
+  kind: string;
+  rationale: string;
+}
+
+export interface ExecutionPlan {
+  opportunity_id: string;
+  opportunity_title: string;
+  summary: string;
+  steps: BuildStep[];
+  estimated_days: number;
+  grounded: boolean;
+  notes: string[];
+}
+
+export interface PlanCritique {
+  approved: boolean;
+  coherent: boolean;
+  complete: boolean;
+  in_scope: boolean;
+  issues: string[];
+  reason: string;
+}
+
+export interface BuildExecuteResponse {
+  owner: string;
+  repo: string;
+  branch: string;
+  opportunity_id: string;
+  plan?: ExecutionPlan | null;
+  critique?: PlanCritique | null;
+  executed: boolean;
+  pr_url?: string | null;
+  files_changed: string[];
+  status: 'planned' | 'plan_rejected' | 'executed' | 'execute_failed' | 'degraded' | string;
+  summary: string;
+  ai_enhanced: boolean;
+  generated_at: string;
 }
 
 // ── App state ─────────────────────────────────────────────────────────────────

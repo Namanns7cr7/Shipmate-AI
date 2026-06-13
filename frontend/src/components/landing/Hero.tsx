@@ -28,19 +28,20 @@ export function Hero({ onLogin, loading, error }: HeroProps) {
           </span>
 
           <h1 style={{ fontSize: 'clamp(36px, 4.5vw, 56px)', lineHeight: 1.04, fontWeight: 850, letterSpacing: '-0.035em', margin: '0 0 20px' }}>
-            Ship{' '}
-            <span className="gradient-ink">production-ready</span>
-            {' '}code with AI agents
+            Diagnose, then{' '}
+            <span className="gradient-ink">actually fix</span>
+            {' '}your repo with AI agents
           </h1>
 
           <p style={{ fontSize: 17, lineHeight: 1.6, color: 'var(--ink-2)', maxWidth: 520, margin: '0 0 16px' }}>
-            Connect GitHub and ShipMate's agents analyze your repo, detect PR &amp; security risks,
-            generate the tests you're missing, and return a single deployment-readiness score.
+            Connect GitHub and ShipMate's agents map your repo, score deployment readiness,
+            and surface security &amp; coverage risks — then write the fix, validate it, and
+            open the pull request for you.
           </p>
 
           {/* Step strip */}
           <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 6, marginBottom: 30 }}>
-            {['Connect GitHub', 'Analyze repo', 'Detect risks', 'Generate tests', 'Ship readiness'].map((s, i) => (
+            {['Connect GitHub', 'Analyze repo', 'Readiness score', 'Auto-fix', 'Open PR'].map((s, i) => (
               <span key={s} style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
                 <span className="mono" style={{ fontSize: 12, color: i === 4 ? 'var(--blue-2)' : 'var(--ink-3)', fontWeight: 600 }}>{s}</span>
                 {i < 4 && <span style={{ color: 'var(--ink-4)', fontSize: 12 }}>→</span>}
@@ -60,7 +61,7 @@ export function Hero({ onLogin, loading, error }: HeroProps) {
 
           {/* Trust row */}
           <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 20, marginTop: 26 }}>
-            {['No code changes', 'Read-only access', 'Results in ~90s'].map(t => (
+            {['Every fix ships as a reviewable PR', 'Token stays server-side', 'Analysis in ~90s'].map(t => (
               <span key={t} style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12.5, color: 'var(--ink-3)' }}>
                 <Check size={14} style={{ color: '#34d399' }} /> {t}
               </span>

@@ -25,7 +25,9 @@ from typing import Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field
 
+import os
 from app.services.bedrock_provider import BedrockProvider
+from app.services.llm_provider import get_provider
 
 logger = logging.getLogger("shipmate.coder_agent")
 
@@ -37,7 +39,12 @@ _SYSTEM_PROMPT = (
     "(c) the current contents of 1-5 target files. For each file you choose "
     "to change, output the COMPLETE new file content — no diffs, no '...', "
     "no placeholders, no truncation. Match existing style: indentation, "
-    "import order, naming. Hard cap: 5 modified files.\n\n"
+    "import order, naming. The patch should be focused — touch only the "
+    "files genuinely required for THIS finding. There is no enforced "
+    "file cap, but a smaller, surgical patch is always preferred over a "
+    "broad rewrite. If a finding genuinely needs many files (e.g. an "
+    "end-to-end feature touching service + route + tests + types), do "
+    "all of it correctly; if you need 1 file, return 1.\n\n"
 
     "## Hard rules — violations are rejected\n\n"
 
@@ -158,6 +165,31 @@ _SYSTEM_PROMPT = (
     "summary under 5 sentences plus the mandatory VERIFY line."
 )
 
+# Diff-mode system prompt: same rules, but emit unified diffs. Used only when
+# the caller opts into diff mode (token savings on large files). The applier
+# (diff_apply) relocates hunks by context, so exact line numbers aren't
+# critical — but real context lines ARE, or the hunk won't locate.
+_SYSTEM_PROMPT_DIFF = (
+    _SYSTEM_PROMPT
+    + "\n\n# OUTPUT FORMAT OVERRIDE — UNIFIED DIFF MODE\n"
+    "Instead of full file contents, emit a UNIFIED DIFF per changed file in "
+    "the `unified_diff` field:\n"
+    "  • Use `@@ -oldStart,oldCount +newStart,newCount @@` hunk headers.\n"
+    "  • Prefix unchanged context lines with a single space, removed lines "
+    "with '-', added lines with '+'.\n"
+    "  • Include AT LEAST 3 lines of real, verbatim context above and below "
+    "each change so the hunk can be located even if line numbers drifted.\n"
+    "  • Context/removed lines MUST exactly match the current file content "
+    "(byte-for-byte, including indentation) — a mismatch makes the diff fail "
+    "to apply and the whole patch is discarded.\n"
+    "  • Do NOT include ---/+++ file header lines; the `path` field names "
+    "the file.\n"
+    "  • Only use diff mode for EDITS to existing files. For a brand-new "
+    "file, you cannot diff — list it in `skipped` and note that it needs "
+    "full-file mode.\n"
+    "All the scope/test/anti-theater rules above still apply to the diff."
+)
+
 
 class CoderFile(BaseModel):
     path: str = Field(..., description="Relative repo path, e.g. 'app/main.py' or '.github/workflows/ci.yml'.")
@@ -168,6 +200,26 @@ class CoderFile(BaseModel):
 class CoderOutput(BaseModel):
     files: List[CoderFile] = Field(default_factory=list)
     skipped: List[str] = Field(default_factory=list, description="Paths from target_files that did not need changes.")
+    summary: str = Field(..., description="1-2 sentence summary of what the patch does and why.")
+
+
+class CoderFileDiff(BaseModel):
+    """Diff-mode counterpart of CoderFile — a unified diff, not full content."""
+    path: str = Field(..., description="Relative repo path being patched (must be an existing file).")
+    unified_diff: str = Field(
+        ...,
+        description=(
+            "A unified diff for this file: @@ -l,s +l,s @@ hunk headers with "
+            "' ' context, '-' removed, '+' added lines. No ---/+++ needed. "
+            "Include 3 lines of context around each change."
+        ),
+    )
+    rationale: str = Field(..., description="One sentence explaining why this file changed.")
+
+
+class CoderOutputDiff(BaseModel):
+    files: List[CoderFileDiff] = Field(default_factory=list)
+    skipped: List[str] = Field(default_factory=list, description="Paths that did not need changes.")
     summary: str = Field(..., description="1-2 sentence summary of what the patch does and why.")
 
 
@@ -227,20 +279,32 @@ class CoderAgent:
         self._provider = provider
 
     def _get_provider(self) -> BedrockProvider:
+        # Routed through the factory so SHIPMATE_LLM_PROVIDER selects Bedrock,
+        # Azure OpenAI, or Anthropic. Type hint stays BedrockProvider for back-compat.
         if self._provider is None:
-            self._provider = BedrockProvider()
+            self._provider = get_provider()
         return self._provider
 
     def run(
         self,
         brief: CoderBrief,
         deployment_hint: Literal["smart", "fast"] = "smart",
+        mode: Literal["full", "diff"] = "full",
     ) -> CoderOutput:
         """
         Synchronous (the underlying Bedrock SDK is sync; we call the
         `_sync` variant to stay safe inside FastAPI's running event loop —
         the route awaits us via `asyncio.to_thread`).
+
+        `mode="diff"` asks the model for unified diffs (token-saving on large
+        files); the diffs are applied here and the method STILL returns a
+        normal CoderOutput (full new_content per file), so every downstream
+        consumer (lint, scope guard, pytest gate, GitHub commit) is unchanged.
+        On any diff-apply failure it transparently falls back to full mode.
         """
+        if mode == "diff":
+            return self._run_diff_with_fallback(brief, deployment_hint)
+
         provider = self._get_provider()
         user_prompt = _build_user_prompt(brief)
 
@@ -255,8 +319,95 @@ class CoderAgent:
             schema_class=CoderOutput,
             deployment_hint=deployment_hint,
         )
-        # Hard cap defense (in case Bedrock ignores the prompt cap).
-        if len(result.files) > 5:
-            logger.warning("Coder returned %d files; truncating to 5", len(result.files))
-            result.files = result.files[:5]
+        return self._cap_runaway(result)
+
+    def _run_diff_with_fallback(
+        self,
+        brief: CoderBrief,
+        deployment_hint: Literal["smart", "fast"] = "smart",
+    ) -> CoderOutput:
+        """Diff-mode path: ask for unified diffs, apply them against the
+        brief's target_files, and return a full-content CoderOutput. Falls
+        back to a full-file `run(mode='full')` if the model emits no diffs or
+        any diff fails to apply / breaks .py syntax."""
+        from app.services import diff_apply as da
+
+        provider = self._get_provider()
+        user_prompt = _build_user_prompt(brief)
+        logger.info(
+            "Coder.run(diff) kind=%s id=%s files=%d",
+            brief.finding_kind, brief.finding_id, len(brief.target_files),
+        )
+        diff_out: CoderOutputDiff = provider.invoke_structured_sync(
+            system_prompt=_SYSTEM_PROMPT_DIFF,
+            user_prompt=user_prompt,
+            schema_class=CoderOutputDiff,
+            deployment_hint=deployment_hint,
+        )
+
+        if not diff_out.files:
+            logger.info("Coder.run(diff): no diffs returned — falling back to full mode")
+            return self.run(brief, deployment_hint, mode="full")
+
+        files: List[CoderFile] = []
+        for fd in diff_out.files:
+            original = brief.target_files.get(fd.path, "")
+            if not original.strip():
+                logger.info(
+                    "Coder.run(diff): %s is new/empty — diff can't apply, fallback to full",
+                    fd.path,
+                )
+                return self.run(brief, deployment_hint, mode="full")
+            patched, err = da.apply_and_validate(original, fd.unified_diff, fd.path)
+            if patched is None:
+                logger.info(
+                    "Coder.run(diff): apply failed for %s (%s) — fallback to full",
+                    fd.path, err,
+                )
+                return self.run(brief, deployment_hint, mode="full")
+            files.append(CoderFile(
+                path=fd.path, new_content=patched, rationale=fd.rationale,
+            ))
+
+        return self._cap_runaway(CoderOutput(
+            files=files, skipped=diff_out.skipped, summary=diff_out.summary,
+        ))
+
+    def run_with_lint_feedback(
+        self,
+        brief: CoderBrief,
+        lint_issues: List[str],
+        deployment_hint: Literal["smart", "fast"] = "smart",
+    ) -> CoderOutput:
+        """Re-run after post-Coder lint rejected the first patch, feeding the
+        specific issues back so the model corrects them. Used by the
+        orchestrator for one auto-retry before returning `lint_rejected`."""
+        provider = self._get_provider()
+        user_prompt = _build_user_prompt(brief)
+        logger.info(
+            "Coder.run_with_lint_feedback kind=%s id=%s issues=%d",
+            brief.finding_kind, brief.finding_id, len(lint_issues),
+        )
+        result = provider.invoke_with_lint_feedback(
+            system_prompt=_SYSTEM_PROMPT,
+            user_prompt=user_prompt,
+            schema_class=CoderOutput,
+            lint_issues=lint_issues,
+            deployment_hint=deployment_hint,
+        )
+        return self._cap_runaway(result)
+
+    @staticmethod
+    def _cap_runaway(result: CoderOutput) -> CoderOutput:
+        # Sanity-only soft cap. Anything above 25 files in a single patch
+        # is almost certainly a runaway generation — log and trim. Below
+        # that, trust the model: real refactors and feature work
+        # legitimately need >5 files.
+        _RUNAWAY_FILE_LIMIT = 25
+        if len(result.files) > _RUNAWAY_FILE_LIMIT:
+            logger.warning(
+                "Coder returned %d files (over runaway limit %d); truncating",
+                len(result.files), _RUNAWAY_FILE_LIMIT,
+            )
+            result.files = result.files[:_RUNAWAY_FILE_LIMIT]
         return result

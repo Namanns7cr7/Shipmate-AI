@@ -8,8 +8,12 @@ import json
 import hmac
 import hashlib
 import logging
-from typing import Callable
+import unicodedata
+from contextlib import asynccontextmanager
+from typing import Any, Callable
 from urllib.parse import urlparse
+
+logger = logging.getLogger("shipmate.main")
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -21,8 +25,10 @@ from app.api.routes.analysis import router as analysis_router
 from app.api.routes.actuate import router as actuate_router
 from app.api.routes.watcher import router as watcher_router
 from app.api.routes.branches import router as branches_router
-
-logger = logging.getLogger("shipmate")
+from app.api.routes.findings import router as findings_router
+from app.api.routes.auto_fix import router as auto_fix_router
+from app.api.routes.history import router as history_router
+from app.api.routes.build import router as build_router
 
 # ---------------------------------------------------------------------------
 # Rate Limiting: Token Bucket Implementation
@@ -54,7 +60,10 @@ class _RateLimiter:
     def __init__(self, capacity: int, refill_rate: float):
         self.capacity = capacity
         self.refill_rate = refill_rate
+        # Plain dict — is_allowed() creates buckets on demand via an explicit
+        # key check below.
         self.buckets: dict[str, _TokenBucket] = {}
+
 
     def is_allowed(self, client_ip: str) -> bool:
         if client_ip not in self.buckets:
@@ -155,6 +164,28 @@ def _validate_endpoint_urls() -> None:
 _validate_endpoint_urls()
 
 # ---------------------------------------------------------------------------
+# Input Sanitization helpers
+#
+# _TEXT_CONTENT_TYPES and _is_text_content_type are used by
+# sanitize_input_middleware below to decide which request bodies to scan.
+# ---------------------------------------------------------------------------
+
+_TEXT_CONTENT_TYPES = (
+    "application/json",
+    "application/x-www-form-urlencoded",
+    "multipart/form-data",
+    "text/plain",
+    "text/",
+)
+
+
+def _is_text_content_type(content_type: str) -> bool:
+    """Return True when the content-type indicates a text-based body."""
+    ct_lower = content_type.lower()
+    return any(ct_lower.startswith(prefix) or prefix in ct_lower for prefix in _TEXT_CONTENT_TYPES)
+
+
+# ---------------------------------------------------------------------------
 # CORS origin allowlist
 # In production set ALLOWED_ORIGINS to a comma-separated list of origins, e.g.:
 #   ALLOWED_ORIGINS=https://app.shipmate.ai
@@ -191,7 +222,24 @@ ALLOWED_ORIGINS: list[str] = [
 
 
 def _is_origin_allowed(origin: str) -> bool:
-    """Exact-match check against the ALLOWED_ORIGINS allowlist."""
+    """Exact-match check: is *origin* on the CORS allowlist? (SEC-004)
+
+    Deliberately strict — no prefix, suffix, or subdomain matching. This is
+    the guard that prevents spoofed origins a naive ``startswith``/substring
+    check would wrongly accept:
+
+    - ``http://localhost:5173.evil.com``  (prefix attack)  -> False
+    - ``http://evil.localhost:5173``      (subdomain)       -> False
+    - ``http://localhost:5173/``          (trailing slash)  -> False
+    - ``""``                              (empty)           -> False
+    - ``"*"``                             (wildcard)        -> False
+
+    A wildcard is never allowed because ``allow_credentials=True`` is
+    incompatible with ``*``. Returns True only for a byte-for-byte member of
+    ALLOWED_ORIGINS.
+    """
+    if not origin or "*" in origin:
+        return False
     return origin in ALLOWED_ORIGINS
 
 
@@ -215,35 +263,87 @@ _DANGEROUS_PATTERNS: list[re.Pattern] = [
 _SKIP_HEADERS = {"authorization", "cookie"}
 
 
+def _normalize_for_scanning(text: str, max_passes: int = 3) -> str:
+    """Defeat common blocklist-evasion encodings before pattern matching.
+
+    An attacker can hide `eval(` as `eval%2528` (double URL-encode), `ev%61l(`
+    (partial), or via Unicode compatibility forms. We:
+      1. Recursively URL-decode until the string stops changing (bounded passes,
+         so a pathological input can't loop) — catches multi-layer %-encoding.
+      2. Apply Unicode NFKC normalization — folds compatibility/full-width
+         variants (e.g. ﹙ -> '(') to their canonical ASCII so the regexes match.
+    Returns the most-decoded form; callers scan BOTH this and the raw text."""
+    from urllib.parse import unquote_plus
+
+    prev = text
+    for _ in range(max_passes):
+        decoded = unquote_plus(prev)
+        if decoded == prev:
+            break
+        prev = decoded
+    try:
+        prev = unicodedata.normalize("NFKC", prev)
+    except Exception:
+        pass
+    return prev
+
+
 def _contains_dangerous_pattern(text: str) -> bool:
-    return any(p.search(text) for p in _DANGEROUS_PATTERNS)
+    """Return True if *text* matches any known code-injection pattern.
+
+    Scans BOTH the raw text and an encoding-normalized form (recursive
+    URL-decode + Unicode NFKC) so blocklist-evasion via %-encoding or Unicode
+    compatibility variants can't slip a payload past the regexes."""
+    if any(p.search(text) for p in _DANGEROUS_PATTERNS):
+        return True
+    normalized = _normalize_for_scanning(text)
+    if normalized != text and any(p.search(normalized) for p in _DANGEROUS_PATTERNS):
+        return True
+    return False
 
 
 # ---------------------------------------------------------------------------
-# GitHub webhook HMAC-SHA256 signature verification
+# Application lifespan — startup / shutdown hooks
 # ---------------------------------------------------------------------------
 
-def _verify_github_webhook_signature(body: bytes, header_sig: str) -> bool:
-    """Constant-time HMAC-SHA256 comparison for GitHub webhook payloads."""
-    secret = os.getenv("GITHUB_WEBHOOK_SECRET", "")
-    if not secret:
-        return False
-    mac = hmac.new(secret.encode(), body, hashlib.sha256)
-    expected = "sha256=" + mac.hexdigest()
-    return hmac.compare_digest(expected, header_sig)
+@asynccontextmanager
+async def _lifespan(app: "FastAPI"):
+    """Startup: initialize the inflight-registry sqlite (creates tables) and
+    re-spawn CIWatcher supervisors for any PR still being watched when the
+    backend last stopped (uvicorn --reload restarts on every code change).
+    Shutdown: nothing to flush — sqlite commits are synchronous per write."""
+    # --- startup ---
+    try:
+        # One call creates every registered sqlite store (inflight, reports,
+        # oauth) with the shared connection/PRAGMA/location policy. The route
+        # imports above have already executed each store module's register().
+        from app.services import sqlite_store as _store
+        _store.init_all()
+    except Exception as e:  # pragma: no cover - startup best-effort
+        logger.warning("sqlite_store init_all failed: %s", e)
+    try:
+        from app.services.ci_watcher import CIWatcher
+        resumed = CIWatcher.resume_from_db()
+        if resumed:
+            logger.info("resumed %d CI watcher(s) after restart", resumed)
+    except Exception as e:  # pragma: no cover
+        logger.warning("CIWatcher resume failed: %s", e)
+
+    yield
+    # --- shutdown --- (no-op; sqlite is durable per-commit)
 
 
-# ---------------------------------------------------------------------------
-# Application
-# ---------------------------------------------------------------------------
+_ENVIRONMENT = os.getenv("ENVIRONMENT", "development").strip().lower()
+_IS_PRODUCTION = _ENVIRONMENT in ("production", "prod")
 
-_is_dev = os.getenv("ENVIRONMENT", "production").lower() == "development"
 app = FastAPI(
     title="ShipMate AI",
     description="AI-native multi-agent release readiness platform",
     version="2.0.0",
-    docs_url="/docs" if _is_dev else None,
-    redoc_url="/redoc" if _is_dev else None,
+    docs_url=None if _IS_PRODUCTION else "/docs",
+    redoc_url=None if _IS_PRODUCTION else "/redoc",
+    openapi_url=None if _IS_PRODUCTION else "/openapi.json",
+    lifespan=_lifespan,
 )
 
 app.add_middleware(
@@ -259,7 +359,7 @@ app.add_middleware(
 # middleware. Starlette/FastAPI inserts each @app.middleware at position 0
 # of the middleware list and reverses when building the stack — so the LAST
 # registered decorator becomes the OUTERMOST layer (runs first for requests).
-# Desired request order: security_headers → sanitize → rate-limiters → CORS
+# Desired request order: security_headers → strict_cors → sanitize → rate-limiters → CORS
 @app.middleware("http")
 async def _rate_limit_auth(request: Request, call_next: Callable):
     return await rate_limit_auth_middleware(request, call_next)
@@ -295,15 +395,12 @@ async def sanitize_input_middleware(request: Request, call_next):
                 content={"detail": "Request contains disallowed content"},
             )
 
+    # 3. Request body — every text-based content type (JSON, form-urlencoded,
+    #    multipart/form-data, text/plain). Multipart uploads carry attacker-
+    #    controlled file bytes, so they must be scanned too.
     if request.method in ("POST", "PUT", "PATCH"):
         content_type = request.headers.get("content-type", "")
-        _scan_ct = (
-            "application/json" in content_type
-            or "application/x-www-form-urlencoded" in content_type
-            or "multipart/form-data" in content_type
-            or content_type.startswith("text/")
-        )
-        if _scan_ct:
+        if _is_text_content_type(content_type):
             try:
                 from urllib.parse import unquote_plus
                 body_bytes = await request.body()
@@ -315,9 +412,24 @@ async def sanitize_input_middleware(request: Request, call_next):
                         content={"detail": "Request contains disallowed content"},
                     )
 
-                async def _receive():
-                    return {"type": "http.request", "body": body_bytes, "more_body": False}
-                request = Request(request.scope, receive=_receive)
+                # Re-inject the consumed body so downstream handlers can read it.
+                # We rebuild the ASGI receive channel rather than only setting
+                # request._body: under an ASGI test transport, the downstream
+                # route constructs its OWN Request from the scope and calls
+                # receive() to read the body — if the stream is drained and we
+                # only stashed _body on THIS Request instance, that receive()
+                # blocks forever (observed as a selector.select hang on Linux
+                # CI). A receive() that replays the cached bytes is what every
+                # consumer (Starlette Request.body, Pydantic binding) honours.
+                request._body = body_bytes
+
+                async def _replay_receive() -> dict:
+                    return {
+                        "type": "http.request",
+                        "body": body_bytes,
+                        "more_body": False,
+                    }
+                request = Request(request.scope, receive=_replay_receive)
             except Exception:
                 pass
 
@@ -325,14 +437,50 @@ async def sanitize_input_middleware(request: Request, call_next):
 
 
 @app.middleware("http")
-async def _security_headers(request: Request, call_next: Callable):
+async def strict_cors_middleware(request: Request, call_next):
+    """Exact-match CORS guard layered on top of CORSMiddleware (SEC-004).
+
+    CORSMiddleware already declines to echo an origin that isn't on the
+    allowlist, but for a *preflight* (OPTIONS + Access-Control-Request-Method)
+    from a spoofed origin it still returns 200 with no CORS headers. That is
+    indistinguishable to a browser from a transient error and leaks no signal
+    to defenders. We make the rejection explicit: a preflight from an origin
+    that is not a byte-for-byte allowlist member gets a hard 403.
+
+    Non-preflight requests pass straight through — CORSMiddleware owns the
+    Access-Control-Allow-Origin reflection for those, and it only reflects
+    allowlisted origins, so a spoofed origin is never echoed.
+    """
+    origin = request.headers.get("origin")
+    is_preflight = (
+        request.method == "OPTIONS"
+        and request.headers.get("access-control-request-method") is not None
+    )
+    if origin and is_preflight and not _is_origin_allowed(origin):
+        return JSONResponse(
+            status_code=403,
+            content={"detail": "Origin not allowed"},
+        )
+    return await call_next(request)
+
+
+_HSTS_ENABLED = os.getenv("ENABLE_HSTS", "false").strip().lower() in ("1", "true", "yes")
+
+
+@app.middleware("http")
+async def security_headers_middleware(request: Request, call_next: Callable):
+    """Attach hardening response headers. HSTS gated on ENABLE_HSTS (never pin
+    a plain-http dev origin to https); plus always-safe headers for clickjacking,
+    MIME-sniffing, and referrer leakage."""
     response = await call_next(request)
-    response.headers.update({
-        "X-Content-Type-Options": "nosniff",
-        "X-Frame-Options": "DENY",
-        "Referrer-Policy": "no-referrer",
-        "X-XSS-Protection": "0",
-    })
+    if _HSTS_ENABLED:
+        response.headers.setdefault(
+            "Strict-Transport-Security",
+            "max-age=31536000; includeSubDomains",
+        )
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
     return response
 
 
@@ -341,6 +489,10 @@ app.include_router(analysis_router, prefix="/api")
 app.include_router(actuate_router, prefix="/api")
 app.include_router(watcher_router, prefix="/api")
 app.include_router(branches_router, prefix="/api")
+app.include_router(findings_router, prefix="/api")
+app.include_router(auto_fix_router, prefix="/api")
+app.include_router(history_router, prefix="/api")
+app.include_router(build_router, prefix="/api")
 
 
 @app.get("/")
@@ -359,9 +511,81 @@ async def health():
     return {"status": "healthy", "agents": 4}
 
 
+def _verify_github_webhook_signature(body: bytes, signature_header: str) -> bool:
+    """Verify a GitHub webhook's X-Hub-Signature-256 header (HMAC-SHA256).
+
+    Returns False when:
+      - GITHUB_WEBHOOK_SECRET is unset (fail closed),
+      - the header is missing or malformed,
+      - the digests don't match.
+    """
+    secret = os.getenv("GITHUB_WEBHOOK_SECRET", "")
+    if not secret:
+        logger.warning("GITHUB_WEBHOOK_SECRET not set — rejecting webhook")
+        return False
+    if not signature_header or not signature_header.startswith("sha256="):
+        return False
+    expected = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
+    provided = signature_header.split("=", 1)[1]
+    return hmac.compare_digest(expected, provided)
+
+
+async def _run_webhook_analysis(
+    owner: str,
+    repo: str,
+    branch: str,
+    pr_number: int | None,
+    installation_token: str,
+) -> None:
+    """Background task: run the full analysis pipeline and post a PR comment."""
+    try:
+        from app.services.repo_analysis_service import RepoAnalysisService
+        from app.orchestrator.shipmate_orchestrator import ShipMateOrchestrator
+        from app.services.github_comment_service import post_pr_comment
+        from app.services.score_history_service import record_score
+
+        repo_context = await RepoAnalysisService.build_context(
+            token=installation_token,
+            owner=owner,
+            repo=repo,
+            branch=branch,
+            pr_number=pr_number,
+            feature_context="",
+        )
+        orchestrator = ShipMateOrchestrator()
+        report = await orchestrator.run(repo_context)
+
+        record_score(
+            owner=owner, repo=repo, branch=branch,
+            score=report.readiness_score,
+            breakdown={
+                "repo": report.score_breakdown.repo_score,
+                "delivery": report.score_breakdown.delivery_score,
+                "security": report.score_breakdown.security_score,
+                "test": report.score_breakdown.test_score,
+            },
+        )
+
+        if pr_number:
+            await post_pr_comment(
+                token=installation_token,
+                owner=owner, repo=repo,
+                pr_number=pr_number,
+                report=report,
+            )
+        logger.info("Webhook analysis complete for %s/%s#%s score=%d",
+                    owner, repo, pr_number or branch, report.readiness_score)
+    except Exception as e:
+        logger.warning("Webhook analysis failed for %s/%s: %s", owner, repo, e)
+
+
 @app.post("/webhooks/github")
 async def github_webhook(request: Request):
-    """Handle GitHub webhook events for push and pull_request."""
+    """Handle GitHub webhook events for push and pull_request.
+
+    Validates webhook signature, extracts repository and branch info,
+    and triggers automatic analysis in the background.
+    """
     body_bytes = await request.body()
 
     signature = request.headers.get("x-hub-signature-256", "")
@@ -381,63 +605,60 @@ async def github_webhook(request: Request):
 
     event_type = request.headers.get("x-github-event", "")
 
+    # The installation token for automated analysis — must be set as env var
+    # when running as a GitHub App. Falls back to empty (analysis skipped).
+    installation_token = os.getenv("GITHUB_INSTALLATION_TOKEN", "")
+
     if event_type == "push":
-        repo_name = payload.get("repository", {}).get("full_name")
+        repo_full = payload.get("repository", {}).get("full_name", "")
         branch = payload.get("ref", "").split("/")[-1]
+        owner, _, repo = repo_full.partition("/")
 
-        if not repo_name or not branch:
-            return JSONResponse(
-                status_code=400,
-                content={"detail": "Missing repository or branch info"},
-            )
+        if not repo_full or not branch:
+            return JSONResponse(status_code=400, content={"detail": "Missing repo or branch"})
 
-        return JSONResponse(
-            status_code=202,
-            content={
-                "status": "accepted",
-                "message": f"Analysis queued for {repo_name}:{branch}",
-                "event": "push",
-            },
-        )
+        if installation_token:
+            import asyncio
+            asyncio.create_task(_run_webhook_analysis(owner, repo, branch, None, installation_token))
+
+        return JSONResponse(status_code=202, content={
+            "status": "accepted",
+            "message": f"Analysis queued for {repo_full}:{branch}",
+            "event": "push",
+        })
 
     elif event_type == "pull_request":
-        repo_name = payload.get("repository", {}).get("full_name")
+        repo_full = payload.get("repository", {}).get("full_name", "")
         pr_number = payload.get("pull_request", {}).get("number")
+        branch = payload.get("pull_request", {}).get("head", {}).get("ref", "main")
         action = payload.get("action")
+        owner, _, repo = repo_full.partition("/")
 
-        if not repo_name or not pr_number:
-            return JSONResponse(
-                status_code=400,
-                content={"detail": "Missing repository or PR info"},
-            )
+        if not repo_full or not pr_number:
+            return JSONResponse(status_code=400, content={"detail": "Missing repo or PR info"})
 
         if action not in ["opened", "synchronize", "reopened"]:
-            return JSONResponse(
-                status_code=202,
-                content={
-                    "status": "ignored",
-                    "message": f"PR action '{action}' does not trigger analysis",
-                    "event": "pull_request",
-                },
-            )
-
-        return JSONResponse(
-            status_code=202,
-            content={
-                "status": "accepted",
-                "message": f"Analysis queued for {repo_name} PR #{pr_number}",
+            return JSONResponse(status_code=202, content={
+                "status": "ignored",
+                "message": f"PR action '{action}' does not trigger analysis",
                 "event": "pull_request",
-            },
-        )
+            })
+
+        if installation_token:
+            import asyncio
+            asyncio.create_task(_run_webhook_analysis(owner, repo, branch, pr_number, installation_token))
+
+        return JSONResponse(status_code=202, content={
+            "status": "accepted",
+            "message": f"Analysis queued for {repo_full} PR #{pr_number}",
+            "event": "pull_request",
+        })
 
     else:
-        return JSONResponse(
-            status_code=202,
-            content={
-                "status": "ignored",
-                "message": f"Event type '{event_type}' is not processed",
-            },
-        )
+        return JSONResponse(status_code=202, content={
+            "status": "ignored",
+            "message": f"Event type '{event_type}' is not processed",
+        })
 
 
 # HTML template for the backend-served OAuth callback page.
