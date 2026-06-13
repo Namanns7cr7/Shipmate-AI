@@ -226,6 +226,8 @@ export const api = {
   async buildPlan(params: {
     owner: string; repo: string; branch: string; access_token: string;
     max_opportunities?: number; include_ungrounded?: boolean;
+    // "opportunity" (conservative fixes) | "innovation" (blue-sky ideas).
+    mode?: 'opportunity' | 'innovation';
   }): Promise<BuildPlanResponse> {
     // Discovery + critic + ranker is a multi-LLM pass; allow generous time.
     const { data } = await gh.post<BuildPlanResponse>('/build/plan', params, {

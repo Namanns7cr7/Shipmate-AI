@@ -8,7 +8,6 @@ import { DashboardPage } from './pages/DashboardPage';
 import { RepositoriesPage } from './pages/RepositoriesPage';
 import { AnalysisPage } from './pages/AnalysisPage';
 import { BuildPage } from './pages/BuildPage';
-import { ResearchPage } from './pages/ResearchPage';
 import { ReportsPage } from './pages/ReportsPage';
 import { Spinner } from './components/ui/GitHubConnectButton';
 import { BranchPicker } from './components/ui/BranchPicker';
@@ -381,13 +380,6 @@ export default function App() {
         )}
         {activePage === 'build' && (
           <BuildPage
-            selectedRepo={selectedRepo}
-            selectedBranch={selectedBranch}
-            accessToken={auth.accessToken}
-          />
-        )}
-        {activePage === 'research' && (
-          <ResearchPage
             selectedRepo={selectedRepo}
             selectedBranch={selectedBranch}
             accessToken={auth.accessToken}
