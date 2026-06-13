@@ -44,6 +44,39 @@ class TestEdges:
         # a is imported by b and c.
         assert g.nodes["backend/app/a.py"].fan_in == 2
 
+    def test_from_package_import_module_is_an_edge(self):
+        # Regression: `from app.services import foo` imports the MODULE foo, not
+        # a symbol of the package __init__. Before the fix this left foo an
+        # orphan (the only edge pointed at the package node). Now it's a real
+        # module->module edge. This is the bug that produced the false
+        # ast_lint/finding_critic "dead code" findings.
+        corpus = {
+            "backend/app/services/__init__.py": "",
+            "backend/app/services/foo.py": "def helper():\n    return 1\n",
+            "backend/app/services/bar.py": "from app.services import foo\ndef use():\n    return foo.helper()\n",
+        }
+        g = build_reference_graph(corpus)
+        assert "backend/app/services/foo.py" in g.nodes["backend/app/services/bar.py"].imports
+        assert g.nodes["backend/app/services/foo.py"].fan_in == 1
+        assert "backend/app/services/foo.py" not in g.orphans()
+
+    def test_function_scoped_import_is_an_edge(self):
+        # Regression: a lazy import INSIDE a function body is a real runtime
+        # dependency for the graph (ast_lint's module-level-only collector
+        # missed these, leaving finding_critic/diff_apply false orphans).
+        corpus = {
+            "backend/app/services/dep.py": "def thing():\n    return 1\n",
+            "backend/app/services/lazy.py": (
+                "def run():\n"
+                "    from app.services import dep as d\n"
+                "    return d.thing()\n"
+            ),
+        }
+        g = build_reference_graph(corpus)
+        assert "backend/app/services/dep.py" in g.nodes["backend/app/services/lazy.py"].imports
+        assert g.nodes["backend/app/services/dep.py"].fan_in == 1
+        assert "backend/app/services/dep.py" not in g.orphans()
+
 
 class TestSignals:
     def test_dead_export_detected(self):
