@@ -309,6 +309,48 @@ export interface AutoFixEvent {
   message?: string;
 }
 
+// ── Research harness (Research tab, SSE) ─────────────────────────────────────────
+
+export interface ResearchEvent {
+  event:
+    | 'research.start' | 'index.done' | 'graph.done' | 'finding'
+    | 'research.done' | 'propose.start' | 'opportunity' | 'propose.done'
+    | 'done' | 'error';
+  mode?: string;
+  files?: number;
+  // graph.done
+  modules?: number;
+  cycles?: number;
+  god_modules?: number;
+  orphans?: number;
+  // finding
+  title?: string;
+  kind?: string;
+  severity?: string;
+  detail?: string;
+  evidence?: string[];
+  suggested_action?: string;
+  graph_signal?: string;
+  // research.done
+  answer?: string;
+  finding_count?: number;
+  ai_enhanced?: boolean;
+  // opportunity
+  id?: string;
+  category?: string;
+  impact?: string;
+  effort?: string;
+  value_score?: number;
+  priority?: string;
+  target_files?: string[];
+  rationale?: string;
+  // done / propose.done
+  findings?: number;
+  opportunities?: number;
+  count?: number;
+  message?: string;
+}
+
 // ── Opportunity Planner (Build tab) ─────────────────────────────────────────────
 
 export interface Opportunity {

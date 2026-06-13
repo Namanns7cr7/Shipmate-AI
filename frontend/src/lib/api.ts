@@ -2,7 +2,7 @@ import axios from 'axios';
 import type {
   AnalyzeResponse, GitHubRepo, GitHubBranch, GitHubPR,
   ActuateResponse, FindingPayload, RepoLensSummary,
-  WatcherState, WatcherLogLine, JournalResponse, AutoFixEvent,
+  WatcherState, WatcherLogLine, JournalResponse, AutoFixEvent, ResearchEvent,
   ShipMateReport, BuildPlanResponse, BuildExecuteResponse, Opportunity,
 } from '../types';
 
@@ -334,6 +334,52 @@ export const api = {
           if (line.startsWith('data: ')) {
             try {
               onEvent(JSON.parse(line.slice(6)) as AutoFixEvent);
+            } catch {
+              // ignore malformed frame
+            }
+          }
+        }
+      }
+    }
+  },
+
+  // ── Research harness (codebase deep-research / improve / innovate, SSE) ────
+  // Same fetch+ReadableStream pattern as startAutoFix (EventSource can't POST a
+  // body or send Authorization). `onEvent` fires per parsed `data:` frame.
+
+  async startResearch(
+    params: {
+      owner: string; repo: string; branch: string; access_token: string;
+      mode?: 'research' | 'improve' | 'innovate'; question?: string;
+      max_findings?: number; max_opportunities?: number;
+    },
+    onEvent: (e: ResearchEvent) => void,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const resp = await fetch(`${BASE}/research`, {
+      method: 'POST',
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify(params),
+      signal,
+    });
+    if (!resp.ok || !resp.body) {
+      throw new Error(`research stream failed: HTTP ${resp.status}`);
+    }
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let sep: number;
+      while ((sep = buffer.indexOf('\n\n')) !== -1) {
+        const frame = buffer.slice(0, sep);
+        buffer = buffer.slice(sep + 2);
+        for (const line of frame.split('\n')) {
+          if (line.startsWith('data: ')) {
+            try {
+              onEvent(JSON.parse(line.slice(6)) as ResearchEvent);
             } catch {
               // ignore malformed frame
             }

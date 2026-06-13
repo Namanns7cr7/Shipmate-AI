@@ -1,17 +1,18 @@
 import { useState, useRef, useEffect } from 'react';
-import { LayoutDashboard, FolderGit2, Activity, FileBarChart2, Hammer, LogOut, ChevronDown, Check, Lock, BookOpen } from 'lucide-react';
+import { LayoutDashboard, FolderGit2, Activity, FileBarChart2, Hammer, Telescope, LogOut, ChevronDown, Check, Lock, BookOpen } from 'lucide-react';
 import { Wordmark } from '../ui/LogoMark';
 import { GitHubIcon } from '../ui/GitHubIcon';
 import { LANG_COLORS } from '../../lib/agents';
 import type { GitHubUser, GitHubRepo } from '../../types';
 
-export type Page = 'dashboard' | 'repos' | 'analysis' | 'build' | 'reports';
+export type Page = 'dashboard' | 'repos' | 'analysis' | 'build' | 'research' | 'reports';
 
 const NAV_ITEMS: { id: Page; label: string; Icon: React.ElementType }[] = [
   { id: 'dashboard', label: 'Dashboard',    Icon: LayoutDashboard },
   { id: 'repos',     label: 'Repositories', Icon: FolderGit2 },
   { id: 'analysis',  label: 'Analysis',     Icon: Activity },
   { id: 'build',     label: 'Build',        Icon: Hammer },
+  { id: 'research',  label: 'Research',     Icon: Telescope },
   { id: 'reports',   label: 'Reports',      Icon: FileBarChart2 },
 ];
 
