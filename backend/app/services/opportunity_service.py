@@ -144,6 +144,94 @@ class OpportunityService:
             generated_at=generated_at,
         )
 
+    @classmethod
+    def build_innovation_plan(
+        cls,
+        repo_context: Dict[str, Any],
+        *,
+        max_opportunities: int = 6,
+        include_ungrounded: bool = False,
+        repo_lens: Any = None,
+    ) -> BuildPlanResponse:
+        """Innovation sibling of `build_plan`: discover_innovations → ground →
+        already-built prefilter → innovation_critic (feasibility, NOT suppress-
+        novelty) → suppress (journal) → rank.
+
+        Same context contract and same fail-open behaviour. The only differences
+        from build_plan are the discovery posture (ambitious/novel) and the LLM
+        verify posture (feasibility/coherence instead of worth-doing suppression);
+        the deterministic floor (grounding + already-built) is identical, reused
+        from opportunity_critic via innovation_critic."""
+        from app.services import innovation_critic as icritic
+
+        info = repo_context.get("repo_info") or {}
+        owner = (
+            info.get("owner", {}).get("login", "")
+            if isinstance(info.get("owner"), dict) else info.get("owner", "")
+        )
+        name = info.get("name", "")
+        full_name = info.get("full_name", "") or (f"{owner}/{name}" if owner and name else "")
+        branch = repo_context.get("branch", "main")
+        generated_at = datetime.now(timezone.utc).isoformat()
+
+        if repo_lens is None:
+            repo_lens = repo_context.get("repo_lens")
+        try:
+            if repo_lens is None:
+                repo_lens = cls._repo_lens.run(repo_context)
+            enriched = {**repo_context, "repo_lens": repo_lens}
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning("RepoLens failed in innovation pipeline (%s); proceeding without it", e)
+            enriched = repo_context
+
+        # 1. DISCOVER (LLM, innovation posture).
+        exclude = critic.journaled_titles(full_name)
+        raw: List[Opportunity] = LLMService.discover_innovations(
+            enriched, max_opportunities=max_opportunities, exclude_titles=exclude,
+        )
+        ai_enhanced = LLMService.is_available()
+        total_found = len(raw)
+        if not raw:
+            return BuildPlanResponse(
+                owner=owner, repo=name, branch=branch,
+                opportunities=[], total_found=0, grounded_count=0,
+                ai_enhanced=ai_enhanced, generated_at=generated_at,
+            )
+
+        # 2. GROUND + 3a. ALREADY-BUILT — the deterministic floor (shared).
+        file_tree = repo_context.get("file_tree") or []
+        key_files = repo_context.get("key_files") or {}
+        grounded = critic.ground_opportunities(raw, file_tree, key_files)
+        grounded_count = sum(1 for o in grounded if getattr(o, "grounded", False))
+        candidates = grounded if include_ungrounded else [o for o in grounded if getattr(o, "grounded", True)]
+        candidates = critic.filter_already_built(candidates, file_tree, key_files)
+
+        # 3b. VERIFY (innovation posture — feasibility/coherence, keeps ambition).
+        provider = LLMService.provider()
+        code_blob = LLMService.opportunity_code_blob(enriched) if provider else ""
+        verified = icritic.verify_innovations(candidates, code_blob, provider)
+        verified_sigs = {id(o) for o in verified}
+        if include_ungrounded:
+            surviving = [o for o in grounded if (id(o) in verified_sigs or not getattr(o, "grounded", True))]
+        else:
+            surviving = verified
+        verified_count = len(verified)
+
+        # 4. SUPPRESS + 5. RANK — shared with the conservative pipeline.
+        kept = critic.filter_suppressed(surviving, full_name)
+        ranked = critic.rank_opportunities(
+            kept, full_name, drop_ungrounded=not include_ungrounded
+        )
+        return BuildPlanResponse(
+            owner=owner, repo=name, branch=branch,
+            opportunities=ranked,
+            total_found=total_found,
+            grounded_count=grounded_count,
+            verified_count=verified_count,
+            ai_enhanced=ai_enhanced,
+            generated_at=generated_at,
+        )
+
     # ── Phase 1B — plan a chosen opportunity, critique it, optionally execute ──
 
     @classmethod

@@ -55,6 +55,16 @@ async def build_plan(request: BuildPlanRequest) -> BuildPlanResponse:
         )
 
     try:
+        # mode="innovation" routes to the blue-sky pipeline (discover_innovations
+        # + innovation_critic); default mode="opportunity" is the conservative
+        # product-review pipeline. Same context, same ranker/journal.
+        if (request.mode or "").strip().lower() == "innovation":
+            return OpportunityService.build_innovation_plan(
+                repo_context,
+                max_opportunities=request.max_opportunities,
+                include_ungrounded=request.include_ungrounded,
+                repo_lens=index.repo_lens,
+            )
         return OpportunityService.build_plan(
             repo_context,
             max_opportunities=request.max_opportunities,
