@@ -41,14 +41,20 @@ export default function GitHubCallback() {
 
         setStatus('success');
 
+        // The backend now returns an opaque session id (session_id) that
+        // references the vaulted token — the raw token never reaches the
+        // browser. Prefer session_id; fall back to access_token only for an
+        // older backend that hasn't shipped the vault yet.
+        const credential = response.session_id ?? response.access_token;
+
         if (window.opener && !window.opener.closed) {
           window.opener.postMessage(
-            { type: 'GITHUB_AUTH_SUCCESS', access_token: response.access_token, user: response.user },
+            { type: 'GITHUB_AUTH_SUCCESS', access_token: credential, user: response.user },
             window.location.origin,
           );
           setTimeout(() => window.close(), 800);
         } else {
-          localStorage.setItem('github_access_token', response.access_token);
+          localStorage.setItem('github_access_token', credential);
           localStorage.setItem('github_user', JSON.stringify(response.user));
           setTimeout(() => { window.location.href = '/'; }, 1000);
         }

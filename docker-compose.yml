@@ -3,8 +3,11 @@ version: '3.8'
 services:
   backend:
     build:
-      context: .
-      dockerfile: backend/Dockerfile
+      # context is backend/ — Dockerfile is self-contained (COPY paths relative
+      # to backend/). Keep in lockstep with CI docker-smoke + `az containerapp
+      # up --source backend`.
+      context: ./backend
+      dockerfile: Dockerfile
     container_name: shipmate-backend
     ports:
       - "${BACKEND_PORT:-8000}:8000"

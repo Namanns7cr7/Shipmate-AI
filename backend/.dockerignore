@@ -1,0 +1,34 @@
+# Build context is backend/ (see backend/Dockerfile). Keep the upload small and
+# never bake secrets/venv into the image.
+
+# Virtualenvs — 95MB+, never needed in the image (deps install from requirements)
+venv/
+.venv/
+ENV/
+
+# Python caches / artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.coverage
+htmlcov/
+reports/
+*.egg-info/
+
+# Secrets / local env — injected as Container App env vars, never in the image
+.env
+.env.local
+.env.*.local
+
+# Runtime sqlite state
+*.sqlite
+*.db
+oauth_state.db
+coder_loop_state.json
+
+# Editor / OS noise
+.DS_Store
+*.swp
+*.swo

@@ -40,6 +40,9 @@ import httpx
 
 from app.agents.coder_agent import CoderAgent, CoderBrief, CoderOutput, CoderFile
 from app.schemas.api_schemas import FindingPayload, RepoLensSummary
+from app.services import inflight_registry as ir
+from app.services import validation_gate as vg
+from app.services import scope_guard as sg
 from app.services.coder_orchestrator import (
     _resolve_target_paths,
     _fetch_current_contents,
@@ -55,91 +58,89 @@ logger.setLevel(logging.INFO)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
-# Persistent dedup state — survives across `python coder_loop.py` invocations
-# so we don't re-pick the same finding every time you re-run. Wipe with --reset.
-_STATE_PATH = Path("/tmp/coder_loop_state.json")
+# Dedup state now lives in the shared sqlite finding_journal (InflightRegistry)
+# so the CLI loop and the UI orchestrator coordinate. The old
+# /tmp/coder_loop_state.json is migrated once on first load, then deleted.
+_MAX_ATTEMPTS = 2  # findings that fail this many times go to `parked`
+
+# The repo this loop run targets — used to attribute journal rows. Set in main().
+_ACTIVE_REPO = "WalkingDevFlag/Shipmate-AI"
+
+
+class _ActuateShim:
+    """Minimal duck-typed stand-in for ActuateRequest — CoderOrchestrator.
+    _run_decomposed reads .owner/.repo/.branch/.finding/.access_token. The
+    loop drives its own gates (it doesn't open PRs), so we don't need the
+    full request — just enough for the decomposer to fetch step-path
+    originals."""
+
+    def __init__(self, owner: str, repo: str, branch: str, finding,
+                 access_token: str = "") -> None:
+        self.owner = owner
+        self.repo = repo
+        self.branch = branch
+        self.finding = finding
+        self.access_token = access_token
 
 
 def _load_state() -> Dict[str, Any]:
-    if _STATE_PATH.exists():
-        try:
-            data = json.loads(_STATE_PATH.read_text())
-            # Backfill new fields for older state files.
-            data.setdefault("attempts", {})  # signature -> attempt count
-            data.setdefault("parked", [])     # signatures permanently skipped
-            return data
-        except Exception:
-            pass
-    return {"seen_signatures": [], "baseline_passing": None,
-            "attempts": {}, "parked": []}
+    """Build the per-run working state from the shared finding_journal.
 
+    Migrates any legacy /tmp/coder_loop_state.json into the journal on first
+    call. Returns a dict with the same shape run_round expects:
+      seen_signatures: sigs we should NOT re-pick (shipped/dismissed/parked)
+      parked:          sigs that exhausted attempts
+      attempts:        sig -> attempt_count (from in_progress rows)
+    baseline_passing is no longer here — it lives in vg.baseline_pass_count().
+    """
+    ir.init_db()
+    try:
+        ir.migrate_legacy_state(_ACTIVE_REPO)
+    except Exception as e:
+        logger.debug("legacy state migration skipped: %s", e)
 
-_MAX_ATTEMPTS = 2  # findings that fail this many times go to `parked`
+    journal = ir.journal_list(repo_full_name=_ACTIVE_REPO)
+    seen = [r["finding_sig"] for r in journal
+            if r["state"] in ("shipped", "dismissed", "parked")]
+    parked = [r["finding_sig"] for r in journal if r["state"] == "parked"]
+    attempts = {r["finding_sig"]: r["attempt_count"] for r in journal
+                if r["state"] == "in_progress"}
+    return {"seen_signatures": seen, "parked": parked, "attempts": attempts}
 
 
 def _save_state(state: Dict[str, Any]) -> None:
-    _STATE_PATH.write_text(json.dumps(state, indent=2))
+    """No-op shim. State now persists inline to the finding_journal as each
+    round records verdicts — there's no separate file to flush. Kept so the
+    existing call sites don't all need editing."""
+    pass
 
 
-# ── Pytest gate ──────────────────────────────────────────────────────────────
+# ── Pytest gate — thin shims onto the shared ValidationGate service ─────────
+# These used to live here; they're now in app/services/validation_gate.py so
+# the UI orchestrator (CoderOrchestrator.run_actuation) gets the identical
+# gate. Kept as 1-line wrappers so the existing call sites don't change.
 
 
 def _smoke_imports() -> Tuple[bool, str]:
-    """Fast pre-pytest check: can we even import app.main? If not, the patch
-    broke a top-level import and pytest will give a misleading 0p/68f result.
-    Bounded by 10s. Returns (ok, error_text)."""
-    import subprocess
-    cwd = REPO_ROOT / "backend"
-    try:
-        proc = subprocess.run(
-            ["./venv/bin/python", "-c", "import app.main"],
-            cwd=str(cwd),
-            capture_output=True, text=True, timeout=10,
-        )
-    except subprocess.TimeoutExpired:
-        return False, "import smoke timeout"
-    return proc.returncode == 0, (proc.stderr or proc.stdout or "")[-500:]
+    return vg.smoke_imports()
 
 
-def _run_pytest(target: str = "backend/tests/") -> Tuple[int, int, str]:
-    """Returns (passed, failed, raw_summary). Runs the test suite from
-    REPO_ROOT/backend so app.* imports resolve. Uses -q + --tb=no for speed.
-    Bounded by 90s to avoid hanging the loop on a slow test."""
-    import subprocess
-    cwd = REPO_ROOT / "backend"
-    try:
-        proc = subprocess.run(
-            ["./venv/bin/python", "-m", "pytest", "tests/", "-q", "--tb=no",
-             "--no-header", "-p", "no:cacheprovider"],
-            cwd=str(cwd),
-            capture_output=True,
-            text=True,
-            timeout=90,
-        )
-    except subprocess.TimeoutExpired:
-        return 0, 0, "pytest timeout"
-    out = (proc.stdout or "") + (proc.stderr or "")
-    # Pytest summary line looks like "5 failed, 67 passed in 0.27s"
-    passed = failed = 0
-    m = re.search(r"(\d+)\s+passed", out)
-    if m:
-        passed = int(m.group(1))
-    m = re.search(r"(\d+)\s+failed", out)
-    if m:
-        failed = int(m.group(1))
-    return passed, failed, out[-2000:]
+def _run_pytest(target: str = "tests/") -> Tuple[int, int, str]:
+    return vg.run_pytest(target)
+
+
+def _snapshot_files(paths: List[str]) -> Dict[str, Optional[str]]:
+    return vg.snapshot_files(paths)
+
+
+def _restore_snapshot(snap: Dict[str, Optional[str]]) -> None:
+    vg.restore_snapshot(snap)
 
 
 def _baseline_pass_count(state: Dict[str, Any]) -> int:
-    """Lazy-compute the baseline pass count. Stored across runs so the loop
-    doesn't re-run tests every round if nothing has changed."""
-    cached = state.get("baseline_passing")
-    if cached is not None:
-        return int(cached)
-    passed, failed, _ = _run_pytest()
-    state["baseline_passing"] = passed
-    _save_state(state)
-    return passed
+    """Shim onto vg.baseline_pass_count (shared, sqlite-cached). The `state`
+    arg is ignored — kept for call-site compatibility."""
+    return vg.baseline_pass_count()
 
 
 # ── Verdict helpers ──────────────────────────────────────────────────────────
@@ -176,6 +177,15 @@ def _verdict_for(
 
     issues = list(_lint_coder_output(coder_out, target_files, file_tree))
 
+    # Scope-discipline guard: catch whole-file rewrites that drop pre-existing
+    # top-level defs (untested-infra miss) or delete protected config lines.
+    # Same drift the orchestrator rejects with `scope_rejected`.
+    _serialized = [
+        {"path": cf.path, "new_content": cf.new_content, "rationale": cf.rationale}
+        for cf in coder_out.files
+    ]
+    issues.extend(sg.check_patch(_serialized, target_files, coder_out.summary))
+
     # Per-file extra: empty content (except __init__.py), gitkeep theater,
     # NEW test theater, mismatched first-party imports for tests.
     for cf in coder_out.files:
@@ -200,14 +210,30 @@ def _verdict_for(
 
 async def _fetch_findings(
     base_url: str, owner: str, repo: str, branch: str, token: str,
+    attempts: int = 2,
 ) -> Dict[str, Any]:
-    async with httpx.AsyncClient(timeout=180) as client:
-        r = await client.post(
-            f"{base_url}/api/analyze",
-            json={"owner": owner, "repo": repo, "branch": branch, "access_token": token},
-        )
-        r.raise_for_status()
-        return r.json()["report"]
+    """POST /api/analyze and return the report. The full 4-agent Bedrock
+    pipeline can take 2-3 min (longer under cold creds / throttling), so the
+    read timeout is generous and a transient ReadTimeout is retried ONCE
+    rather than crashing the whole round."""
+    # connect quickly, but allow a long read for the slow analyze pipeline.
+    timeout = httpx.Timeout(connect=10.0, read=300.0, write=30.0, pool=10.0)
+    last_err: Optional[Exception] = None
+    for i in range(1, attempts + 1):
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                r = await client.post(
+                    f"{base_url}/api/analyze",
+                    json={"owner": owner, "repo": repo, "branch": branch,
+                          "access_token": token},
+                )
+                r.raise_for_status()
+                return r.json()["report"]
+        except (httpx.ReadTimeout, httpx.ConnectError, httpx.RemoteProtocolError) as e:
+            last_err = e
+            print(f"  analyze attempt {i}/{attempts} failed ({type(e).__name__}); "
+                  f"{'retrying' if i < attempts else 'giving up'}")
+    raise last_err  # type: ignore[misc]
 
 
 def _slug(s: str, n: int = 40) -> str:
@@ -398,6 +424,8 @@ async def _actuate_one(
     owner: str,
     repo: str,
     branch: str,
+    diff_mode: bool = False,
+    decompose: bool = False,
 ) -> Dict[str, Any]:
     """Actuate one finding against current state. Returns verdict record."""
     started = time.time()
@@ -428,7 +456,19 @@ async def _actuate_one(
             finding_severity=finding.severity,
         )
         agent = CoderAgent()
-        coder_out = await asyncio.to_thread(agent.run, brief, _deployment_hint(finding))
+        _mode = "diff" if diff_mode else "full"
+        # Decompose only multi-file kinds (milestone/blocker); a guardrail/test
+        # tweak is single-file by nature and planning would just add latency.
+        if decompose and finding.kind in ("milestone", "blocker"):
+            from app.services.coder_orchestrator import CoderOrchestrator
+            coder_out = await CoderOrchestrator._run_decomposed(
+                _ActuateShim(owner, repo, branch, finding, token), ctx, file_tree,
+                target_files, _mode,
+            )
+        else:
+            coder_out = await asyncio.to_thread(
+                agent.run, brief, _deployment_hint(finding), _mode,
+            )
 
         verdict, reasons = _verdict_for(coder_out, target_files, file_tree)
         rec.update({
@@ -453,33 +493,6 @@ async def _actuate_one(
             "elapsed_s": round(time.time() - started, 1),
         })
     return rec
-
-
-def _snapshot_files(paths: List[str]) -> Dict[str, Optional[str]]:
-    """Capture current contents of `paths` so we can revert. None means
-    'didn't exist' (and we should delete on revert)."""
-    snap: Dict[str, Optional[str]] = {}
-    for p in paths:
-        full = REPO_ROOT / p
-        if full.exists():
-            try:
-                snap[p] = full.read_text(encoding="utf-8", errors="replace")
-            except Exception:
-                snap[p] = None
-        else:
-            snap[p] = None
-    return snap
-
-
-def _restore_snapshot(snap: Dict[str, Optional[str]]) -> None:
-    for p, original in snap.items():
-        full = REPO_ROOT / p
-        if original is None:
-            if full.exists():
-                full.unlink()
-        else:
-            full.parent.mkdir(parents=True, exist_ok=True)
-            full.write_text(original)
 
 
 def _apply_to_working_tree(
@@ -528,6 +541,8 @@ async def run_round(
     out_path: Path,
     apply: bool,
     state: Dict[str, Any],
+    diff_mode: bool = False,
+    decompose: bool = False,
 ) -> Tuple[int, int, int]:
     """Returns (good_count, bad_count, applied_count).
 
@@ -567,7 +582,8 @@ async def run_round(
     print(f"→ Actuating {len(findings)} in parallel…")
     t0 = time.time()
     recs = await asyncio.gather(*[
-        _actuate_one(f, ctx, file_tree, token, owner, repo, branch)
+        _actuate_one(f, ctx, file_tree, token, owner, repo, branch,
+                     diff_mode=diff_mode, decompose=decompose)
         for f in findings
     ])
     print(f"  actuate: {round(time.time()-t0,1)}s")
@@ -576,10 +592,18 @@ async def run_round(
     # are cooled, not forever — they get a 1-round cooloff.
     cooled_paths.clear()
 
-    # Detect file-collision: two `good` patches both writing the same path.
-    # The COMPLETE conflicting patch is dropped (not partially merged), so
-    # the next round can re-pick that finding and see the new file state.
+    # Intra-round file-collision: two `good` patches THIS round both writing
+    # the same path. The COMPLETE conflicting patch is dropped (not partially
+    # merged), so the next round can re-pick it against the new file state.
     # Earlier kind ordering wins: guardrail > blocker > milestone > test.
+    #
+    # NOTE: this guards collisions WITHIN one loop process. Cross-process
+    # collisions (this loop vs a concurrent UI "Apply Fix") are handled by
+    # InflightRegistry.claim_path in CoderOrchestrator.run_actuation — the
+    # loop applies to the working tree directly so it doesn't claim, but it
+    # also operates on a branch the UI typically isn't touching at the same
+    # second. If you run the loop and click Apply Fix on the same finding
+    # concurrently, the UI side will get `path_busy`.
     if apply:
         KIND_ORDER = {"guardrail": 0, "blocker": 1, "milestone": 2, "test": 3}
         recs.sort(key=lambda r: KIND_ORDER.get(r.get("finding_kind", "z"), 99))
@@ -660,8 +684,8 @@ async def run_round(
                     else:
                         applied_count += len(touched)
                         baseline_passing = passed  # any improvement becomes new baseline
-                        state["baseline_passing"] = passed
-                        _save_state(state)
+                        vg.update_baseline(passed)  # shared sqlite-backed baseline
+                        rec["applied_ok"] = True     # durable flag for journal (survives _files_full pop)
                         if touched:
                             print(f"      → applied {len(touched)} file(s); tests {passed}p/{failed}f")
                         cooled_paths.update(touched)
@@ -676,26 +700,25 @@ async def run_round(
     if reverted:
         print(f"  reverted: {reverted} patch(es) due to test regression")
 
-    # Increment attempt counters for findings that didn't land cleanly.
-    # After _MAX_ATTEMPTS consecutive non-`good` rounds, park the finding so
-    # the loop stops wasting tokens on it. A successful apply resets it.
-    attempts: Dict[str, int] = dict(state.get("attempts") or {})
-    parked: List[str] = list(state.get("parked") or [])
+    # Record verdicts in the shared journal. A clean apply → `shipped`;
+    # repeated failure → `parked` after _MAX_ATTEMPTS; otherwise bump the
+    # in_progress attempt counter. The journal is what _load_state reads
+    # next run, and what the UI reads to badge findings.
     for rec in recs:
         sig = _finding_signature(
             rec["finding_kind"], rec["finding_title"], rec.get("finding_target")
         )
-        if rec.get("verdict") == "good" and rec.get("_files_full"):
-            attempts.pop(sig, None)
-        elif rec.get("verdict") in ("bad", "reverted", "skipped", "error"):
-            attempts[sig] = attempts.get(sig, 0) + 1
-            if attempts[sig] >= _MAX_ATTEMPTS and sig not in parked:
-                parked.append(sig)
-                attempts.pop(sig, None)
+        verdict = rec.get("verdict")
+        if verdict == "good" and rec.get("applied_ok"):
+            ir.journal_set_state(sig, _ACTIVE_REPO, "shipped")
+        elif verdict in ("bad", "reverted", "skipped", "error"):
+            existing = ir.journal_get_state(sig)
+            count = (existing["attempt_count"] if existing else 0) + 1
+            if count >= _MAX_ATTEMPTS:
+                ir.journal_set_state(sig, _ACTIVE_REPO, "parked", bump_attempt=True)
                 print(f"  ⛔ parked (≥{_MAX_ATTEMPTS} failed attempts): {rec['finding_title'][:60]}")
-    state["attempts"] = attempts
-    state["parked"] = parked
-    _save_state(state)
+            else:
+                ir.journal_set_state(sig, _ACTIVE_REPO, "in_progress", bump_attempt=True)
 
     return good, bad, applied_count
 
@@ -714,6 +737,12 @@ async def main() -> None:
     p.add_argument("--token-from", default="gh")
     p.add_argument("--reset", action="store_true",
                    help="wipe persistent state (seen signatures, baseline)")
+    p.add_argument("--diff-mode", action="store_true",
+                   help="Tier-2: ask Coder for unified diffs (token-saving; "
+                        "auto-falls back to full-file on apply failure)")
+    p.add_argument("--decompose", action="store_true",
+                   help="Tier-2: split multi-file milestone/blocker findings "
+                        "into ordered Coder steps")
     args = p.parse_args()
 
     if args.token_from == "gh":
@@ -725,16 +754,27 @@ async def main() -> None:
     out_path = Path(args.out)
     out_path.write_text("")
 
-    state = _load_state()
+    # Point the journal at the repo we're actuating so rows are attributed
+    # correctly (the loop and UI share the journal keyed by repo_full_name).
+    global _ACTIVE_REPO
+    _ACTIVE_REPO = f"{args.owner}/{args.repo}"
+
     if getattr(args, "reset", False):
-        state = {"seen_signatures": [], "baseline_passing": None}
-        _save_state(state)
-        print("→ reset persistent state")
+        ir.init_db()
+        ir.reset_all()
+        vg.reset_baseline()
+        print("→ reset persistent state (journal + inflight + baseline)")
+
+    state = _load_state()
     seen_signatures: set = set(state.get("seen_signatures") or [])
     cooled_paths: set = set()
     apply = not args.no_apply
     print(f"Mode: {'APPLY (will modify local working tree)' if apply else 'DRY-RUN (verdicts only)'}")
     print(f"Rounds: up to {args.rounds}")
+    if args.diff_mode:
+        print("Tier-2: diff-mode ON (Coder emits unified diffs; full-file fallback)")
+    if args.decompose:
+        print("Tier-2: decompose ON (milestone/blocker findings split into steps)")
     if seen_signatures:
         print(f"Loaded {len(seen_signatures)} previously-attempted finding signatures")
 
@@ -744,6 +784,7 @@ async def main() -> None:
             g, b, a = await run_round(
                 r, args.base_url, args.owner, args.repo, args.branch,
                 token, seen_signatures, cooled_paths, out_path, apply, state,
+                diff_mode=args.diff_mode, decompose=args.decompose,
             )
             # Persist accumulated state across runs.
             state["seen_signatures"] = sorted(seen_signatures)
