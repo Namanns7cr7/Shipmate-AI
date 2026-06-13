@@ -897,6 +897,32 @@ class CoderOrchestrator:
                     f"(SHIPMATE_LLM_TIMEOUT_S) and was aborted. No patch produced."
                 ),
             )
+        except Exception as e:
+            # A malformed model response (e.g. Bedrock returns a CoderOutput
+            # missing a required field even after the provider's array-not-string
+            # retry) raises here. That's a flaky-LLM outcome, NOT a server fault —
+            # fail SOFT to a coder_error status (like timeout) instead of letting
+            # it surface as a 500. Callers already treat any status != "complete"
+            # as a non-shipping outcome, so this slots in cleanly.
+            logger.warning(
+                "Coder call failed for %s/%s (%s: %s) — returning coder_error",
+                req.finding.kind, req.finding.id, type(e).__name__, str(e)[:200],
+            )
+            _record_coder_lessons(
+                f"{req.owner}/{req.repo}", "coder_error", [f"{type(e).__name__}: {str(e)[:160]}"]
+            )
+            await _emit("done", status="coder_error", pr_url=None)
+            return ActuateResponse(
+                status="coder_error",
+                pr_url=None,
+                branch_name=branch_name,
+                files_changed=[],
+                skipped=target_paths,
+                summary=(
+                    f"Coder produced an unusable response ({type(e).__name__}). "
+                    f"No patch was applied. Re-run to retry."
+                ),
+            )
         await _emit("coding.done", files=[cf.path for cf in coder_out.files])
 
         if not coder_out.files:
