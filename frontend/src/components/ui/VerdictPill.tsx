@@ -19,10 +19,7 @@ export function VerdictPill({ verdict, small = false }: VerdictPillProps) {
   );
 }
 
-/** Map our 5-state backend recommendation to the simpler 3-state verdict */
+// toVerdict now lives in lib/verdict.ts (pure, React-free). Re-exported here so
+// existing `import { toVerdict } from '.../VerdictPill'` call sites keep working.
 // eslint-disable-next-line react-refresh/only-export-components
-export function toVerdict(rec: string): string {
-  if (rec === 'ready_to_ship' || rec === 'mostly_ready') return 'Ready';
-  if (rec === 'not_ready' || rec === 'risky_release')    return 'Blocked';
-  return 'Needs Fixes';
-}
+export { toVerdict } from '../../lib/verdict';

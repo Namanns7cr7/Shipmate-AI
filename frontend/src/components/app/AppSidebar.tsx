@@ -184,8 +184,9 @@ export function AppSidebar({
               onClick={() => { onAutoFix?.(); onMobileClose?.(); }}
               disabled={analyzing || !selectedRepo}
               title="Auto-fix loop"
+              style={{ flex: 1, justifyContent: 'center' }}
             >
-              <Sparkles size={14} />
+              <Sparkles size={14} /> Auto-fix
             </button>
           </div>
         </div>

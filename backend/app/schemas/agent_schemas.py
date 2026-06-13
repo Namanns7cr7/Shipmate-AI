@@ -132,6 +132,42 @@ class TestPilotOutput(BaseModel):
     test_score: int     # 0-100
 
 
+# ── PR Risk ───────────────────────────────────────────────────────────────────
+# Unlike the four repo-level agents, PRRiskAgent judges a SPECIFIC pull request's
+# diff. It only runs when the analyze request carries a pr_number; otherwise
+# ShipMateReport.pr_risk stays None.
+
+class PRRiskFactor(BaseModel):
+    id: str
+    title: str
+    severity: Severity
+    category: str   # "auth" | "migration" | "ci_cd" | "deps" | "secrets" | "injection" | "config" | "size" | "tests"
+    description: str
+    file: Optional[str] = None       # the changed path that grounds this factor
+    evidence: Optional[str] = None   # the added diff line / surface that proves it
+    source: str = "heuristic"        # "heuristic" | "discovery"
+    confidence: str = "high"         # "high" | "medium" | "low"
+
+
+class PRRiskOutput(BaseModel):
+    pr_number: int
+    title: str = ""
+    files_changed: int = 0
+    additions: int = 0
+    deletions: int = 0
+    net_lines: int = 0                       # additions - deletions
+    # NOTE: unlike the repo *_score fields (higher = healthier), risk_score is
+    # 0-100 where HIGHER = RISKIER (0 = trivial/safe PR). It is a standalone
+    # signal and does NOT feed the deterministic readiness_score.
+    risk_score: int = 0
+    risk_level: str = "low"                  # "low" | "medium" | "high" | "critical"
+    risk_factors: List[PRRiskFactor] = []
+    risky_surfaces: List[str] = []           # sensitive areas the diff touched
+    changed_files_without_tests: List[str] = []   # changed source files with no test change
+    summary: str = ""
+    recommendation: str = ""
+
+
 # ── Aggregate ─────────────────────────────────────────────────────────────────
 
 class AgentOutputs(BaseModel):
@@ -169,6 +205,10 @@ class ShipMateReport(BaseModel):
     key_blockers: List[str]
     next_actions: List[str]
     generated_at: str
+    # PR-scoped risk assessment — present ONLY when a pr_number was analyzed.
+    # None for a plain branch analysis (no PR to score). Optional + default None
+    # keeps older stored reports valid under model_validate.
+    pr_risk: Optional["PRRiskOutput"] = None
     # True when the LLM discovery/enhancement path was live for this run; False
     # when it silently degraded to pure heuristics (expired creds / unreachable
     # provider). Lets the UI show a "heuristic-only" banner instead of leaving

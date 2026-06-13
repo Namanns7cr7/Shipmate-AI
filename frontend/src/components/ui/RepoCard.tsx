@@ -65,7 +65,7 @@ export function RepoCard({ repo: r, report, onAnalyze, onReport, analyzing = fal
                   ? <span style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 11.5, color: 'var(--ink-3)' }}>
                       <Clock size={12} /> {new Date(report!.generated_at).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
                     </span>
-                  : <span className="chip tone-blue">Not analyzed</span>
+                  : <span className="chip tone-slate">Not analyzed</span>
                 }
               </div>
             </div>

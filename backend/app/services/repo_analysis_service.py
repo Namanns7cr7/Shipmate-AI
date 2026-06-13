@@ -80,6 +80,7 @@ class RepoAnalysisService:
         # `warnings` list in the context so the orchestrator/route can tell the
         # user "PR context unavailable" instead of degrading invisibly.
         pr_info = None
+        pr_files: List[Dict[str, Any]] = []
         warnings: List[str] = []
         if pr_number:
             try:
@@ -98,12 +99,26 @@ class RepoAnalysisService:
                 warnings.append(msg)
                 logger.warning(msg)
 
+            # The changed-file diff powers PRRiskAgent. Only fetch it when the PR
+            # actually exists: if pr_info 404'd (PR not found — a benign, expected
+            # case), there's nothing to diff and we stay silent, matching the
+            # pr_info contract. A failure here when the PR DOES exist is
+            # best-effort — the PR risk card is simply absent, never an error.
+            if pr_info is not None:
+                try:
+                    pr_files = await GitHubAPIService.get_pr_files(token, owner, repo, pr_number)
+                except Exception:
+                    # Best-effort: a PR whose metadata loaded but whose files
+                    # failed simply gets no PR-risk card, never an error.
+                    pass
+
         return {
             "repo_info": repo_info,
             "file_tree": file_tree,
             "key_files": key_files,
             "branch": branch,
             "pr_info": pr_info,
+            "pr_files": pr_files,
             "feature_context": feature_context,
             "warnings": warnings,
         }
@@ -188,6 +203,12 @@ class RepoAnalysisService:
         for name in _KEY_FILE_NAMES:
             if name in tree_set:
                 selected.append(name)
+            else:
+                # If not at root, find up to 2 instances in subdirectories
+                matches = [f for f in tree if f.endswith("/" + name)]
+                if matches:
+                    selected.extend(matches[:2])
+
             if len(selected) >= _MAX_KEY_FILES:
                 break
 

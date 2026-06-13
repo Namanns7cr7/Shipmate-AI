@@ -1,6 +1,6 @@
 import { motion } from 'framer-motion';
 import { useState, useEffect } from 'react';
-import { AlertTriangle, FileText, RotateCcw, TrendingUp, List, ExternalLink, Lock, BookOpen } from 'lucide-react';
+import { AlertTriangle, FileText, RotateCcw, TrendingUp, List, ExternalLink, Lock, BookOpen, ShieldCheck } from 'lucide-react';
 import { ScoreRing } from '../components/ui/ScoreRing';
 import { VerdictPill, toVerdict } from '../components/ui/VerdictPill';
 import { RadarBg } from '../components/ui/RadarBg';
@@ -28,7 +28,8 @@ function DeploymentReadinessCard({ report, onView }: { report: ShipMateReport; o
     'Blocked':     { hex: '#ef4444', Icon: AlertTriangle },
   };
   const v = vmap[verdict];
-  const topBlocker = report.key_blockers[0] ?? 'No critical blockers detected.';
+  const hasBlockers = report.key_blockers.length > 0;
+  const topBlocker = report.key_blockers[0] ?? 'No critical blockers — cleared for deployment.';
   const breakdown = [
     { key: 'repolens',  label: 'Repo Health', score: report.score_breakdown.repo_score },
     { key: 'planforge', label: 'Delivery',    score: report.score_breakdown.delivery_score },
@@ -44,7 +45,7 @@ function DeploymentReadinessCard({ report, onView }: { report: ShipMateReport; o
         <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 14, paddingRight: 28, borderRight: '1px solid var(--line)' }}>
           <div className="eyebrow">Deployment Readiness</div>
           <ScoreRing value={report.readiness_score} size={158} stroke={11} label={verdict.toUpperCase()} />
-          <div className="mono" style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 11, color: 'var(--ink-3)' }}>
+          <div className="mono" style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 11, color: 'var(--ink-2)' }}>
             {report.repo.branch} · {report.repo.full_name.split('/')[1]}
           </div>
         </div>
@@ -67,11 +68,17 @@ function DeploymentReadinessCard({ report, onView }: { report: ShipMateReport; o
             </button>
           </div>
 
-          {/* Top blocker */}
-          <div style={{ display: 'flex', alignItems: 'flex-start', gap: 12, padding: '12px 14px', borderRadius: 12, background: 'rgba(239,68,68,0.08)', border: '1px solid rgba(239,68,68,0.22)' }}>
-            <AlertTriangle size={17} style={{ color: '#f87171', flexShrink: 0, marginTop: 1 }} />
+          {/* Top blocker — verdict-aware: red alert when blockers exist, emerald "cleared" affirmation when none */}
+          <div style={{ display: 'flex', alignItems: 'flex-start', gap: 12, padding: '12px 14px', borderRadius: 12,
+            background: hasBlockers ? 'rgba(239,68,68,0.08)' : 'rgba(16,185,129,0.08)',
+            border: hasBlockers ? '1px solid rgba(239,68,68,0.22)' : '1px solid rgba(16,185,129,0.22)' }}>
+            {hasBlockers
+              ? <AlertTriangle size={17} style={{ color: '#f87171', flexShrink: 0, marginTop: 1 }} />
+              : <ShieldCheck size={17} style={{ color: '#34d399', flexShrink: 0, marginTop: 1 }} />}
             <div>
-              <div style={{ fontSize: 11, fontWeight: 700, color: '#fca5a5', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 3 }}>Top Blocker · GuardRail</div>
+              <div style={{ fontSize: 11, fontWeight: 700, color: hasBlockers ? '#fca5a5' : '#6ee7b7', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 3 }}>
+                {hasBlockers ? 'Top Blocker · GuardRail' : 'All Clear · GuardRail'}
+              </div>
               <div style={{ fontSize: 13.5, color: 'var(--ink-2)', lineHeight: 1.5 }}>{topBlocker}</div>
             </div>
           </div>
@@ -234,7 +241,7 @@ function ScoreSparkline({ history, currentScore }: { history: ScorePoint[]; curr
         })}
       </div>
       {history.length >= 2 && (
-        <div className="mono" style={{ display: 'flex', justifyContent: 'space-between', marginTop: 8, fontSize: 10, color: 'var(--ink-4)' }}>
+        <div className="mono" style={{ display: 'flex', justifyContent: 'space-between', marginTop: 8, fontSize: 10.5, color: 'var(--ink-3)' }}>
           <span>{new Date(history[0].recorded_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}</span>
           <span>{history.length} runs</span>
           <span>{new Date(history[history.length - 1].recorded_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}</span>
@@ -320,7 +327,7 @@ export function DashboardPage({ user, repos, report, onNavigate, onAnalyze }: Pr
           <RecentAnalysesTable repos={repos} report={report} onNavigate={onNavigate} onAnalyze={onAnalyze} />
           {report
             ? <AIInsightsPanel report={report} history={history} onView={() => onNavigate('reports')} />
-            : <div className="card" style={{ padding: 32, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', textAlign: 'center', gap: 12 }}>
+            : <div className="card" style={{ padding: 32, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', textAlign: 'center', gap: 12, alignSelf: 'start' }}>
                 <div style={{ fontSize: 40 }}>✦</div>
                 <p className="muted" style={{ fontSize: 13 }}>Run your first analysis to see AI insights.</p>
                 <button className="btn btn-primary btn-sm" onClick={() => onNavigate('repos')}>Go to Repositories →</button>

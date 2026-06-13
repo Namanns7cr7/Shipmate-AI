@@ -6,6 +6,7 @@ from ..agents.repo_lens_agent import RepoLensAgent
 from ..agents.plan_forge_agent import PlanForgeAgent
 from ..agents.guardrail_agent import GuardRailAgent
 from ..agents.testpilot_agent import TestPilotAgent
+from ..agents.pr_risk_agent import PRRiskAgent
 from ..services.scoring_service import ScoringService
 from ..services.report_service import ReportService
 from ..schemas.agent_schemas import (
@@ -15,13 +16,14 @@ from ..schemas.agent_schemas import (
 
 class ShipMateOrchestrator:
     """
-    Runs the 4-agent pipeline and assembles the final ShipMateReport.
+    Runs the agent pipeline and assembles the final ShipMateReport.
 
     Execution order:
       1. RepoLens  — repo structure, tech stack, architecture risks (context builder)
       2. PlanForge, GuardRail, TestPilot  — run in parallel via asyncio.to_thread
-      3. ScoringService  — deterministic weighted score
-      4. ReportService   — final report assembly
+      3. PRRiskAgent — ONLY for a PR-scoped analysis (pr_number → pr_files present)
+      4. ScoringService  — deterministic weighted score
+      5. ReportService   — final report assembly
     """
 
     def __init__(self):
@@ -29,6 +31,12 @@ class ShipMateOrchestrator:
         self.plan_forge = PlanForgeAgent()
         self.guardrail = GuardRailAgent()
         self.testpilot = TestPilotAgent()
+        self.pr_risk = PRRiskAgent()
+
+    @staticmethod
+    def _has_pr(repo_context: Dict[str, Any]) -> bool:
+        """PR risk only runs for a PR-scoped analysis (pr_number → pr_files)."""
+        return bool(repo_context.get("pr_files"))
 
     async def run(self, repo_context: Dict[str, Any]) -> ShipMateReport:
         """
@@ -40,6 +48,7 @@ class ShipMateOrchestrator:
                 - branch: str
                 - feature_context: str (optional)
                 - pr_info: dict (optional)
+                - pr_files: List[dict] (optional — present for a PR-scoped run)
         Returns:
             ShipMateReport
         """
@@ -124,6 +133,9 @@ class ShipMateOrchestrator:
             repo_context, plan_forge_out, guardrail_out, testpilot_out
         )
 
+        # ── Step 2b: PR Risk — only when this is a PR-scoped analysis ──
+        pr_risk_out = self.pr_risk.run(repo_context) if self._has_pr(repo_context) else None
+
         score_breakdown = ScoringService.calculate(
             repo_lens_out, plan_forge_out, guardrail_out, testpilot_out
         )
@@ -171,6 +183,7 @@ class ShipMateOrchestrator:
             key_blockers=key_blockers,
             next_actions=next_actions,
             generated_at=datetime.now(timezone.utc).isoformat(),
+            pr_risk=pr_risk_out,
             ai_enhanced=ai_enhanced,
             score_explanation=score_breakdown.get("score_explanation", []),
         )

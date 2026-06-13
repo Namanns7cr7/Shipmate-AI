@@ -185,7 +185,7 @@ export function BuildPage({ selectedRepo, selectedBranch, accessToken }: Props) 
 
       {/* Empty / loading states */}
       {!plan && !loading && (
-        <div className="card grid-bg" style={{ padding: 48, textAlign: 'center' }}>
+        <div className="card grid-bg" style={{ padding: 32, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', textAlign: 'center', minHeight: 280 }}>
           <Hammer size={36} style={{ color: 'var(--purple)', marginBottom: 14 }} />
           <h3 style={{ fontSize: 17, fontWeight: 800, color: '#fff', margin: '0 0 6px' }}>Find self-improvement work</h3>
           <p className="muted" style={{ fontSize: 13.5, maxWidth: 520, margin: '0 auto 4px' }}>

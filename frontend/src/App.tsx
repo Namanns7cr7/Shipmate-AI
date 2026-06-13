@@ -181,8 +181,14 @@ export default function App() {
     return () => window.removeEventListener('resize', handler);
   }, []);
 
-  // Close drawer on page navigation (mobile)
-  useEffect(() => { setSidebarOpen(false); }, [page]);
+  // Close drawer on page navigation (mobile). Done during render via a
+  // previous-value check instead of an effect, so it doesn't trigger a
+  // cascading re-render (react-hooks/set-state-in-effect).
+  const [drawerSyncedPage, setDrawerSyncedPage] = useState(page);
+  if (page !== drawerSyncedPage) {
+    setDrawerSyncedPage(page);
+    setSidebarOpen(false);
+  }
 
   const { agents, progressByAgent, overallPct, markAllComplete, markAgentComplete, markAllError } = useAgentSimulation(analyzing);
 
@@ -278,7 +284,7 @@ export default function App() {
       {isMobile && sidebarOpen && (
         <div
           onClick={() => setSidebarOpen(false)}
-          style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.65)', zIndex: 90, backdropFilter: 'blur(3px)' }}
+          style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.85)', zIndex: 90, backdropFilter: 'blur(3px)' }}
         />
       )}
 
