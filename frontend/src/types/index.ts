@@ -154,6 +154,36 @@ export interface TestPilotOutput {
   test_score: number;
 }
 
+// ── PR Risk ───────────────────────────────────────────────────────────────────
+
+export interface PRRiskFactor {
+  id: string;
+  title: string;
+  severity: Severity;
+  category: string;
+  description: string;
+  file?: string | null;
+  evidence?: string | null;
+  source?: 'heuristic' | 'discovery';
+  confidence?: string;
+}
+
+export interface PRRiskOutput {
+  pr_number: number;
+  title: string;
+  files_changed: number;
+  additions: number;
+  deletions: number;
+  net_lines: number;
+  risk_score: number;          // 0-100, HIGHER = riskier (standalone, not in readiness_score)
+  risk_level: string;          // 'low' | 'medium' | 'high' | 'critical'
+  risk_factors: PRRiskFactor[];
+  risky_surfaces: string[];
+  changed_files_without_tests: string[];
+  summary: string;
+  recommendation: string;
+}
+
 // ── Report ────────────────────────────────────────────────────────────────────
 
 export interface ScoreBreakdown {
@@ -191,6 +221,8 @@ export interface ShipMateReport {
   key_blockers: string[];
   next_actions: string[];
   generated_at: string;
+  // Present ONLY when a PR (pr_number) was analyzed; null for a branch analysis.
+  pr_risk?: PRRiskOutput | null;
 }
 
 export interface AnalyzeResponse {

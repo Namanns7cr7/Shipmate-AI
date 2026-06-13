@@ -64,11 +64,25 @@ class RepoAnalysisService:
 
         # Optional PR context
         pr_info = None
+        pr_files: List[Dict[str, Any]] = []
         if pr_number:
             try:
                 pr_info = await GitHubAPIService.get_pr_info(token, owner, repo, pr_number)
             except Exception:
                 pass
+
+            # The changed-file diff powers PRRiskAgent. Only fetch it when the PR
+            # actually exists: if pr_info 404'd (PR not found — a benign, expected
+            # case), there's nothing to diff and we stay silent, matching the
+            # pr_info contract. A failure here when the PR DOES exist is
+            # best-effort — the PR risk card is simply absent, never an error.
+            if pr_info is not None:
+                try:
+                    pr_files = await GitHubAPIService.get_pr_files(token, owner, repo, pr_number)
+                except Exception:
+                    # Best-effort: a PR whose metadata loaded but whose files
+                    # failed simply gets no PR-risk card, never an error.
+                    pass
 
         return {
             "repo_info": repo_info,
@@ -76,6 +90,7 @@ class RepoAnalysisService:
             "key_files": key_files,
             "branch": branch,
             "pr_info": pr_info,
+            "pr_files": pr_files,
             "feature_context": feature_context,
         }
 

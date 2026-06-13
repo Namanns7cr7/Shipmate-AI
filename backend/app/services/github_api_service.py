@@ -126,3 +126,33 @@ class GitHubAPIService:
             )
             resp.raise_for_status()
             return resp.json()
+
+    @staticmethod
+    async def get_pr_files(
+        token: str, owner: str, repo: str, pr_number: int, max_files: int = 300,
+    ) -> List[Dict[str, Any]]:
+        """Return a PR's changed files for the PRRiskAgent.
+
+        Each item carries: filename, status (added|modified|removed|renamed),
+        additions, deletions, changes, and `patch` (the unified-diff hunks for
+        that file — absent for binary or very large files). Paginated at 100/page
+        and capped at `max_files` so a giant PR can't blow the request budget;
+        the risk heuristic only needs a representative slice."""
+        out: List[Dict[str, Any]] = []
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+            page = 1
+            while len(out) < max_files:
+                resp = await client.get(
+                    f"{_BASE}/repos/{owner}/{repo}/pulls/{pr_number}/files",
+                    headers=_headers(token),
+                    params={"per_page": 100, "page": page},
+                )
+                resp.raise_for_status()
+                batch = resp.json()
+                if not batch:
+                    break
+                out.extend(batch)
+                if len(batch) < 100:
+                    break
+                page += 1
+        return out[:max_files]

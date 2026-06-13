@@ -6,7 +6,7 @@ import { VerdictPill, toVerdict } from '../components/ui/VerdictPill';
 import { RadarBg } from '../components/ui/RadarBg';
 import { ActuateButton } from '../components/ui/ActuateButton';
 import { AGENTS } from '../lib/agents';
-import type { ShipMateReport, SecurityFinding, RepoLensSummary } from '../types';
+import type { ShipMateReport, SecurityFinding, RepoLensSummary, PRRiskOutput } from '../types';
 
 /* ---------- Actuate context helpers ---------- */
 function makeContext(report: ShipMateReport): RepoLensSummary {
@@ -72,6 +72,87 @@ function RationaleNote({ rationale }: { rationale?: string | null }) {
         <Sparkles size={11} /> Why:
       </span>
       <span style={{ color: 'var(--ink-2)' }}>{rationale}</span>
+    </div>
+  );
+}
+
+/* ---------- PR Risk card ---------- */
+const LEVEL_HEX: Record<string, string>  = { critical: '#ef4444', high: '#f97316', medium: '#f59e0b', low: '#10b981' };
+const LEVEL_TONE: Record<string, string> = { critical: 'red', high: 'orange', medium: 'amber', low: 'emerald' };
+
+function PRRiskCard({ pr }: { pr: PRRiskOutput }) {
+  const hex  = LEVEL_HEX[pr.risk_level]  ?? '#64748b';
+  const tone = LEVEL_TONE[pr.risk_level] ?? 'slate';
+  return (
+    <div className="card" style={{ padding: 22, marginTop: 18, borderColor: `${hex}44`, background: `linear-gradient(180deg, ${hex}0d, var(--panel))` }}>
+      {/* header */}
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 10, marginBottom: 12 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', minWidth: 0 }}>
+          <span className="eyebrow" style={{ color: hex }}>PR Risk</span>
+          <span className="mono" style={{ fontSize: 14, fontWeight: 700, color: '#fff' }}>#{pr.pr_number}</span>
+          {pr.title && <span className="muted" style={{ fontSize: 13, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 360 }}>{pr.title}</span>}
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <span className={`chip tone-${tone}`} style={{ textTransform: 'uppercase', fontWeight: 700 }}>{pr.risk_level} risk</span>
+          <span className="mono" style={{ fontSize: 13, fontWeight: 800, color: hex }}>{pr.risk_score}<span className="muted" style={{ fontWeight: 500 }}>/100</span></span>
+        </div>
+      </div>
+
+      {/* summary */}
+      {pr.summary && <p style={{ fontSize: 13.5, color: 'var(--ink-2)', lineHeight: 1.55, margin: '0 0 14px' }}>{pr.summary}</p>}
+
+      {/* stat + surface chips */}
+      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: pr.risk_factors.length ? 16 : 0 }}>
+        <span className="chip tone-slate">{pr.files_changed} files</span>
+        <span className="chip tone-emerald">+{pr.additions}</span>
+        <span className="chip tone-red">-{pr.deletions}</span>
+        {pr.risky_surfaces.slice(0, 3).map(s => <span key={s} className="chip tone-amber">{s}</span>)}
+      </div>
+
+      {/* risk factors */}
+      {pr.risk_factors.length > 0 && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+          {pr.risk_factors.map(f => {
+            const fhex  = SEV_HEX[f.severity]  ?? '#64748b';
+            const ftone = SEV_TONE[f.severity] ?? 'slate';
+            return (
+              <div key={f.id} style={{ display: 'flex', flexDirection: 'column', gap: 5, padding: '11px 13px', borderRadius: 10, background: 'rgba(255,255,255,0.02)', border: `1px solid ${fhex}33` }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                  <span className={`chip tone-${ftone}`} style={{ textTransform: 'uppercase', fontWeight: 700 }}>{f.severity}</span>
+                  <span style={{ fontSize: 13.5, fontWeight: 650, color: '#fff' }}>{f.title}</span>
+                  {f.file && <span className="mono muted" style={{ fontSize: 11, overflowWrap: 'anywhere' }}>{f.file}</span>}
+                </div>
+                <div className="muted" style={{ fontSize: 12.5, lineHeight: 1.5 }}>{f.description}</div>
+                {f.evidence && (
+                  <div className="mono" style={{ fontSize: 11, color: 'var(--ink-3)', overflowWrap: 'anywhere' }}>&rarr; {f.evidence}</div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {/* changed-without-tests */}
+      {pr.changed_files_without_tests.length > 0 && (
+        <div style={{ marginTop: 14, padding: '11px 13px', borderRadius: 10, background: 'rgba(245,158,11,0.08)', border: '1px solid rgba(245,158,11,0.28)' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, fontWeight: 700, color: '#fbbf24', marginBottom: 6 }}>
+            <AlertTriangle size={13} /> Changed without tests
+          </div>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+            {pr.changed_files_without_tests.slice(0, 8).map(f => (
+              <span key={f} className="mono muted" style={{ fontSize: 11 }}>{f}</span>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* review focus */}
+      {pr.recommendation && (
+        <div style={{ display: 'flex', alignItems: 'flex-start', gap: 8, marginTop: 14, fontSize: 13 }}>
+          <ChevronRight size={14} style={{ flexShrink: 0, marginTop: 2, color: '#6ee7b7' }} />
+          <span><b style={{ color: '#a7f3d0' }}>Review focus: </b><span style={{ color: 'var(--ink-2)' }}>{pr.recommendation}</span></span>
+        </div>
+      )}
     </div>
   );
 }
@@ -500,6 +581,9 @@ export function ReportsPage({ report, onReRun, accessToken }: Props) {
     <motion.div initial={{ opacity: 0, y: 14 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.55, ease: [0.2,0.7,0.2,1] }}
       style={{ padding: '28px 32px', maxWidth: 1180, margin: '0 auto', width: '100%' }}>
       <ExecutiveReportHeader report={report} onReRun={onReRun} />
+
+      {/* PR Risk — shown only for a PR-scoped analysis (report.pr_risk present) */}
+      {report.pr_risk && <PRRiskCard pr={report.pr_risk} />}
 
       {/* Tab bar */}
       <div style={{ display: 'flex', gap: 16, borderBottom: '1px solid var(--line)', margin: '22px 0', overflowX: 'auto' }}>
