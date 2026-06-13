@@ -93,3 +93,45 @@ class TestOpenAudit:
         rep = ResearchService.research(CTX)   # no question
         assert rep.question == ""
         assert rep.graph_summary["module_count"] == 2
+
+
+class TestSalvageLeakedFindings:
+    """Regression: Opus-on-Bedrock sometimes serializes the `findings` ARRAY
+    into the `answer` STRING (an XML param-tag or bare-JSON leak) for the
+    two-field research schema. _salvage_research_findings must recover them."""
+
+    def test_xml_param_tag_leak_recovered(self):
+        from app.services.llm_service import _salvage_research_findings, _ResearchDiscovery
+        leaked = (
+            'Prose answer about the repo.\n'
+            '<parameter name="findings">'
+            '[{"title":"god barrel","kind":"coupling","severity":"high",'
+            '"detail":"fan-in 16","evidence":["backend/app/services/__init__.py"],'
+            '"suggested_action":"import directly","graph_signal":"fan_in=16"}]'
+            '</parameter>'
+        )
+        out = _salvage_research_findings(_ResearchDiscovery(answer=leaked, findings=[]))
+        assert len(out.findings) == 1
+        assert out.findings[0].graph_signal == "fan_in=16"
+        assert "parameter" not in out.answer and out.answer == "Prose answer about the repo."
+
+    def test_bare_json_leak_recovered(self):
+        from app.services.llm_service import _salvage_research_findings, _ResearchDiscovery
+        leaked = 'Answer text. "findings": [{"title":"x","kind":"risk","severity":"low","detail":"d"}]'
+        out = _salvage_research_findings(_ResearchDiscovery(answer=leaked, findings=[]))
+        assert len(out.findings) == 1 and out.findings[0].kind == "risk"
+
+    def test_noop_when_findings_present(self):
+        from app.services.llm_service import _salvage_research_findings, _ResearchDiscovery, _ResearchFinding
+        disc = _ResearchDiscovery(answer="clean", findings=[_ResearchFinding(title="t", kind="risk", severity="low", detail="d")])
+        assert _salvage_research_findings(disc).answer == "clean"
+
+    def test_noop_when_no_leak(self):
+        from app.services.llm_service import _salvage_research_findings, _ResearchDiscovery
+        disc = _ResearchDiscovery(answer="just prose, no array here", findings=[])
+        out = _salvage_research_findings(disc)
+        assert out.findings == [] and out.answer == "just prose, no array here"
+
+    def test_none_passthrough(self):
+        from app.services.llm_service import _salvage_research_findings
+        assert _salvage_research_findings(None) is None

@@ -721,12 +721,13 @@ class LLMService:
                 context, code_blob, graph_summary,
                 question=question, max_findings=max_findings,
             )
-            return provider.invoke_structured_sync(
+            disc = provider.invoke_structured_sync(
                 system_prompt=_RESEARCH_SYSTEM,
                 user_prompt=user,
                 schema_class=_ResearchDiscovery,
                 deployment_hint="smart",
             )
+            return _salvage_research_findings(disc)
         except Exception as e:
             logger.warning("Codebase research failed (%s); returning none", e)
             _maybe_invalidate_provider(e)
@@ -845,6 +846,69 @@ class _ResearchDiscovery(BaseModel):
         default_factory=list,
         description="Grounded loops/holes/tweaks/dataflow issues. Each MUST cite real files; prefer findings the reference-graph summary supports.",
     )
+
+
+# Two shapes of the Bedrock multi-field forced-tool-call leak, where the model
+# serializes the `findings` ARRAY into the `answer` STRING instead of the
+# structured field: an XML param tag `<parameter name="findings">[...]>` or a
+# bare JSON `"findings": [...]`. Both observed live on Opus-4.8/Bedrock for the
+# two-field research schema (the single-list opportunity schema never leaks).
+_FINDINGS_XML_RE = re.compile(
+    r'<\s*(?:antml:)?parameter\s+name="findings"\s*>\s*(\[.*\])', re.DOTALL,
+)
+_FINDINGS_JSON_RE = re.compile(r'"findings"\s*:\s*(\[.*\])', re.DOTALL)
+
+
+def _salvage_research_findings(disc: Optional["_ResearchDiscovery"]) -> Optional["_ResearchDiscovery"]:
+    """Recover findings the model leaked into `answer` as a serialized array
+    instead of the structured field. No-op when findings already populated or
+    no leak is present. Trims the leaked blob off the answer so the UI shows
+    clean prose. Fail-safe: any parse error leaves `disc` untouched."""
+    if disc is None or disc.findings:
+        return disc
+    answer = disc.answer or ""
+    m = _FINDINGS_XML_RE.search(answer) or _FINDINGS_JSON_RE.search(answer)
+    if not m:
+        return disc
+    blob = m.group(1)
+    # The regex is greedy to the last ']'; walk back to a json-parseable array.
+    parsed = None
+    while blob.endswith("]"):
+        try:
+            parsed = json.loads(blob)
+            break
+        except Exception:
+            cut = blob.rfind("]", 0, len(blob) - 1)
+            if cut == -1:
+                break
+            blob = blob[: cut + 1]
+    if not isinstance(parsed, list) or not parsed:
+        return disc
+    recovered: List[_ResearchFinding] = []
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        try:
+            recovered.append(_ResearchFinding(**{
+                "title": item.get("title", ""),
+                "kind": item.get("kind", "observation"),
+                "severity": item.get("severity", "medium"),
+                "detail": item.get("detail", ""),
+                "evidence": item.get("evidence", []) or [],
+                "suggested_action": item.get("suggested_action", "") or "",
+                "graph_signal": item.get("graph_signal", "") or "",
+            }))
+        except Exception:
+            continue
+    if recovered:
+        disc.findings = recovered
+        # Strip the leaked blob + any stray open/close param tags off the prose.
+        clean = answer[: m.start()]
+        clean = re.sub(r'<\s*/?\s*(?:antml:)?parameter[^>]*>\s*$', "", clean).rstrip()
+        clean = clean.rstrip("<").rstrip()
+        disc.answer = clean
+        logger.info("research: salvaged %d findings leaked into answer", len(recovered))
+    return disc
 
 
 # ─── Discovery — code-blob builder ───────────────────────────────────────────
