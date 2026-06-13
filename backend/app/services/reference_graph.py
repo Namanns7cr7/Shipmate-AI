@@ -115,6 +115,37 @@ class ReferenceGraph:
         }
 
 
+# ── all-scope import collection ──────────────────────────────────────────────
+
+def _collect_all_imports(content: str):
+    """Collect imports at EVERY scope (module level AND inside functions).
+
+    ast_lint._collect_imports deliberately models module-level imports only —
+    correct for import-fidelity linting (a function-body import can't break
+    `import app.main`). But for the dependency GRAPH a lazy `from app.services
+    import diff_apply` inside a method IS a real runtime edge; ignoring it makes
+    the imported module look like an orphan. So the graph walks all scopes.
+
+    Returns (plain_modules: set, module_imports: dict[mod -> set[names]]),
+    matching the shape build_reference_graph already consumes. Empty on
+    SyntaxError (the file becomes an edge-less node, flagged via parse_error)."""
+    plain: Set[str] = set()
+    module_imports: Dict[str, Set[str]] = {}
+    try:
+        tree = ast.parse(content or "")
+    except SyntaxError:
+        return plain, module_imports
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                plain.add(alias.name)
+        elif isinstance(node, ast.ImportFrom):
+            mod = ("." * node.level) + (node.module or "")
+            names = {a.name for a in node.names if a.name != "*"}
+            module_imports.setdefault(mod, set()).update(names)
+    return plain, module_imports
+
+
 # ── defined (not imported) top-level symbols ─────────────────────────────────
 
 def _defined_symbols(content: str) -> Set[str]:
@@ -200,15 +231,17 @@ def build_reference_graph(
     # 2. Resolve imports → edges (only when the target is a corpus node).
     for path, node in graph.nodes.items():
         src = key_files.get(path) or ""
-        collector, err = ast_lint._collect_imports(src)
-        if err:
-            node.parse_error = err
+        # Flag unparseable files (no edges) the same way as before.
+        if ast_lint.syntax_error_of(src, path):
+            node.parse_error = ast_lint.syntax_error_of(src, path)
             continue
-        # `import a.b.c` and `from X import names` (X may be relative).
+        # All-scope collection: a lazy import inside a function IS a real graph
+        # edge (see _collect_all_imports). `import a.b.c` + `from X import names`.
+        plain_modules, module_imports = _collect_all_imports(src)
         targets: Dict[str, Set[str]] = {}
-        for mod in collector.plain_modules:
+        for mod in plain_modules:
             targets.setdefault(mod, set())
-        for mod, names in collector.module_imports.items():
+        for mod, names in module_imports.items():
             resolved = _resolve_relative(mod, node.module) if mod.startswith(".") else mod
             if resolved:
                 targets.setdefault(resolved, set()).update(names)
@@ -222,15 +255,38 @@ def build_reference_graph(
                     if cand in graph.nodes:
                         tgt_path = cand
                         break
+
+            # `from app.services import ast_lint` parses as module="app.services",
+            # names={"ast_lint"} — i.e. the imported NAME is itself a sibling
+            # MODULE, not a symbol of the package __init__. Without this, every
+            # module imported that way looks like an orphan (0 importers) because
+            # the only edge recorded points at the package node. For each name
+            # that resolves to a real submodule path in the corpus, add a direct
+            # module→module edge to it (and don't count it as a symbol of `mod`).
+            symbol_names: Set[str] = set()
+            for name in names:
+                sub_path = module_to_path.get(f"{mod}.{name}")
+                if sub_path is None:
+                    for cand in _candidate_paths_for_module(f"{mod}.{name}"):
+                        if cand in graph.nodes:
+                            sub_path = cand
+                            break
+                if sub_path is not None and sub_path != path:
+                    node.imports.add(sub_path)
+                    graph.nodes[sub_path].imported_by.add(path)
+                else:
+                    symbol_names.add(name)  # a real symbol of `mod`, handled below
+
             if tgt_path is None or tgt_path == path:
                 continue  # third-party, non-corpus, or self-import
             node.imports.add(tgt_path)
             graph.nodes[tgt_path].imported_by.add(path)
             # Record which of the target's DEFINED exports are actually imported
             # elsewhere (match against defined symbols so re-exports of a name
-            # don't mask that the DEFINING module's symbol is unused).
+            # don't mask that the DEFINING module's symbol is unused). Only the
+            # names that were NOT resolved to a submodule count as symbols here.
             graph.nodes[tgt_path].used_symbols.update(
-                names & graph.nodes[tgt_path].exported_symbols
+                symbol_names & graph.nodes[tgt_path].exported_symbols
             )
 
     # 3. Detect import cycles (DFS over the path-edge graph).
