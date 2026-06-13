@@ -178,7 +178,7 @@ export function AnalysisPage({ selectedRepo, selectedBranch, agents, progressByA
 
   return (
     <motion.div initial={{ opacity: 0, y: 14 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.55, ease: [0.2,0.7,0.2,1] }}
-      style={{ padding: '28px 32px', maxWidth: 1180, margin: '0 auto', width: '100%' }}>
+      className="page-content" style={{ padding: 'var(--page-py) var(--page-px)', maxWidth: 1180, margin: '0 auto', width: '100%' }}>
       {/* Header */}
       <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', flexWrap: 'wrap', gap: 12, marginBottom: 22 }}>
         <div>

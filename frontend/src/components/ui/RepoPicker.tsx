@@ -97,11 +97,11 @@ export function RepoPicker({ repos, selected, onSelect, disabled }: Props) {
             marginTop: 6,
             minWidth: 300,
             maxWidth: 400,
-            background: 'var(--panel)',
-            backdropFilter: 'blur(14px)',
-            border: '1px solid var(--line-2)',
+            background: 'rgba(8,14,28,0.97)',
+            backdropFilter: 'blur(20px)',
+            border: '1px solid rgba(255,255,255,0.09)',
             borderRadius: 10,
-            boxShadow: '0 12px 32px rgba(0,0,0,0.4)',
+            boxShadow: '0 16px 40px rgba(0,0,0,0.7), 0 0 0 0.5px rgba(255,255,255,0.05)',
             zIndex: 100,
             padding: 4,
           }}
@@ -110,7 +110,7 @@ export function RepoPicker({ repos, selected, onSelect, disabled }: Props) {
             <div style={{
               display: 'flex', alignItems: 'center', gap: 6,
               padding: '5px 8px', borderRadius: 8,
-              background: 'rgba(255,255,255,0.04)', border: '1px solid var(--line)',
+              background: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.08)',
             }}>
               <Search size={12} style={{ color: 'var(--ink-3)', flexShrink: 0 }} />
               <input

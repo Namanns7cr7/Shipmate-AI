@@ -1,5 +1,5 @@
 import { useState, useCallback, useEffect, useRef } from 'react';
-import { Zap, Bell, Clock, Sparkles } from 'lucide-react';
+import { Zap, Bell, Clock, Sparkles, Menu } from 'lucide-react';
 import { useGithubAuth } from './hooks/useGithubAuth';
 import { api } from './lib/api';
 import { LandingPage } from './components/landing/LandingPage';
@@ -169,8 +169,20 @@ export default function App() {
   const [report, setReport]                 = useState<ShipMateReport | null>(null);
   const [analyzing, setAnalyzing]           = useState(false);
   const [autoFixOpen, setAutoFixOpen]       = useState(false);
+  const [sidebarOpen, setSidebarOpen]       = useState(false);
+  const [isMobile, setIsMobile]             = useState(() => window.innerWidth < 768);
   // Real per-agent activity-log lines from the SSE stream (empty until events arrive).
   const [liveLines, setLiveLines]           = useState<LogLine[]>([]);
+
+  // Track viewport width for responsive layout
+  useEffect(() => {
+    const handler = () => setIsMobile(window.innerWidth < 768);
+    window.addEventListener('resize', handler);
+    return () => window.removeEventListener('resize', handler);
+  }, []);
+
+  // Close drawer on page navigation (mobile)
+  useEffect(() => { setSidebarOpen(false); }, [page]);
 
   const { agents, progressByAgent, overallPct, markAllComplete, markAgentComplete, markAllError } = useAgentSimulation(analyzing);
 
@@ -260,7 +272,16 @@ export default function App() {
   const lastScan = report ? new Date(report.generated_at).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : null;
 
   return (
-    <div style={{ display: 'flex', minHeight: '100vh', background: 'var(--bg)', color: 'var(--ink)' }}>
+    <div style={{ display: 'flex', minHeight: '100vh', background: 'var(--bg)', color: 'var(--ink)', position: 'relative' }}>
+
+      {/* Mobile backdrop */}
+      {isMobile && sidebarOpen && (
+        <div
+          onClick={() => setSidebarOpen(false)}
+          style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.65)', zIndex: 90, backdropFilter: 'blur(3px)' }}
+        />
+      )}
+
       <AppSidebar
         activePage={activePage}
         onNavigate={p => { if (p === 'analysis' && !analyzing) return; setPage(p); }}
@@ -270,38 +291,74 @@ export default function App() {
         selectedRepo={selectedRepo}
         onSelectRepo={r => { handleSelectRepo(r); }}
         hasReport={!!report}
+        isMobile={isMobile}
+        mobileOpen={sidebarOpen}
+        onMobileClose={() => setSidebarOpen(false)}
+        selectedBranch={selectedBranch}
+        onBranchChange={setSelectedBranch}
+        accessToken={auth.accessToken}
+        analyzing={analyzing}
+        onAnalyze={() => handleAnalyze()}
+        onAutoFix={() => setAutoFixOpen(true)}
       />
 
-      <main style={{ flex: 1, height: '100vh', overflowY: 'auto', display: 'flex', flexDirection: 'column' }}>
+      <main style={{ flex: 1, minHeight: '100vh', height: isMobile ? 'auto' : '100vh', overflowY: 'auto', display: 'flex', flexDirection: 'column' }}>
         {/* Topbar */}
         <div style={{
           position: 'sticky', top: 0, zIndex: 40, height: 60,
-          background: 'rgba(7,12,24,0.82)', backdropFilter: 'blur(16px)',
+          background: 'rgba(7,12,24,0.92)', backdropFilter: 'blur(16px)',
           borderBottom: '1px solid var(--line)',
-          display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '0 28px',
-          flexShrink: 0,
+          display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+          padding: isMobile ? '0 14px' : '0 28px',
+          flexShrink: 0, gap: 8,
         }}>
-          {/* Left: breadcrumb + chips */}
-          <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13 }}>
-              <span className="muted">ShipMate</span>
-              <span style={{ color: 'var(--ink-4)' }}>›</span>
-              <span style={{ color: '#fff', fontWeight: 600, textTransform: 'capitalize' }}>
+
+          {/* Left section */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: isMobile ? 10 : 12, minWidth: 0 }}>
+            {/* Hamburger — mobile only */}
+            {isMobile && (
+              <button
+                onClick={() => setSidebarOpen(o => !o)}
+                style={{ padding: 7, borderRadius: 9, background: 'rgba(255,255,255,0.05)', border: '1px solid var(--line)', color: 'var(--ink-2)', cursor: 'pointer', display: 'flex', alignItems: 'center', flexShrink: 0 }}
+                aria-label="Open navigation"
+              >
+                <Menu size={18} />
+              </button>
+            )}
+
+            {/* Breadcrumb — desktop only */}
+            {!isMobile && (
+              <>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13 }}>
+                  <span className="muted">ShipMate</span>
+                  <span style={{ color: 'var(--ink-4)' }}>›</span>
+                  <span style={{ color: '#fff', fontWeight: 600, textTransform: 'capitalize' }}>
+                    {activePage === 'repos' ? 'Repositories' : activePage}
+                  </span>
+                </div>
+                <span style={{ width: 1, height: 18, background: 'var(--line-2)', flexShrink: 0 }} />
+              </>
+            )}
+
+            {/* Page title — mobile only */}
+            {isMobile && (
+              <span style={{ fontSize: 15, fontWeight: 700, color: '#fff', textTransform: 'capitalize', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                 {activePage === 'repos' ? 'Repositories' : activePage}
               </span>
-            </div>
-            <span style={{ width: 1, height: 18, background: 'var(--line-2)' }} />
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-              {repos.length > 0 && (
-                <RepoPicker
-                  repos={repos}
-                  selected={selectedRepo}
-                  onSelect={r => { handleSelectRepo(r); }}
-                  disabled={analyzing}
-                />
-              )}
-              {selectedRepo && (
-                <>
+            )}
+
+            {/* Repo + Branch pickers — desktop only */}
+            {!isMobile && (
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                {repos.length > 0 && (
+                  <RepoPicker
+                    repos={repos}
+                    selected={selectedRepo}
+                    onSelect={r => { handleSelectRepo(r); }}
+                    disabled={analyzing}
+                  />
+                )}
+                {selectedRepo && (
                   <BranchPicker
                     repoFullName={selectedRepo.full_name}
                     defaultBranch={selectedRepo.default_branch}
@@ -310,45 +367,53 @@ export default function App() {
                     accessToken={auth.accessToken}
                     disabled={analyzing}
                   />
-                </>
-              )}
-              <span className="chip tone-slate">
-                <Clock size={12} /> {lastScan ? `scanned ${lastScan}` : 'never scanned'}
-              </span>
-            </div>
+                )}
+                <span className="chip tone-slate">
+                  <Clock size={12} /> {lastScan ? `scanned ${lastScan}` : 'never scanned'}
+                </span>
+              </div>
+            )}
           </div>
 
-          {/* Right: run button + bell + user */}
-          <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+          {/* Right section */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: isMobile ? 8 : 12, flexShrink: 0 }}>
             <button
               className="btn btn-primary btn-sm"
               onClick={() => handleAnalyze()}
               disabled={analyzing || !selectedRepo}
+              style={isMobile ? { padding: '0 12px', gap: 6, fontSize: 12 } : {}}
             >
-              {analyzing ? <><Spinner size={13} /> Running…</> : <><Zap size={14} /> Run Analysis</>}
+              {analyzing
+                ? <><Spinner size={13} />{!isMobile && 'Running…'}</>
+                : <><Zap size={14} />{!isMobile && 'Run Analysis'}</>
+              }
             </button>
-            <button
-              className="btn btn-secondary btn-sm"
-              onClick={() => setAutoFixOpen(true)}
-              disabled={analyzing || !selectedRepo}
-              title="Run the autonomous fix loop: analyze → fix → pytest gate → PR → watch CI"
-            >
-              <Sparkles size={14} /> Auto-fix
-            </button>
-            <button style={{ padding: 8, borderRadius: 8, background: 'none', border: 'none', color: 'var(--ink-3)', cursor: 'pointer' }}>
-              <Bell size={16} />
-            </button>
-            {auth.user && (
-              <div className="pill" style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '5px 5px 5px 11px' }}>
-                <span className="dot dot-pulse" style={{ background: '#34d399' }} />
-                <span className="mono" style={{ fontSize: 11.5, color: 'var(--ink-2)' }}>@{auth.user.login}</span>
-                {auth.user.avatar_url
-                  ? <img src={auth.user.avatar_url} alt="" style={{ width: 24, height: 24, borderRadius: 7, objectFit: 'cover' }} />
-                  : <div style={{ width: 24, height: 24, borderRadius: 7, background: 'linear-gradient(135deg,#8b5cf6,#3b82f6)', display: 'grid', placeItems: 'center', fontSize: 10, fontWeight: 700, color: '#fff' }}>
-                      {auth.user.login.slice(0, 2).toUpperCase()}
-                    </div>
-                }
-              </div>
+            {!isMobile && (
+              <>
+                <button
+                  className="btn btn-secondary btn-sm"
+                  onClick={() => setAutoFixOpen(true)}
+                  disabled={analyzing || !selectedRepo}
+                  title="Run the autonomous fix loop: analyze → fix → pytest gate → PR → watch CI"
+                >
+                  <Sparkles size={14} /> Auto-fix
+                </button>
+                <button style={{ padding: 8, borderRadius: 8, background: 'none', border: 'none', color: 'var(--ink-3)', cursor: 'pointer' }}>
+                  <Bell size={16} />
+                </button>
+                {auth.user && (
+                  <div className="pill" style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '5px 5px 5px 11px' }}>
+                    <span className="dot dot-pulse" style={{ background: '#34d399' }} />
+                    <span className="mono" style={{ fontSize: 11.5, color: 'var(--ink-2)' }}>@{auth.user.login}</span>
+                    {auth.user.avatar_url
+                      ? <img src={auth.user.avatar_url} alt="" style={{ width: 24, height: 24, borderRadius: 7, objectFit: 'cover' }} />
+                      : <div style={{ width: 24, height: 24, borderRadius: 7, background: 'linear-gradient(135deg,#8b5cf6,#3b82f6)', display: 'grid', placeItems: 'center', fontSize: 10, fontWeight: 700, color: '#fff' }}>
+                          {auth.user.login.slice(0, 2).toUpperCase()}
+                        </div>
+                    }
+                  </div>
+                )}
+              </>
             )}
           </div>
         </div>
