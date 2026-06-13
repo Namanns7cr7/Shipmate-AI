@@ -45,7 +45,7 @@ export function ScoreRing({ value = 0, size = 120, stroke = 9, label, sub, anima
   return (
     <div style={{ position: 'relative', width: size, height: size, flexShrink: 0 }}>
       <svg width={size} height={size}
-        style={{ transform: 'rotate(-90deg)', filter: `drop-shadow(0 0 10px ${color}55)` }}>
+        style={{ transform: 'rotate(-90deg)', filter: `drop-shadow(0 0 10px ${color}55)`, overflow: 'visible' }}>
         <circle cx={size / 2} cy={size / 2} r={r} fill="none"
           stroke="rgba(255,255,255,0.07)" strokeWidth={stroke} />
         <circle cx={size / 2} cy={size / 2} r={r} fill="none"

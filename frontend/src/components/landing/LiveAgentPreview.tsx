@@ -27,10 +27,10 @@ export function LiveAgentPreview() {
     <div className="card glow-border" style={{ padding: 0, overflow: 'hidden', boxShadow: 'var(--shadow-glow)' }}>
       {/* Window chrome */}
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '12px 16px', borderBottom: '1px solid var(--line)', background: 'rgba(0,0,0,0.2)' }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-          <GitHubIcon size={16} style={{ color: 'var(--ink-2)' }} />
-          <span className="mono" style={{ fontSize: 12.5, color: '#fff', fontWeight: 600 }}>northwind-labs/atlas-checkout</span>
-          <span className="chip tone-emerald" style={{ fontSize: 10 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, minWidth: 0 }}>
+          <GitHubIcon size={16} style={{ color: 'var(--ink-2)', flexShrink: 0 }} />
+          <span className="mono" style={{ fontSize: 12.5, color: '#fff', fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>northwind-labs/atlas-checkout</span>
+          <span className="chip tone-emerald" style={{ fontSize: 10, flexShrink: 0 }}>
             <span className="dot dot-pulse" style={{ background: '#34d399' }} /> connected
           </span>
         </div>

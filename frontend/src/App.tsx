@@ -278,7 +278,7 @@ export default function App() {
       {isMobile && sidebarOpen && (
         <div
           onClick={() => setSidebarOpen(false)}
-          style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.65)', zIndex: 90, backdropFilter: 'blur(3px)' }}
+          style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.85)', zIndex: 90, backdropFilter: 'blur(3px)' }}
         />
       )}
 

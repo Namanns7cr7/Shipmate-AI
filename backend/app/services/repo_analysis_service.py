@@ -203,6 +203,12 @@ class RepoAnalysisService:
         for name in _KEY_FILE_NAMES:
             if name in tree_set:
                 selected.append(name)
+            else:
+                # If not at root, find up to 2 instances in subdirectories
+                matches = [f for f in tree if f.endswith("/" + name)]
+                if matches:
+                    selected.extend(matches[:2])
+
             if len(selected) >= _MAX_KEY_FILES:
                 break
 
