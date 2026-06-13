@@ -660,6 +660,48 @@ class LLMService:
             _maybe_invalidate_provider(e)
             return []
 
+    @classmethod
+    def discover_innovations(
+        cls, context: Dict[str, Any], max_opportunities: int = 6,
+        *, exclude_titles: Optional[List[str]] = None,
+    ) -> List[Opportunity]:
+        """Sibling of `discover_opportunities`, INVERTED posture: instead of
+        conservative product-review fixes, ask for AMBITIOUS, novel, sometimes-
+        architectural ideas — new agent passes, new capabilities, research-grade
+        directions — the kind the conservative discovery prompt explicitly tells
+        the model NOT to emit ('speculative rewrites or future architecture').
+
+        Same output shape (Opportunity) and same fail-open contract. The
+        deterministic floor (must cite real files, must not already exist) is
+        still enforced downstream by `innovation_critic` — novelty is rewarded,
+        but groundlessness is not."""
+        provider = _get_provider()
+        if provider is None:
+            logger.warning(
+                "Innovation discovery skipped: LLM provider unavailable "
+                "(LLM_PROVIDER=%r).", os.getenv("LLM_PROVIDER", "(unset)"),
+            )
+            return []
+        try:
+            code_blob = cls.opportunity_code_blob(context)
+            capability_digest = _capability_digest(context)
+            user = _user_prompt_innovation_discovery(
+                context, code_blob, max_opportunities,
+                capability_digest=capability_digest,
+                exclude_titles=exclude_titles or [],
+            )
+            discovery = provider.invoke_structured_sync(
+                system_prompt=_DISCOVERY_INNOVATION_SYSTEM,
+                user_prompt=user,
+                schema_class=OpportunityDiscovery,
+                deployment_hint="smart",
+            )
+            return _coerce_opportunities(discovery, max_opportunities)
+        except Exception as e:
+            logger.warning("Innovation discovery failed (%s); returning none", e)
+            _maybe_invalidate_provider(e)
+            return []
+
 
 # ─── Discovery — schemas ─────────────────────────────────────────────────────
 # These are what Bedrock fills in. They're separate from PlanForgeOutput etc.
@@ -1071,6 +1113,49 @@ _DISCOVERY_OPPORTUNITY_SYSTEM = (
 )
 
 
+_DISCOVERY_INNOVATION_SYSTEM = (
+    "You are a principal engineer + applied researcher running a BLUE-SKY "
+    "innovation review of a repo. Unlike a conservative code review, your job "
+    "is to propose AMBITIOUS, novel, high-ceiling ideas that would meaningfully "
+    "advance what this product can do — the kind of idea a roadmap review would "
+    "get excited about, not a lint fix.\n\n"
+    "Lean into these shapes (mix them):\n"
+    "  • feature      — a genuinely new CAPABILITY the product doesn't have: a "
+    "new agent/analysis pass, a new modality, an integration, a feedback loop, "
+    "a learning/eval mechanism, an autonomy upgrade.\n"
+    "  • improvement  — a step-change to an existing capability (not a tweak): "
+    "replace a heuristic with a learned signal, add a closed loop where it's "
+    "open, make a single-shot pass iterative, add cross-run memory.\n"
+    "  • research     — a direction worth prototyping even if the payoff is "
+    "uncertain: a smarter retrieval/ranking strategy, an adversarial/verify "
+    "stage, an A/B-able harness change. Mark these category='improvement' (the "
+    "schema has no 'research' value) but be explicit in the description that "
+    "it's exploratory.\n\n"
+    "Crucial difference from a normal review: speculative, architectural, and "
+    "future-facing ideas are WELCOME here — that's the point. But ambition is "
+    "NOT an excuse for hand-waving. Every idea MUST still:\n"
+    "  1. Cite REAL files in `evidence` — anchor the idea to code that exists "
+    "(the system it extends, the seam it plugs into). An idea with no anchor is "
+    "a daydream; do not emit it.\n"
+    "  2. Name plausible `target_files` (existing files it would touch or sit "
+    "beside) — new files are fine, but say which existing module they extend.\n"
+    "  3. Explain in `rationale` WHY it's high-value AND why it's feasible to "
+    "PROTOTYPE in <=21 days (a first cut, not the full vision).\n"
+    "  4. Be NEW — do not propose anything in the ALREADY-EXISTS lists.\n\n"
+    "GOOD innovation examples (SHAPE only — judge against THIS repo):\n"
+    "  [feature]     'add a <new>_agent pass that does X, slotting into the "
+    "orchestrator beside the existing agents in <file>.'\n"
+    "  [improvement] 'the <pass> in <file> is single-shot + heuristic; add a "
+    "verify→refine loop that re-scores its own output before emitting.'\n"
+    "  [improvement] '(exploratory) replace the keyword scoring in <file> with "
+    "a lightweight reference-graph signal to rank files by structural centrality.'\n\n"
+    "BAD (DO NOT EMIT): generic 'add tests/CI/docs'; vague 'use AI/ML' with no "
+    "seam named; anything in the ALREADY-EXISTS lists; ideas with no file anchor.\n\n"
+    "Bias toward AMBITION + a real anchor. Four bold, anchored, not-already-done "
+    "ideas beat ten safe ones."
+)
+
+
 # ─── Discovery — user prompt builders ────────────────────────────────────────
 
 def _user_prompt_plan_discovery(
@@ -1323,6 +1408,42 @@ def _user_prompt_opportunity_discovery(
         "Prefer DEEPER, less-obvious improvements (specific functions, edge "
         "cases, perf hotspots, missing error handling) over broad scaffolding. "
         "Return ONLY the OpportunityDiscovery schema."
+    )
+
+
+def _user_prompt_innovation_discovery(
+    context: Dict[str, Any], code_blob: str, max_opportunities: int,
+    *, capability_digest: str = "", exclude_titles: Optional[List[str]] = None,
+) -> str:
+    exclude_titles = exclude_titles or []
+    exclude_block = ""
+    if exclude_titles:
+        exclude_block = (
+            "\n\n# ALREADY PROPOSED / SHIPPED / DISMISSED — DO NOT propose any of "
+            "these again, or anything that overlaps them:\n"
+            + "\n".join(f"- {t}" for t in exclude_titles[:60])
+        )
+    digest_block = f"\n\n# {capability_digest}" if capability_digest else ""
+    return (
+        f"# Repo summary\n{_repo_summary(context)}"
+        f"{digest_block}"
+        f"{exclude_block}\n\n"
+        f"# Repo code\n{code_blob[:20000]}\n\n"
+        f"Propose up to {max_opportunities} AMBITIOUS, novel innovation ideas "
+        "for THIS repo — new capabilities, step-change improvements, and "
+        "exploratory research directions worth prototyping. HARD RULES:\n"
+        "  • Do NOT propose anything in the ALREADY-EXISTS lists above, or "
+        "overlapping the DO-NOT-PROPOSE list.\n"
+        "  • Every idea MUST anchor to a REAL file in `evidence` (the system it "
+        "extends / the seam it plugs into) — ambition is welcome, hand-waving "
+        "is not.\n"
+        "  • Say which existing module each idea extends in `target_files` "
+        "(new files are fine alongside them).\n"
+        "  • `rationale` must argue both VALUE and why a first cut is feasible "
+        "in <=21 days.\n"
+        "Favour bold, high-ceiling ideas over safe ones — but every one must be "
+        "anchored in this repo's actual code. Return ONLY the OpportunityDiscovery "
+        "schema."
     )
 
 
