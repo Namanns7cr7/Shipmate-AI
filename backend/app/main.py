@@ -489,26 +489,11 @@ app.add_middleware(
 )
 
 
-# Rate limiters are registered first so they end up INNER to the sanitize
-# middleware. Starlette/FastAPI inserts each @app.middleware at position 0
-# of the middleware list and reverses when building the stack — so the LAST
-# registered decorator becomes the OUTERMOST layer (runs first for requests).
-# Desired request order: security_headers → sanitize → rate-limiters → CORS
-@app.middleware("http")
-async def _rate_limit_auth(request: Request, call_next: Callable):
-    return await rate_limit_auth_middleware(request, call_next)
-
-
-@app.middleware("http")
-async def _rate_limit_analysis(request: Request, call_next: Callable):
-    return await rate_limit_analysis_middleware(request, call_next)
-
-
-@app.middleware("http")
-async def _rate_limit_webhook(request: Request, call_next: Callable):
-    return await rate_limit_webhook_middleware(request, call_next)
-
-
+# Per-IP rate limiting is mounted as a SINGLE @app.middleware
+# (rate_limit_middleware, defined below) that dispatches to the right bucket via
+# _limiter_for_path. It's registered LAST so it ends up OUTERMOST — over-limit
+# requests get 429'd before any sanitization/routing work. The three separate
+# _rate_limit_* wrappers that used to live here were dead, unregistered code.
 @app.middleware("http")
 async def sanitize_input_middleware(request: Request, call_next):
     """Reject requests whose query params, headers, or body contain code-injection patterns."""

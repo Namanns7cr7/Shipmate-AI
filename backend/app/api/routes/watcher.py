@@ -16,7 +16,7 @@ back (get_log_tail / list_active project token-less columns).
 import logging
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Header, HTTPException, Query
 
 from app.services import inflight_registry as ir
 from app.services.ci_watcher import CIWatcher
