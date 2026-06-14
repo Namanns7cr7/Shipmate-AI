@@ -1,12 +1,15 @@
 import pytest
 from fastapi.testclient import TestClient
 import re
+import logging
 
 from app.main import (
     app,
     _contains_dangerous_pattern,
     _DANGEROUS_PATTERNS,
     ALLOWED_ORIGINS,
+    _get_client_ip,
+    _get_config_value,
 )
 
 
@@ -401,3 +404,64 @@ class TestIntegration:
         assert "openapi" in schema
         assert "info" in schema
         assert schema["info"]["title"] == "ShipMate AI"
+
+
+class TestGetClientIP:
+    """Test _get_client_ip function behavior with different headers and config."""
+
+    def test_get_client_ip_with_x_forwarded_for_enabled(self, monkeypatch, caplog):
+        monkeypatch.setattr("app.main._get_config_value", lambda key, default=None: True if key == "USE_X_FORWARDED_FOR" else default)
+        caplog.set_level(logging.DEBUG)
+
+        # Single IP in X-Forwarded-For
+        headers = {"X-Forwarded-For": "203.0.113.195"}
+        ip = _get_client_ip(headers)
+        assert ip == "203.0.113.195"
+
+        # Multiple IPs in X-Forwarded-For, should take first
+        headers = {"X-Forwarded-For": "203.0.113.195, 70.41.3.18, 150.172.238.178"}
+        ip = _get_client_ip(headers)
+        assert ip == "203.0.113.195"
+
+        # No X-Forwarded-For header, fallback to X-Real-IP
+        headers = {"X-Real-IP": "198.51.100.17"}
+        ip = _get_client_ip(headers)
+        assert ip == "198.51.100.17"
+
+        # No relevant headers, fallback to empty string
+        headers = {}
+        ip = _get_client_ip(headers)
+        assert ip == ""
+
+        # Check debug logs
+        assert any("Using X-Forwarded-For header" in record.message for record in caplog.records)
+
+    def test_get_client_ip_with_x_forwarded_for_disabled(self, monkeypatch, caplog):
+        monkeypatch.setattr("app.main._get_config_value", lambda key, default=None: False if key == "USE_X_FORWARDED_FOR" else default)
+        caplog.set_level(logging.DEBUG)
+
+        # X-Forwarded-For header present but config disabled, should ignore it
+        headers = {"X-Forwarded-For": "203.0.113.195"}
+        ip = _get_client_ip(headers)
+        # Should fallback to X-Real-IP or empty string
+        assert ip == ""
+
+        # X-Real-IP header present
+        headers = {"X-Real-IP": "198.51.100.17"}
+        ip = _get_client_ip(headers)
+        assert ip == "198.51.100.17"
+
+        # No relevant headers
+        headers = {}
+        ip = _get_client_ip(headers)
+        assert ip == ""
+
+    def test_get_client_ip_logs_when_no_ip_found(self, monkeypatch, caplog):
+        monkeypatch.setattr("app.main._get_config_value", lambda key, default=None: True if key == "USE_X_FORWARDED_FOR" else default)
+        caplog.set_level(logging.DEBUG)
+
+        headers = {}
+        ip = _get_client_ip(headers)
+        assert ip == ""
+        assert any("No client IP found" in record.message for record in caplog.records)
+
