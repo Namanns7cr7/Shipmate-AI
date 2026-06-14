@@ -8,7 +8,6 @@ Token is supplied via Authorization: Bearer <token> header.
 from __future__ import annotations
 
 import logging
-from typing import Optional
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException
@@ -18,12 +17,6 @@ from app.api.deps import resolve_access_token, verify_repo_write_access
 
 router = APIRouter(tags=["branches"])
 logger = logging.getLogger("shipmate.branches_route")
-
-
-def _extract_token(authorization: Optional[str]) -> str:
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
-    return authorization[len("Bearer "):]
 
 
 @router.get("/branches/{owner}/{repo}/prune")
@@ -36,7 +29,7 @@ async def preview_prune(
     param — the query-param form leaks the token into logs/Referer, so the
     header is preferred (OPP-001; this route previously only accepted Query)."""
     try:
-        report = await prune_shipmate_branches(token, owner, repo, dry_run=True)
+        report = await prune_shipmate_branches(access_token, owner, repo, dry_run=True)
     except httpx.HTTPStatusError as e:
         raise HTTPException(status_code=502, detail=str(e)) from e
     except Exception as e:
@@ -53,7 +46,7 @@ async def execute_prune(
     this is a destructive operation, so a read-only token must not reach it."""
     await verify_repo_write_access(owner, repo, access_token)
     try:
-        report = await prune_shipmate_branches(token, owner, repo, dry_run=False)
+        report = await prune_shipmate_branches(access_token, owner, repo, dry_run=False)
     except httpx.HTTPStatusError as e:
         raise HTTPException(status_code=502, detail=str(e)) from e
     except Exception as e:

@@ -14,13 +14,6 @@ router = APIRouter(prefix="/auth/github", tags=["github-auth"])
 logger = logging.getLogger("shipmate.auth")
 
 
-def _extract_token(authorization: Optional[str]) -> str:
-    """Extract Bearer token from Authorization header."""
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
-    return authorization[len("Bearer "):]
-
-
 @router.get("/login")
 async def github_login():
     """Return the GitHub OAuth authorization URL."""
@@ -73,9 +66,8 @@ async def github_callback(code: str, state: str):
 @router.get("/me")
 async def get_me(access_token: str = Depends(resolve_access_token)):
     """Return the authenticated user's GitHub profile."""
-    token = _extract_token(authorization)
     try:
-        user = await GitHubAuthService.get_user_profile(token)
+        user = await GitHubAuthService.get_user_profile(access_token)
         return {"authenticated": True, "user": user}
     except ValueError as e:
         raise HTTPException(status_code=401, detail=str(e))
@@ -84,9 +76,8 @@ async def get_me(access_token: str = Depends(resolve_access_token)):
 @router.get("/repos")
 async def get_repos(access_token: str = Depends(resolve_access_token)):
     """Return the authenticated user's repositories."""
-    token = _extract_token(authorization)
     try:
-        repos = await GitHubAPIService.get_user_repos(token)
+        repos = await GitHubAPIService.get_user_repos(access_token)
         result = []
         for r in repos:
             result.append({
@@ -116,9 +107,8 @@ async def get_repos(access_token: str = Depends(resolve_access_token)):
 @router.get("/repos/{owner}/{repo_name}/branches")
 async def get_branches(owner: str, repo_name: str, access_token: str = Depends(resolve_access_token)):
     """Return branches for a repository."""
-    token = _extract_token(authorization)
     try:
-        branches = await GitHubAPIService.get_branches(token, owner, repo_name)
+        branches = await GitHubAPIService.get_branches(access_token, owner, repo_name)
         formatted = [
             {
                 "name": b.get("name"),
@@ -137,9 +127,8 @@ async def get_branches(owner: str, repo_name: str, access_token: str = Depends(r
 @router.get("/repos/{owner}/{repo_name}/pulls")
 async def get_pulls(owner: str, repo_name: str, access_token: str = Depends(resolve_access_token)):
     """Return open pull requests for a repository."""
-    token = _extract_token(authorization)
     try:
-        pulls = await GitHubAPIService.get_open_pulls(token, owner, repo_name)
+        pulls = await GitHubAPIService.get_open_pulls(access_token, owner, repo_name)
         formatted = [
             {
                 "number": p.get("number"),
