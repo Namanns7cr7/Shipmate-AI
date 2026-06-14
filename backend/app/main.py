@@ -71,10 +71,36 @@ _webhook_limiter = _RateLimiter(capacity=10, refill_rate=60.0 / 60.0)
 
 
 def _get_client_ip(request: Request) -> str:
-    # X-Forwarded-For is trusted here; ensure a reverse proxy is in place in prod.
+    """
+    Extract the client IP address from the request.
+
+    If the configuration flag 'TRUST_X_FORWARDED_FOR' is enabled (set to 'true' case-insensitive),
+    then the 'X-Forwarded-For' header is trusted and the first IP in the list is returned.
+
+    If the flag is disabled or missing, the 'X-Forwarded-For' header is ignored to avoid
+    trusting potentially spoofed client IPs.
+
+    If multiple IPs are present in 'X-Forwarded-For' and the header is trusted, a warning
+    is logged to highlight the potential security risk.
+
+    Security Note:
+    Trusting 'X-Forwarded-For' without a trusted reverse proxy can lead to IP spoofing,
+    allowing clients to bypass IP-based rate limiting or access controls.
+    Ensure that this header is only trusted if the application is behind a secure proxy
+    that properly sets this header.
+    """
+    trust_xff = os.getenv("TRUST_X_FORWARDED_FOR", "false").lower() == "true"
     forwarded_for = request.headers.get("x-forwarded-for")
-    if forwarded_for:
-        return forwarded_for.split(",")[0].strip()
+    if trust_xff and forwarded_for:
+        ips = [ip.strip() for ip in forwarded_for.split(",") if ip.strip()]
+        if len(ips) > 1:
+            logger.warning(
+                "Multiple IPs detected in X-Forwarded-For header: %s. "
+                "Using the first IP %s. Ensure this header is set by a trusted proxy.",
+                forwarded_for, ips[0]
+            )
+        if ips:
+            return ips[0]
     if request.client:
         return request.client.host
     return "unknown"
