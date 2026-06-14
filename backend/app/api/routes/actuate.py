@@ -32,7 +32,7 @@ async def actuate(req: ActuateRequest) -> ActuateResponse:
     # Resolve the body session id → real token once (vault boundary).
     req.access_token = require_body_credential(req.access_token)
 
-    await _verify_repo_write_access(req.owner, req.repo, req.access_token)
+    await verify_repo_write_access(req.access_token, req.owner, req.repo)
 
     try:
         return await CoderOrchestrator.run_actuation(req)

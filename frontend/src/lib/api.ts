@@ -165,9 +165,6 @@ export const api = {
     context?: RepoLensSummary;
     open_pr?: boolean;
   }): Promise<ActuateResponse> {
-    // Coder + GitHub PR creation can take ~15-25s; bump the timeout above
-    // axios's default 0 (which would actually never time out) only to add
-    // an explicit upper bound that surfaces a clean error.
     const { data } = await gh.post<ActuateResponse>('/actuate', params, {
       timeout: 120_000,
     });
