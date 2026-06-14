@@ -17,14 +17,14 @@ const CARDS: WhyCard[] = [
   },
   {
     Icon: Rocket, tone: 'blue', hex: '#3b82f6',
-    title: 'Ship with confidence',
-    body: 'One readiness score with a clear Ready / Needs Fixes / Blocked verdict — and the exact next action to move the needle.',
+    title: 'Fix it, not just flag it',
+    body: 'One click and the Coder agent writes the fix, runs it through lint and tests, and opens a pull request — then watches CI and repairs a red build until it goes green.',
   },
 ];
 
 export function WhySection() {
   return (
-    <section style={{ position: 'relative', padding: '40px 0 80px' }}>
+    <section id="why" style={{ position: 'relative', padding: '40px 0 80px', scrollMarginTop: 84 }}>
       <div style={{ maxWidth: 1160, margin: '0 auto', padding: '0 28px' }}>
         <Reveal>
           <div style={{ textAlign: 'center', marginBottom: 44 }}>

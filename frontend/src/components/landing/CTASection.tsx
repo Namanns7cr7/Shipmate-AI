@@ -8,7 +8,7 @@ interface CTASectionProps { onLogin: () => void; loading?: boolean; }
 
 export function CTASection({ onLogin, loading }: CTASectionProps) {
   return (
-    <section style={{ position: 'relative', padding: '0 28px 90px' }}>
+    <section id="get-started" style={{ position: 'relative', padding: '0 28px 90px', scrollMarginTop: 84 }}>
       <div style={{ maxWidth: 1000, margin: '0 auto' }}>
         <Reveal>
           <div className="card glow-border" style={{ position: 'relative', overflow: 'hidden', padding: '60px 40px', textAlign: 'center' }}>
@@ -18,15 +18,16 @@ export function CTASection({ onLogin, loading }: CTASectionProps) {
                 <LogoMark size={52} />
               </div>
               <h2 style={{ fontSize: 40, fontWeight: 840, letterSpacing: '-0.035em', margin: '0 0 14px', lineHeight: 1.08 }}>
-                Connect GitHub.<br />Get your readiness score.
+                Connect GitHub.<br />Score it, then fix it.
               </h2>
               <p className="muted" style={{ fontSize: 16.5, maxWidth: 480, margin: '0 auto 30px', lineHeight: 1.6 }}>
-                Point ShipMate at a repository and watch the crew work. Read-only, revocable, and free to try.
+                Point ShipMate at a repository and watch the crew work — every fix lands as a
+                reviewable pull request you approve. Revocable, and free to try.
               </p>
               <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 12, flexWrap: 'wrap' }}>
                 <GitHubConnectButton onClick={onLogin} label="Connect GitHub" variant="light" size="lg" loading={loading} />
                 <span style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13, color: 'var(--ink-3)' }}>
-                  <Lock size={14} /> SOC 2 · read-only scopes
+                  <Lock size={14} /> Token stays server-side · you approve every PR
                 </span>
               </div>
             </div>

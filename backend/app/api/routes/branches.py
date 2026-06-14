@@ -11,9 +11,10 @@ import logging
 from typing import Optional
 
 import httpx
-from fastapi import APIRouter, HTTPException, Header
+from fastapi import APIRouter, Depends, HTTPException
 
 from app.services.branch_pruner import prune_shipmate_branches
+from app.api.deps import resolve_access_token, verify_repo_write_access
 
 router = APIRouter(tags=["branches"])
 logger = logging.getLogger("shipmate.branches_route")
@@ -27,10 +28,13 @@ def _extract_token(authorization: Optional[str]) -> str:
 
 @router.get("/branches/{owner}/{repo}/prune")
 async def preview_prune(
-    owner: str, repo: str, authorization: Optional[str] = Header(None),
+    owner: str, repo: str, access_token: str = Depends(resolve_access_token),
 ):
-    """Dry-run: returns what WOULD be deleted without touching anything."""
-    token = _extract_token(authorization)
+    """Dry-run: returns what WOULD be deleted without touching anything.
+
+    Token resolved from the Authorization header (preferred) or legacy query
+    param — the query-param form leaks the token into logs/Referer, so the
+    header is preferred (OPP-001; this route previously only accepted Query)."""
     try:
         report = await prune_shipmate_branches(token, owner, repo, dry_run=True)
     except httpx.HTTPStatusError as e:
@@ -43,10 +47,11 @@ async def preview_prune(
 
 @router.post("/branches/{owner}/{repo}/prune")
 async def execute_prune(
-    owner: str, repo: str, authorization: Optional[str] = Header(None),
+    owner: str, repo: str, access_token: str = Depends(resolve_access_token),
 ):
-    """Actually delete the qualifying branches."""
-    token = _extract_token(authorization)
+    """Actually delete the qualifying branches. Verifies write access first —
+    this is a destructive operation, so a read-only token must not reach it."""
+    await verify_repo_write_access(owner, repo, access_token)
     try:
         report = await prune_shipmate_branches(token, owner, repo, dry_run=False)
     except httpx.HTTPStatusError as e:

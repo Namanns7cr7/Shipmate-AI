@@ -1,11 +1,14 @@
-import os
 import logging
-from typing import Optional
+import os
 
-from fastapi import APIRouter, HTTPException, Header
+from fastapi import APIRouter, Depends, HTTPException, Query
 from app.services.github_auth_service import GitHubAuthService
 from app.services.github_api_service import GitHubAPIService
+from app.services import session_store
 from app.schemas.api_schemas import RepoSummary
+from app.api.deps import resolve_access_token
+
+logger = logging.getLogger("shipmate.auth_route")
 
 router = APIRouter(prefix="/auth/github", tags=["github-auth"])
 logger = logging.getLogger("shipmate.auth")
@@ -38,24 +41,37 @@ async def github_callback(code: str, state: str):
         if not access_token:
             raise HTTPException(status_code=400, detail="GitHub did not return an access token.")
         user_profile = await GitHubAuthService.get_user_profile(access_token)
+        # Vault the raw token and hand the client an OPAQUE session id instead.
+        # The raw token never crosses the network boundary again — the frontend
+        # stores `session_id`, sends it as the bearer credential, and the auth
+        # boundary resolves it back to the token server-side. We deliberately do
+        # NOT echo the raw token (nor an `access_token` alias) — the migration
+        # window is over; the frontend reads `session_id`.
+        session_id = session_store.mint(access_token, scope=token_data.get("scope"))
         return {
             "success": True,
-            "access_token": access_token,
+            "session_id": session_id,
             "token_type": token_data.get("token_type", "bearer"),
             "scope": token_data.get("scope"),
             "user": user_profile,
         }
     except HTTPException:
+        # Already a clean, intentional error (e.g. the 400 above) — don't
+        # re-wrap it into a 500 with a traceback.
         raise
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception:
+        # SECURITY: never return the traceback to the client. The failing call
+        # stack runs through get_user_profile(access_token), so format_exc()
+        # could serialize the OAuth access token into the HTTP response. Log the
+        # full traceback server-side only; return a generic message.
         logger.exception("GitHub OAuth callback failed")
-        raise HTTPException(status_code=500, detail="Authentication failed. Please try again.")
+        raise HTTPException(status_code=500, detail="OAuth callback failed. Please try signing in again.")
 
 
 @router.get("/me")
-async def get_me(authorization: Optional[str] = Header(None)):
+async def get_me(access_token: str = Depends(resolve_access_token)):
     """Return the authenticated user's GitHub profile."""
     token = _extract_token(authorization)
     try:
@@ -66,7 +82,7 @@ async def get_me(authorization: Optional[str] = Header(None)):
 
 
 @router.get("/repos")
-async def get_repos(authorization: Optional[str] = Header(None)):
+async def get_repos(access_token: str = Depends(resolve_access_token)):
     """Return the authenticated user's repositories."""
     token = _extract_token(authorization)
     try:
@@ -98,7 +114,7 @@ async def get_repos(authorization: Optional[str] = Header(None)):
 
 
 @router.get("/repos/{owner}/{repo_name}/branches")
-async def get_branches(owner: str, repo_name: str, authorization: Optional[str] = Header(None)):
+async def get_branches(owner: str, repo_name: str, access_token: str = Depends(resolve_access_token)):
     """Return branches for a repository."""
     token = _extract_token(authorization)
     try:
@@ -119,7 +135,7 @@ async def get_branches(owner: str, repo_name: str, authorization: Optional[str] 
 
 
 @router.get("/repos/{owner}/{repo_name}/pulls")
-async def get_pulls(owner: str, repo_name: str, authorization: Optional[str] = Header(None)):
+async def get_pulls(owner: str, repo_name: str, access_token: str = Depends(resolve_access_token)):
     """Return open pull requests for a repository."""
     token = _extract_token(authorization)
     try:
@@ -143,12 +159,14 @@ async def get_pulls(owner: str, repo_name: str, authorization: Optional[str] = H
 
 
 @router.post("/logout")
-async def logout(authorization: Optional[str] = Header(None)):
+async def logout(access_token: str = Depends(resolve_access_token)):
+    # `access_token` here is the resolved real token (the dependency already
+    # turned the session id back into it). Drop both the vault session that
+    # referenced it and the in-memory token entry.
     try:
-        token = _extract_token(authorization)
-        GitHubAuthService.clear_token(token)
-    except HTTPException:
-        pass  # Accept logout even without a valid token
+        session_store.revoke_token(access_token)
+        GitHubAuthService.clear_token(access_token)
+        return {"success": True, "message": "Logged out"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     return {"success": True, "message": "Logged out"}

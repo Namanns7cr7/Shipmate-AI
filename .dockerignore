@@ -15,6 +15,10 @@ __pycache__
 *$py.class
 *.so
 .Python
+venv/
+backend/venv/
+.venv/
+ENV/
 build/
 develop-eggs/
 dist/

@@ -152,11 +152,17 @@ interface Props {
   progressByAgent?: Record<AgentProgress['id'], number>;
   /** 0..100 overall, capped at 95 until API resolves. */
   overallPct?: number;
+  /** Real per-agent log lines from the SSE stream. When non-empty, these
+   *  replace the scripted simulation so the Activity Log shows live events. */
+  liveLines?: LogLine[];
   onCancel: () => void;
 }
 
-export function AnalysisPage({ selectedRepo, selectedBranch, agents, progressByAgent, overallPct, onCancel }: Props) {
-  const logs = useActivityLog(true);
+export function AnalysisPage({ selectedRepo, selectedBranch, agents, progressByAgent, overallPct, liveLines, onCancel }: Props) {
+  // Use the real SSE-driven lines when present; fall back to the scripted
+  // simulation only when no live lines have arrived yet (e.g. batch mode).
+  const scriptedLogs = useActivityLog(!liveLines || liveLines.length === 0);
+  const logs = liveLines && liveLines.length > 0 ? liveLines : scriptedLogs;
 
   const statuses = AGENTS.map((_, i) => {
     const match = agents.find(a => ID_TO_INDEX[a.id] === i);
@@ -171,7 +177,7 @@ export function AnalysisPage({ selectedRepo, selectedBranch, agents, progressByA
   const activeAgent = AGENTS.find((_, i) => statuses[i] === 'running');
 
   return (
-    <motion.div initial={{ opacity: 0, y: 14 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.55, ease: [0.2,0.7,0.2,1] }}
+    <motion.div className="page-content" initial={{ opacity: 0, y: 14 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.55, ease: [0.2,0.7,0.2,1] }}
       style={{ padding: '28px 32px', maxWidth: 1180, margin: '0 auto', width: '100%' }}>
       {/* Header */}
       <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', flexWrap: 'wrap', gap: 12, marginBottom: 22 }}>
@@ -194,10 +200,10 @@ export function AnalysisPage({ selectedRepo, selectedBranch, agents, progressByA
       </div>
 
       {/* Two-column layout */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0,1fr) 340px', gap: 20 }}>
+      <div className="analysis-grid" style={{ display: 'grid', gridTemplateColumns: 'minmax(0,1fr) 340px', gap: 20 }}>
         {/* Left: radar + log */}
         <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-          <div className="card glow-border" style={{ position: 'relative', overflow: 'hidden', padding: '30px 20px' }}>
+          <div className="card glow-border radar-card" style={{ position: 'relative', overflow: 'hidden', padding: '30px 20px' }}>
             <RadarBg sweep={false} rings={false} blobs style={{ opacity: 0.5 }} />
             <div style={{ position: 'relative' }}>
               {/* Active agent pill */}

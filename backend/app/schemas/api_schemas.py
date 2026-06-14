@@ -1,6 +1,6 @@
 from pydantic import BaseModel, Field
 from typing import Optional, List, Literal
-from .agent_schemas import ShipMateReport
+from .agent_schemas import ShipMateReport, Opportunity
 
 
 class AnalyzeRequest(BaseModel):
@@ -15,6 +15,50 @@ class AnalyzeRequest(BaseModel):
 class AnalyzeResponse(BaseModel):
     status: str = "complete"
     report: ShipMateReport
+
+
+class BuildPlanRequest(BaseModel):
+    """POST /api/build/plan — discover ranked, grounded self-improvement
+    opportunities for a repo (plan-only; no PRs, no Coder)."""
+    owner: str
+    repo: str
+    branch: str = "main"
+    access_token: str
+    max_opportunities: int = 8
+    # When True, ungrounded opportunities are kept (flagged grounded=False)
+    # instead of dropped — useful for debugging the discovery quality.
+    include_ungrounded: bool = False
+    # "opportunity" (default, conservative product-review fixes) or "innovation"
+    # (ambitious/novel ideas via discover_innovations + innovation_critic).
+    mode: str = "opportunity"
+
+
+class BuildExecuteRequest(BaseModel):
+    """POST /api/build/execute — plan a single chosen opportunity, critique the
+    plan, and (when execute=true) actuate each step into one branch/PR.
+
+    The client sends the chosen Opportunity inline (the same object it received
+    from /api/build/plan) so the backend keeps no opportunity state between
+    calls — mirrors how /actuate takes the finding inline."""
+    owner: str
+    repo: str
+    branch: str = "main"
+    access_token: str
+    opportunity: "Opportunity"
+    # False (default) = plan + critique only, no PRs (safe to call freely).
+    # True = if the critic approves, actuate each step into one branch/PR.
+    execute: bool = False
+
+
+class BuildDismissRequest(BaseModel):
+    """POST /api/build/dismiss — hide an opportunity from future plans + exclude
+    it from discovery. No auth-sensitive action (journal-only), but we still take
+    the token to keep the surface uniform."""
+    owner: str
+    repo: str
+    access_token: str
+    title: str
+    file: Optional[str] = None
 
 
 class RepoSummary(BaseModel):
@@ -67,6 +111,13 @@ class ActuateRequest(BaseModel):
     finding: FindingPayload
     context: Optional[RepoLensSummary] = None
     open_pr: bool = True
+    # Tier-2 opt-ins, both off by default (current behaviour unchanged):
+    #  • diff_mode: ask Coder for unified diffs (token-saving; auto-falls back
+    #    to full-file on any apply failure).
+    #  • decompose: for multi-file features, plan ordered steps and run Coder
+    #    once per step into one branch before opening the PR.
+    diff_mode: bool = False
+    decompose: bool = False
 
 
 class ActuatedFile(BaseModel):
