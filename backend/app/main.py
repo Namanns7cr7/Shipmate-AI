@@ -1,3 +1,4 @@
+
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -16,6 +17,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 import uvicorn
 
+# Read config for trusting X-Forwarded-For header
+TRUST_X_FORWARDED_FOR = os.getenv("TRUST_X_FORWARDED_FOR", "false").lower() in ("1", "true", "yes")
+
 from app.api.routes.auth import router as auth_router
 from app.api.routes.analysis import router as analysis_router
 from app.api.routes.actuate import router as actuate_router
@@ -29,6 +33,7 @@ logger = logging.getLogger("shipmate")
 # ---------------------------------------------------------------------------
 
 class _TokenBucket:
+
     """Simple token bucket for rate limiting."""
 
     def __init__(self, capacity: int, refill_rate: float):
@@ -49,6 +54,7 @@ class _TokenBucket:
 
 
 class _RateLimiter:
+
     """Per-IP rate limiter using token buckets."""
 
     def __init__(self, capacity: int, refill_rate: float):
@@ -71,10 +77,11 @@ _webhook_limiter = _RateLimiter(capacity=10, refill_rate=60.0 / 60.0)
 
 
 def _get_client_ip(request: Request) -> str:
-    # X-Forwarded-For is trusted here; ensure a reverse proxy is in place in prod.
-    forwarded_for = request.headers.get("x-forwarded-for")
-    if forwarded_for:
-        return forwarded_for.split(",")[0].strip()
+    # Conditionally trust X-Forwarded-For header based on config
+    if TRUST_X_FORWARDED_FOR:
+        forwarded_for = request.headers.get("x-forwarded-for")
+        if forwarded_for:
+            return forwarded_for.split(",")[0].strip()
     if request.client:
         return request.client.host
     return "unknown"
@@ -89,6 +96,7 @@ async def rate_limit_auth_middleware(request: Request, call_next: Callable):
                 content={"detail": "Rate limit exceeded. Too many authentication attempts."},
             )
     return await call_next(request)
+
 
 
 async def rate_limit_analysis_middleware(request: Request, call_next: Callable):
