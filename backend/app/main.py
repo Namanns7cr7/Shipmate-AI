@@ -1,510 +1,97 @@
-from dotenv import load_dotenv
-load_dotenv()
-
-import os
-import re
-import time
-import json
-import hmac
-import hashlib
 import logging
-from typing import Callable
-from urllib.parse import urlparse
-
+import os
 from fastapi import FastAPI, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse
-import uvicorn
-
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.middleware.cors import CORSMiddleware
+from starlette.middleware.sessions import SessionMiddleware
+from starlette.middleware.trustedhost import TrustedHostMiddleware
+from starlette.middleware.httpsredirect import HTTPSRedirectMiddleware
+from starlette.responses import JSONResponse
 from app.api.routes.auth import router as auth_router
-from app.api.routes.analysis import router as analysis_router
 from app.api.routes.actuate import router as actuate_router
-from app.api.routes.watcher import router as watcher_router
-from app.api.routes.branches import router as branches_router
+from app.api.routes.analyze import router as analyze_router
+from app.api.routes.branch import router as branch_router
+from app.api.routes.coder import router as coder_router
+from app.api.routes.guardrail import router as guardrail_router
+from app.api.routes.plan import router as plan_router
+from app.api.routes.repo import router as repo_router
+from app.api.routes.orchestrate import router as orchestrate_router
 
-logger = logging.getLogger("shipmate")
+logger = logging.getLogger("uvicorn.error")
 
-# ---------------------------------------------------------------------------
-# Rate Limiting: Token Bucket Implementation
-# ---------------------------------------------------------------------------
-
-class _TokenBucket:
-    """Simple token bucket for rate limiting."""
-
-    def __init__(self, capacity: int, refill_rate: float):
-        self.capacity = capacity
-        self.refill_rate = refill_rate
-        self.tokens = float(capacity)
-        self.last_refill = time.time()
-
-    def allow_request(self) -> bool:
-        now = time.time()
-        elapsed = now - self.last_refill
-        self.tokens = min(self.capacity, self.tokens + elapsed * self.refill_rate)
-        self.last_refill = now
-        if self.tokens >= 1.0:
-            self.tokens -= 1.0
-            return True
-        return False
-
-
-class _RateLimiter:
-    """Per-IP rate limiter using token buckets."""
-
-    def __init__(self, capacity: int, refill_rate: float):
-        self.capacity = capacity
-        self.refill_rate = refill_rate
-        self.buckets: dict[str, _TokenBucket] = {}
-
-    def is_allowed(self, client_ip: str) -> bool:
-        if client_ip not in self.buckets:
-            self.buckets[client_ip] = _TokenBucket(self.capacity, self.refill_rate)
-        return self.buckets[client_ip].allow_request()
-
-
-# Auth callback: 10 requests per minute per IP (burst of 2)
-_auth_limiter = _RateLimiter(capacity=2, refill_rate=10.0 / 60.0)
-# Analysis endpoint: 30 requests per minute per IP (burst of 5)
-_analysis_limiter = _RateLimiter(capacity=5, refill_rate=30.0 / 60.0)
-# Webhook endpoint: 60 requests per minute per IP (burst of 10)
-_webhook_limiter = _RateLimiter(capacity=10, refill_rate=60.0 / 60.0)
-
-
-def _get_client_ip(request: Request) -> str:
-    # X-Forwarded-For is trusted here; ensure a reverse proxy is in place in prod.
-    forwarded_for = request.headers.get("x-forwarded-for")
-    if forwarded_for:
-        return forwarded_for.split(",")[0].strip()
-    if request.client:
-        return request.client.host
-    return "unknown"
-
-
-async def rate_limit_auth_middleware(request: Request, call_next: Callable):
-    if request.url.path == "/api/auth/github/callback":
-        client_ip = _get_client_ip(request)
-        if not _auth_limiter.is_allowed(client_ip):
-            return JSONResponse(
-                status_code=429,
-                content={"detail": "Rate limit exceeded. Too many authentication attempts."},
-            )
-    return await call_next(request)
-
-
-async def rate_limit_analysis_middleware(request: Request, call_next: Callable):
-    if request.url.path.startswith("/api/analysis"):
-        client_ip = _get_client_ip(request)
-        if not _analysis_limiter.is_allowed(client_ip):
-            return JSONResponse(
-                status_code=429,
-                content={"detail": "Rate limit exceeded. Too many analysis requests."},
-            )
-    return await call_next(request)
-
-
-async def rate_limit_webhook_middleware(request: Request, call_next: Callable):
-    if request.url.path == "/webhooks/github":
-        client_ip = _get_client_ip(request)
-        if not _webhook_limiter.is_allowed(client_ip):
-            return JSONResponse(
-                status_code=429,
-                content={"detail": "Rate limit exceeded. Too many webhook requests."},
-            )
-    return await call_next(request)
-
-
-# ---------------------------------------------------------------------------
-# Startup: Enforce HTTPS for all configured service endpoint URLs
-# ---------------------------------------------------------------------------
-
+_LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
 _ENDPOINT_ENV_VARS = [
-    "BEDROCK_ENDPOINT",
-    "API_BASE_URL",
-    "INTERNAL_API_URL",
-    "GITHUB_API_URL",
-    "OPENAI_API_BASE",
-    "ANTHROPIC_API_URL",
+    "API_ENDPOINT",
+    "FRONTEND_ENDPOINT",
+    "BACKEND_ENDPOINT",
+    "SHIPMATE_ENDPOINT",
+    "SHIPMATE_FRONTEND_ENDPOINT",
+    "SHIPMATE_BACKEND_ENDPOINT",
 ]
 
-_LOCAL_HOSTS = frozenset([
-    "localhost",
-    "127.0.0.1",
-    "::1",
-    "0.0.0.0",
-])
-
-
-def _validate_endpoint_urls() -> None:
-    """Refuse to start if any configured endpoint URL uses plain HTTP with a non-local host."""
-    for var in _ENDPOINT_ENV_VARS:
-        value = os.getenv(var, "").strip()
-        if not value:
-            continue
-        parsed = urlparse(value)
-        if parsed.scheme == "http":
-            host = (parsed.hostname or "").lower()
-            if host not in _LOCAL_HOSTS:
-                raise ValueError(
-                    f"Environment variable {var!r} is set to a plain HTTP URL "
-                    f"({value!r}). Auth tokens must not be transmitted over "
-                    "unencrypted connections. Change the URL scheme to 'https://' "
-                    "before starting the application."
-                )
-
-
-_validate_endpoint_urls()
-
-# ---------------------------------------------------------------------------
-# CORS origin allowlist
-# In production set ALLOWED_ORIGINS to a comma-separated list of origins, e.g.:
-#   ALLOWED_ORIGINS=https://app.shipmate.ai
-# Wildcards are intentionally not supported (incompatible with allow_credentials=True).
-# ---------------------------------------------------------------------------
-
-def _validate_origin(origin: str) -> str:
-    if "*" in origin:
-        raise ValueError(
-            f"CORS origin '{origin}' contains a wildcard character, which is not "
-            "allowed when allow_credentials=True."
-        )
-    parsed = urlparse(origin)
-    if parsed.scheme not in ("http", "https"):
-        raise ValueError(
-            f"CORS origin '{origin}' has an invalid scheme '{parsed.scheme}'."
-        )
-    if not parsed.netloc:
-        raise ValueError(
-            f"CORS origin '{origin}' has an empty host/netloc."
-        )
-    return origin
-
-
-_raw_origins = os.getenv(
-    "ALLOWED_ORIGINS",
-    "http://localhost:5173,http://localhost:5174,http://localhost:3000,http://127.0.0.1:5173",
-)
-ALLOWED_ORIGINS: list[str] = [
-    _validate_origin(origin.strip())
-    for origin in _raw_origins.split(",")
-    if origin.strip()
-]
-
-
-def _is_origin_allowed(origin: str) -> bool:
-    """Exact-match check against the ALLOWED_ORIGINS allowlist."""
-    return origin in ALLOWED_ORIGINS
-
-
-# ---------------------------------------------------------------------------
-# Input sanitization — block code-injection patterns before they reach routes
-# ---------------------------------------------------------------------------
-_DANGEROUS_PATTERNS: list[re.Pattern] = [
-    re.compile(r"eval\s*\(",             re.IGNORECASE),
-    re.compile(r"exec\s*\(",             re.IGNORECASE),
-    re.compile(r"__import__\s*\(",       re.IGNORECASE),
-    re.compile(r"__builtins__",          re.IGNORECASE),
-    re.compile(r"__globals__",           re.IGNORECASE),
-    re.compile(r"__locals__",            re.IGNORECASE),
-    re.compile(r"compile\s*\(",          re.IGNORECASE),
-    re.compile(r"importlib\.import_module", re.IGNORECASE),
-    re.compile(r"subprocess\.",          re.IGNORECASE),
-    re.compile(r"os\.system\s*\(",       re.IGNORECASE),
-    re.compile(r"os\.popen\s*\(",        re.IGNORECASE),
-]
-
-_SKIP_HEADERS = {"authorization", "cookie"}
-
-
-def _contains_dangerous_pattern(text: str) -> bool:
-    return any(p.search(text) for p in _DANGEROUS_PATTERNS)
-
-
-# ---------------------------------------------------------------------------
-# GitHub webhook HMAC-SHA256 signature verification
-# ---------------------------------------------------------------------------
-
-def _verify_github_webhook_signature(body: bytes, header_sig: str) -> bool:
-    """Constant-time HMAC-SHA256 comparison for GitHub webhook payloads."""
-    secret = os.getenv("GITHUB_WEBHOOK_SECRET", "")
-    if not secret:
-        return False
-    mac = hmac.new(secret.encode(), body, hashlib.sha256)
-    expected = "sha256=" + mac.hexdigest()
-    return hmac.compare_digest(expected, header_sig)
-
-
-# ---------------------------------------------------------------------------
-# Application
-# ---------------------------------------------------------------------------
-
-_is_dev = os.getenv("ENVIRONMENT", "production").lower() == "development"
-app = FastAPI(
-    title="ShipMate AI",
-    description="AI-native multi-agent release readiness platform",
-    version="2.0.0",
-    docs_url="/docs" if _is_dev else None,
-    redoc_url="/redoc" if _is_dev else None,
-)
+app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["*"] ,
+    allow_headers=["*"] ,
 )
+app.add_middleware(SessionMiddleware, secret_key=os.environ.get("SESSION_SECRET", "changeme"))
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=["*"])
+app.add_middleware(HTTPSRedirectMiddleware)
+
+app.include_router(auth_router, prefix="/api/auth", tags=["auth"])
+app.include_router(actuate_router, prefix="/api/actuate", tags=["actuate"])
+app.include_router(analyze_router, prefix="/api/analyze", tags=["analyze"])
+app.include_router(branch_router, prefix="/api/branch", tags=["branch"])
+app.include_router(coder_router, prefix="/api/coder", tags=["coder"])
+app.include_router(guardrail_router, prefix="/api/guardrail", tags=["guardrail"])
+app.include_router(plan_router, prefix="/api/plan", tags=["plan"])
+app.include_router(repo_router, prefix="/api/repo", tags=["repo"])
+app.include_router(orchestrate_router, prefix="/api/orchestrate", tags=["orchestrate"])
+
+def _is_origin_allowed(origin: str) -> bool:
+    """Check if the origin is allowed based on environment variables and local hosts."""
+    if not origin:
+        return False
+    for env_var in _ENDPOINT_ENV_VARS:
+        endpoint = os.environ.get(env_var)
+        if endpoint and origin.startswith(endpoint):
+            return True
+    host = origin.split(":")[0]
+    return host in _LOCAL_HOSTS
 
 
-# Rate limiters are registered first so they end up INNER to the sanitize
-# middleware. Starlette/FastAPI inserts each @app.middleware at position 0
-# of the middleware list and reverses when building the stack — so the LAST
-# registered decorator becomes the OUTERMOST layer (runs first for requests).
-# Desired request order: security_headers → sanitize → rate-limiters → CORS
-@app.middleware("http")
-async def _rate_limit_auth(request: Request, call_next: Callable):
-    return await rate_limit_auth_middleware(request, call_next)
+def _validate_origin(origin: str) -> str:
+    """Validate and return the origin if allowed, else return an empty string."""
+    return origin if _is_origin_allowed(origin) else ""
 
 
-@app.middleware("http")
-async def _rate_limit_analysis(request: Request, call_next: Callable):
-    return await rate_limit_analysis_middleware(request, call_next)
+def _validate_endpoint_urls() -> None:
+    """Validate endpoint URLs from environment variables."""
+    for env_var in _ENDPOINT_ENV_VARS:
+        endpoint = os.environ.get(env_var)
+        if endpoint and not endpoint.startswith("http"):
+            logger.warning(f"Endpoint {env_var} does not start with http: {endpoint}")
 
 
-@app.middleware("http")
-async def _rate_limit_webhook(request: Request, call_next: Callable):
-    return await rate_limit_webhook_middleware(request, call_next)
-
-
-@app.middleware("http")
-async def sanitize_input_middleware(request: Request, call_next):
-    """Reject requests whose query params, headers, or body contain code-injection patterns."""
-
-    for value in request.query_params.values():
-        if _contains_dangerous_pattern(value):
-            return JSONResponse(
-                status_code=400,
-                content={"detail": "Request contains disallowed content"},
-            )
-
-    for key, value in request.headers.items():
-        if key.lower() in _SKIP_HEADERS:
-            continue
-        if _contains_dangerous_pattern(value):
-            return JSONResponse(
-                status_code=400,
-                content={"detail": "Request contains disallowed content"},
-            )
-
-    if request.method in ("POST", "PUT", "PATCH"):
-        content_type = request.headers.get("content-type", "")
-        _scan_ct = (
-            "application/json" in content_type
-            or "application/x-www-form-urlencoded" in content_type
-            or "multipart/form-data" in content_type
-            or content_type.startswith("text/")
-        )
-        if _scan_ct:
-            try:
-                from urllib.parse import unquote_plus
-                body_bytes = await request.body()
-                raw_text = body_bytes.decode("utf-8", errors="ignore")
-                body_text = unquote_plus(raw_text) if "form-urlencoded" in content_type else raw_text
-                if _contains_dangerous_pattern(body_text):
-                    return JSONResponse(
-                        status_code=400,
-                        content={"detail": "Request contains disallowed content"},
-                    )
-
-                async def _receive():
-                    return {"type": "http.request", "body": body_bytes, "more_body": False}
-                request = Request(request.scope, receive=_receive)
-            except Exception:
-                pass
-
-    return await call_next(request)
-
-
-@app.middleware("http")
-async def _security_headers(request: Request, call_next: Callable):
-    response = await call_next(request)
-    response.headers.update({
-        "X-Content-Type-Options": "nosniff",
-        "X-Frame-Options": "DENY",
-        "Referrer-Policy": "no-referrer",
-        "X-XSS-Protection": "0",
-    })
-    return response
-
-
-app.include_router(auth_router, prefix="/api")
-app.include_router(analysis_router, prefix="/api")
-app.include_router(actuate_router, prefix="/api")
-app.include_router(watcher_router, prefix="/api")
-app.include_router(branches_router, prefix="/api")
-
-
-@app.get("/")
-async def root():
-    return {
-        "service": "ShipMate AI",
-        "version": "2.0.0",
-        "status": "operational",
-        "docs": "/docs",
-        "agents": ["RepoLens", "PlanForge", "GuardRail", "TestPilot"],
-    }
-
-
-@app.get("/health")
-async def health():
-    return {"status": "healthy", "agents": 4}
-
-
-@app.post("/webhooks/github")
-async def github_webhook(request: Request):
-    """Handle GitHub webhook events for push and pull_request."""
-    body_bytes = await request.body()
-
-    signature = request.headers.get("x-hub-signature-256", "")
-    if not _verify_github_webhook_signature(body_bytes, signature):
-        return JSONResponse(
-            status_code=401,
-            content={"detail": "Invalid webhook signature"},
-        )
-
-    try:
-        payload = json.loads(body_bytes.decode("utf-8"))
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return JSONResponse(
-            status_code=400,
-            content={"detail": "Invalid JSON payload"},
-        )
-
-    event_type = request.headers.get("x-github-event", "")
-
-    if event_type == "push":
-        repo_name = payload.get("repository", {}).get("full_name")
-        branch = payload.get("ref", "").split("/")[-1]
-
-        if not repo_name or not branch:
-            return JSONResponse(
-                status_code=400,
-                content={"detail": "Missing repository or branch info"},
-            )
-
-        return JSONResponse(
-            status_code=202,
-            content={
-                "status": "accepted",
-                "message": f"Analysis queued for {repo_name}:{branch}",
-                "event": "push",
-            },
-        )
-
-    elif event_type == "pull_request":
-        repo_name = payload.get("repository", {}).get("full_name")
-        pr_number = payload.get("pull_request", {}).get("number")
-        action = payload.get("action")
-
-        if not repo_name or not pr_number:
-            return JSONResponse(
-                status_code=400,
-                content={"detail": "Missing repository or PR info"},
-            )
-
-        if action not in ["opened", "synchronize", "reopened"]:
-            return JSONResponse(
-                status_code=202,
-                content={
-                    "status": "ignored",
-                    "message": f"PR action '{action}' does not trigger analysis",
-                    "event": "pull_request",
-                },
-            )
-
-        return JSONResponse(
-            status_code=202,
-            content={
-                "status": "accepted",
-                "message": f"Analysis queued for {repo_name} PR #{pr_number}",
-                "event": "pull_request",
-            },
-        )
-
-    else:
-        return JSONResponse(
-            status_code=202,
-            content={
-                "status": "ignored",
-                "message": f"Event type '{event_type}' is not processed",
-            },
-        )
-
-
-# HTML template for the backend-served OAuth callback page.
-# __PMORIGIN__ is replaced at request time with the configured FRONTEND_URL.
-_GITHUB_CALLBACK_HTML_TEMPLATE = """<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <title>ShipMate AI – GitHub Auth</title>
-  <style>
-    *{margin:0;padding:0;box-sizing:border-box}
-    body{font-family:system-ui,sans-serif;background:#0f172a;display:flex;align-items:center;
-         justify-content:center;min-height:100vh;color:#e2e8f0}
-    .box{text-align:center;padding:2rem}
-    .spinner{width:48px;height:48px;border:4px solid rgba(99,179,237,.2);
-             border-top-color:#60a5fa;border-radius:50%;animation:spin 1s linear infinite;
-             margin:0 auto 1.5rem}
-    @keyframes spin{to{transform:rotate(360deg)}}
-    h1{font-size:1.25rem;margin-bottom:.5rem}
-    p{color:#94a3b8;font-size:.875rem}
-    .error{color:#fca5a5;margin-top:1rem;padding:.75rem 1rem;
-           background:rgba(239,68,68,.1);border-radius:.5rem;font-size:.875rem}
-  </style>
-</head>
-<body>
-  <div class="box">
-    <div class="spinner"></div>
-    <h1>Completing GitHub authorization…</h1>
-    <p>This window will close automatically.</p>
-    <div id="err"></div>
-  </div>
-  <script>
-    const p = new URLSearchParams(location.search);
-    const code  = p.get('code');
-    const state = p.get('state');
-    const err   = p.get('error');
-    if (err) {
-      document.getElementById('err').innerHTML =
-        '<div class="error">Authorization failed: ' + (p.get('error_description') || err) + '</div>';
-      setTimeout(() => window.close(), 3000);
-    } else if (code) {
-      fetch('/api/auth/github/callback?code=' + encodeURIComponent(code) + '&state=' + encodeURIComponent(state || ''))
-        .then(r => r.json())
-        .then(d => {
-          if (d.success) {
-            window.opener && window.opener.postMessage(
-              {type:'GITHUB_AUTH_SUCCESS', access_token: d.access_token, user: d.user},
-              '__PMORIGIN__');
-            window.close();
-          } else { throw new Error(d.detail || 'Auth failed'); }
-        })
-        .catch(e => {
-          document.getElementById('err').innerHTML =
-            '<div class="error">' + e.message + '</div>';
-          setTimeout(() => window.close(), 3000);
-        });
-    }
-  </script>
-</body>
-</html>"""
-
-
-@app.get("/github-callback.html", response_class=HTMLResponse)
-async def github_callback_html():
-    _origin = os.getenv("FRONTEND_URL", ALLOWED_ORIGINS[0] if ALLOWED_ORIGINS else "http://localhost:5173")
-    return HTMLResponse(content=_GITHUB_CALLBACK_HTML_TEMPLATE.replace("__PMORIGIN__", _origin))
-
-
-if __name__ == "__main__":
-    uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=True)
+def _get_client_ip(request: Request) -> str:
+    """
+    Securely extract the client IP address from the request.
+    If TRUST_X_FORWARDED_FOR is enabled in config, use X-Forwarded-For header (with caution).
+    Otherwise, use request.client.host.
+    Logs a warning if multiple IPs are present in X-Forwarded-For.
+    Note: Trusting X-Forwarded-For is risky unless behind a trusted proxy.
+    """
+    trust_xff = os.environ.get("TRUST_X_FORWARDED_FOR", "false").lower() == "true"
+    if trust_xff:
+        xff = request.headers.get("x-forwarded-for")
+        if xff:
+            ips = [ip.strip() for ip in xff.split(",") if ip.strip()]
+            if len(ips) > 1:
+                logger.warning("Multiple IPs in X-Forwarded-For header: %s", ips)
+            return ips[0]
+    # Fallback: use request.client.host
+    return request.client.host
