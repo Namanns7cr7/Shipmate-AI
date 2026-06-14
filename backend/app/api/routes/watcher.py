@@ -14,7 +14,7 @@ back (get_log_tail / list_active project token-less columns).
 """
 
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from fastapi import APIRouter, HTTPException, Query
 
@@ -53,12 +53,5 @@ async def get_watcher_log(
 
 
 @router.delete("/watcher/{owner}/{repo}/{pr_number}")
-async def stop_watcher(
-    owner: str,
-    repo: str,
-    pr_number: int,
-    authorization: Optional[str] = Header(None),
-) -> Dict[str, bool]:
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
+async def stop_watcher(owner: str, repo: str, pr_number: int) -> Dict[str, bool]:
     return {"stopped": CIWatcher.stop(owner, repo, pr_number)}
